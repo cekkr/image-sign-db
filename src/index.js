@@ -3,14 +3,17 @@ const mysql = require('mysql2/promise');
 const express = require('express');
 const crypto = require('crypto');
 require('dotenv').config();
-const { generateSpecificVector, GRID_SIZES, NEIGHBOR_OFFSETS } = require('./featureExtractor.js');
+const {
+    generateSpecificVector,
+    resolveDefaultProbeSpec,
+} = require('./featureExtractor.js');
+const { extractAugmentationFromType } = require('./lib/vectorSpecs');
+const { euclideanDistance } = require('./lib/correlationMetrics');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const SIMILARITY_THRESHOLD = 0.1;
-const DEFAULT_GRID = GRID_SIZES[Math.floor(GRID_SIZES.length / 2)] || GRID_SIZES[0] || 8;
-const DEFAULT_OFFSET = NEIGHBOR_OFFSETS.find(({ dx, dy }) => dx === 1 && dy === 0) || NEIGHBOR_OFFSETS[0] || { dx: 1, dy: 0, key: 'dx1dy0' };
-const DEFAULT_VECTOR_TYPE = `hsv_rel_gradient_g${DEFAULT_GRID}_${DEFAULT_OFFSET.key}`;
+const DEFAULT_PROBE_SPEC = resolveDefaultProbeSpec();
 
 // --- SHARED LOGIC & DATABASE ---
 let dbConnection;
@@ -30,17 +33,6 @@ async function connectToDatabase() {
     });
     console.log("🗄️  Connected to MySQL database.");
     return dbConnection;
-}
-
-function euclideanDistance(buf1, buf2) {
-    if (!buf1 || !buf2 || buf1.length !== buf2.length) return Infinity;
-    const vec1 = new Float32Array(buf1.buffer, buf1.byteOffset, buf1.length / Float32Array.BYTES_PER_ELEMENT);
-    const vec2 = new Float32Array(buf2.buffer, buf2.byteOffset, buf2.length / Float32Array.BYTES_PER_ELEMENT);
-    let sum = 0;
-    for (let i = 0; i < vec1.length; i++) {
-        sum += (vec1[i] - vec2[i]) ** 2;
-    }
-    return Math.sqrt(sum);
 }
 
 function extractAugmentationFromType(type) {
@@ -311,13 +303,7 @@ function runServer() {
 
 async function runCli(imagePath) {
     console.log(`🔎 Starting standalone search for: ${imagePath}`);
-    const probeSpec = {
-        vector_type: DEFAULT_VECTOR_TYPE,
-        augmentation: 'original',
-        resolution_level: DEFAULT_GRID,
-        pos_x: 0,
-        pos_y: 0,
-    };
+    const probeSpec = { ...DEFAULT_PROBE_SPEC };
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
 
     if (!probeVector) {

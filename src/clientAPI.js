@@ -1,12 +1,13 @@
 // --- LIBRARIES ---
 const fs = require('fs/promises');
-const { generateSpecificVector, GRID_SIZES, NEIGHBOR_OFFSETS } = require('./featureExtractor.js');
+const {
+    generateSpecificVector,
+    resolveDefaultProbeSpec,
+} = require('./featureExtractor.js');
 
 // --- CONFIGURATION ---
 const API_BASE_URL = 'http://localhost:3000';
-const DEFAULT_GRID = GRID_SIZES[Math.floor(GRID_SIZES.length / 2)] || GRID_SIZES[0] || 8;
-const DEFAULT_OFFSET = NEIGHBOR_OFFSETS.find(({ dx, dy }) => dx === 1 && dy === 0) || NEIGHBOR_OFFSETS[0] || { dx: 1, dy: 0, key: 'dx1dy0' };
-const DEFAULT_VECTOR_TYPE = `hsv_rel_gradient_g${DEFAULT_GRID}_${DEFAULT_OFFSET.key}`;
+const DEFAULT_PROBE_SPEC = resolveDefaultProbeSpec();
 
 // --- MAIN LOGIC ---
 
@@ -21,13 +22,7 @@ async function findImageRemotely(imagePath) {
     console.log(`🔎 Starting remote search for: ${imagePath}`);
     
     // 1. Generate the initial probe vector and start the session
-    const probeSpec = {
-        vector_type: DEFAULT_VECTOR_TYPE,
-        augmentation: 'original',
-        resolution_level: DEFAULT_GRID,
-        pos_x: 0,
-        pos_y: 0,
-    };
+    const probeSpec = { ...DEFAULT_PROBE_SPEC };
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
 
     if (!probeVector) {
