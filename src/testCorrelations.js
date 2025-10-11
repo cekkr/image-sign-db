@@ -5,18 +5,18 @@ require('dotenv').config();
 // --- SAMPLE DATA ---
 const sampleCorrelations = [
     {
-        start: { vector_type: 'hsv_gradient_h', level: 2, x: 0, y: 0 },
+        start: { vector_type: 'hsv_rel_gradient_g10_dx1dy0', level: 10, x: 0, y: 0 },
         discriminator: { vector_type: 'hsv_tree_mean', level: 1, x: 1, y: 1 },
         stats: { mean_distance: 0.48, std_distance: 0.17, mean_cosine: 0.32, mean_pearson: 0.28, sample_size: 24 },
     },
     {
-        start: { vector_type: 'hsv_gradient_v#mirror_horizontal', level: 1, x: 3, y: 2 },
+        start: { vector_type: 'hsv_rel_gradient_g14_dx1dy1#mirror_horizontal', level: 14, x: 3, y: 2 },
         discriminator: { vector_type: 'hsv_tree_delta#mirror_horizontal', level: 2, x: 6, y: 5 },
         stats: { mean_distance: 0.61, std_distance: 0.21, mean_cosine: 0.15, mean_pearson: 0.18, sample_size: 19 },
     },
     {
-        start: { vector_type: 'hsv_tree_mean', level: 0, x: 0, y: 0 },
-        discriminator: { vector_type: 'hsv_gradient_h', level: 1, x: 2, y: 3 },
+        start: { vector_type: 'hsv_tree_mean#random_combo_1', level: 0, x: 0, y: 0 },
+        discriminator: { vector_type: 'hsv_rel_gradient_g6_dx2dy0#random_combo_1', level: 6, x: 2, y: 3 },
         stats: { mean_distance: 0.32, std_distance: 0.08, mean_cosine: 0.54, mean_pearson: 0.49, sample_size: 31 },
     },
 ];

@@ -2,14 +2,22 @@
 const sharp = require('sharp');
 const fs = require('fs/promises');
 const path = require('path');
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
 // --- CONFIGURATION ---
-const RESOLUTION_LEVELS = [0, 1, 2];
-const GRID_SIZE = 8;
+const GRID_SIZES = [6, 10, 14];
+const NEIGHBOR_OFFSETS = [
+    { dx: 1, dy: 0, key: 'dx1dy0' },
+    { dx: 0, dy: 1, key: 'dx0dy1' },
+    { dx: 1, dy: 1, key: 'dx1dy1' },
+    { dx: 2, dy: 0, key: 'dx2dy0' },
+    { dx: 0, dy: 2, key: 'dx0dy2' },
+];
 const TREE_DEPTHS = [0, 1, 2, 3];
-const AUGMENTATION_ORDER = ['original', 'mirror_horizontal', 'mirror_vertical', 'gaussian_blur'];
+const STOCHASTIC_AUGMENTATIONS = ['random_combo_0', 'random_combo_1', 'random_combo_2'];
+const AUGMENTATION_ORDER = ['original', 'mirror_horizontal', 'mirror_vertical', 'gaussian_blur', ...STOCHASTIC_AUGMENTATIONS];
 
 const AUGMENTATIONS = {
     original(image) {
@@ -30,10 +38,12 @@ const AUGMENTATIONS = {
 
 function rgbToHsv(r, g, b) {
     r /= 255; g /= 255; b /= 255;
-    let max = Math.max(r, g, b), min = Math.min(r, g, b);
-    let h, s, v = max;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    let h;
+    const v = max;
     const d = max - min;
-    s = max === 0 ? 0 : d / max;
+    const s = max === 0 ? 0 : d / max;
     if (max === min) {
         h = 0;
     } else {
@@ -41,6 +51,7 @@ function rgbToHsv(r, g, b) {
             case r: h = (g - b) / d + (g < b ? 6 : 0); break;
             case g: h = (b - r) / d + 2; break;
             case b: h = (r - g) / d + 4; break;
+            default: h = 0;
         }
         h /= 6;
     }
@@ -51,12 +62,69 @@ function buildVectorType(baseType, augmentationName) {
     return augmentationName === 'original' ? baseType : `${baseType}#${augmentationName}`;
 }
 
-function applyAugmentation(baseImage, augmentationName) {
-    const operator = AUGMENTATIONS[augmentationName];
-    if (!operator) {
-        throw new Error(`Unknown augmentation '${augmentationName}'`);
+function extractAugmentationFromType(type) {
+    if (!type) return 'original';
+    const idx = type.indexOf('#');
+    return idx === -1 ? 'original' : type.slice(idx + 1);
+}
+
+function createSeededRandom(seed) {
+    const buffer = crypto.createHash('sha1').update(seed).digest();
+    let state = buffer.readUInt32BE(0);
+    return () => {
+        state = (state + 0x6D2B79F5) | 0;
+        let t = Math.imul(state ^ (state >>> 15), 1 | state);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function applyRandomCombo(baseImage, baseMeta, imagePath, augmentationName) {
+    const rand = createSeededRandom(`${imagePath}:${augmentationName}:${baseMeta.width}x${baseMeta.height}`);
+    const cropRatio = 0.82 + rand() * 0.15; // 0.82 - 0.97
+    const rotation = (rand() * 12) - 6; // -6 to +6 degrees
+    const saturation = 0.85 + rand() * 0.3; // 0.85 - 1.15
+    const brightness = 0.9 + rand() * 0.2; // 0.9 - 1.1
+    const hueShift = (rand() * 36) - 18; // -18 to +18 degrees
+    const blurSigma = 0.4 + rand() * 0.6; // optional blur
+
+    const cropWidth = Math.max(1, Math.floor(baseMeta.width * cropRatio));
+    const cropHeight = Math.max(1, Math.floor(baseMeta.height * cropRatio));
+    const maxLeft = Math.max(0, baseMeta.width - cropWidth);
+    const maxTop = Math.max(0, baseMeta.height - cropHeight);
+    const left = Math.floor(rand() * (maxLeft + 1));
+    const top = Math.floor(rand() * (maxTop + 1));
+
+    let transformed = baseImage.clone();
+
+    if (cropWidth < baseMeta.width || cropHeight < baseMeta.height) {
+        transformed = transformed.extract({ left, top, width: cropWidth, height: cropHeight });
     }
-    return operator(baseImage);
+
+    transformed = transformed
+        .rotate(rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .resize(baseMeta.width, baseMeta.height, { fit: 'cover' })
+        .modulate({
+            saturation,
+            brightness,
+            hue: hueShift,
+        });
+
+    if (rand() > 0.5) {
+        transformed = transformed.blur(blurSigma);
+    }
+
+    return transformed;
+}
+
+function applyAugmentation(baseImage, augmentationName, baseMeta, imagePath) {
+    if (AUGMENTATIONS[augmentationName]) {
+        return AUGMENTATIONS[augmentationName](baseImage);
+    }
+    if (augmentationName.startsWith('random_combo_')) {
+        return applyRandomCombo(baseImage, baseMeta, imagePath, augmentationName);
+    }
+    throw new Error(`Unknown augmentation '${augmentationName}'`);
 }
 
 function getBlockRange(gridSize, dimension, index) {
@@ -111,63 +179,52 @@ async function getRawPixels(sharpInstance) {
     return { rawPixels: data, meta: info };
 }
 
-async function extractGridGradientFeatures(augmentedImage, baseMeta, augmentationName) {
+function buildRelativeGradientType(gridSize, offsetKey) {
+    return `hsv_rel_gradient_g${gridSize}_${offsetKey}`;
+}
+
+function extractRelativeGradientFeatures(rawPixels, meta, augmentationName) {
     const features = [];
 
-    for (const level of RESOLUTION_LEVELS) {
-        const scale = 1 / Math.pow(2, level);
-        const width = Math.max(1, Math.floor(baseMeta.width * scale));
-        const height = Math.max(1, Math.floor(baseMeta.height * scale));
-
-        if (width < GRID_SIZE || height < GRID_SIZE) {
+    for (const gridSize of GRID_SIZES) {
+        if (meta.width < gridSize || meta.height < gridSize) {
             continue;
         }
 
-        const resized = augmentedImage.clone().resize(width, height, { fit: 'fill' });
-        const { rawPixels, meta } = await getRawPixels(resized);
-
-        const blockCache = [];
-        for (let y = 0; y < GRID_SIZE; y++) {
-            for (let x = 0; x < GRID_SIZE; x++) {
-                const [startX, endX] = getBlockRange(GRID_SIZE, meta.width, x);
-                const [startY, endY] = getBlockRange(GRID_SIZE, meta.height, y);
-                blockCache[y * GRID_SIZE + x] = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
+        const blockCache = new Array(gridSize * gridSize);
+        for (let y = 0; y < gridSize; y++) {
+            for (let x = 0; x < gridSize; x++) {
+                const [startX, endX] = getBlockRange(gridSize, meta.width, x);
+                const [startY, endY] = getBlockRange(gridSize, meta.height, y);
+                blockCache[y * gridSize + x] = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
             }
         }
 
-        for (let y = 0; y < GRID_SIZE; y++) {
-            for (let x = 0; x < GRID_SIZE; x++) {
-                const currentBlock = blockCache[y * GRID_SIZE + x];
-                if (x < GRID_SIZE - 1) {
-                    const rightBlock = blockCache[y * GRID_SIZE + (x + 1)];
-                    const gradH = new Float32Array([
-                        (rightBlock.h - currentBlock.h) / 360,
-                        (rightBlock.s - currentBlock.s) / 100,
-                        (rightBlock.v - currentBlock.v) / 100,
-                        (rightBlock.luminance - currentBlock.luminance) / 255,
+        for (let y = 0; y < gridSize; y++) {
+            for (let x = 0; x < gridSize; x++) {
+                const currentBlock = blockCache[y * gridSize + x];
+                for (const offset of NEIGHBOR_OFFSETS) {
+                    const targetX = x + offset.dx;
+                    const targetY = y + offset.dy;
+                    if (targetX >= gridSize || targetY >= gridSize) continue;
+                    const neighborBlock = blockCache[targetY * gridSize + targetX];
+                    if (!neighborBlock) continue;
+
+                    const vector = new Float32Array([
+                        (neighborBlock.h - currentBlock.h) / 360,
+                        (neighborBlock.s - currentBlock.s) / 100,
+                        (neighborBlock.v - currentBlock.v) / 100,
+                        (neighborBlock.luminance - currentBlock.luminance) / 255,
+                        offset.dx / gridSize,
+                        offset.dy / gridSize,
                     ]);
+
                     features.push({
-                        vector_type: buildVectorType('hsv_gradient_h', augmentationName),
-                        resolution_level: level,
+                        vector_type: buildVectorType(buildRelativeGradientType(gridSize, offset.key), augmentationName),
+                        resolution_level: gridSize,
                         pos_x: x,
                         pos_y: y,
-                        vector_data: Buffer.from(gradH.buffer),
-                    });
-                }
-                if (y < GRID_SIZE - 1) {
-                    const bottomBlock = blockCache[(y + 1) * GRID_SIZE + x];
-                    const gradV = new Float32Array([
-                        (bottomBlock.h - currentBlock.h) / 360,
-                        (bottomBlock.s - currentBlock.s) / 100,
-                        (bottomBlock.v - currentBlock.v) / 100,
-                        (bottomBlock.luminance - currentBlock.luminance) / 255,
-                    ]);
-                    features.push({
-                        vector_type: buildVectorType('hsv_gradient_v', augmentationName),
-                        resolution_level: level,
-                        pos_x: x,
-                        pos_y: y,
-                        vector_data: Buffer.from(gradV.buffer),
+                        vector_data: Buffer.from(vector.buffer),
                     });
                 }
             }
@@ -177,19 +234,21 @@ async function extractGridGradientFeatures(augmentedImage, baseMeta, augmentatio
     return features;
 }
 
-function extractTreeFeatures(baseRawPixels, baseMeta, augmentationName) {
+function extractTreeFeatures(rawPixels, meta, augmentationName) {
     const features = [];
     const statsCache = new Map();
 
     for (const depth of TREE_DEPTHS) {
         const gridSize = Math.pow(2, depth);
+        if (gridSize > meta.width || gridSize > meta.height) break;
+
         for (let y = 0; y < gridSize; y++) {
             for (let x = 0; x < gridSize; x++) {
-                const [startX, endX] = getBlockRange(gridSize, baseMeta.width, x);
-                const [startY, endY] = getBlockRange(gridSize, baseMeta.height, y);
+                const [startX, endX] = getBlockRange(gridSize, meta.width, x);
+                const [startY, endY] = getBlockRange(gridSize, meta.height, y);
                 if (endX <= startX || endY <= startY) continue;
 
-                const stats = calculateStatsForRegion(baseRawPixels, baseMeta, startX, startY, endX, endY);
+                const stats = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
                 const cacheKey = `${depth}_${x}_${y}`;
                 statsCache.set(cacheKey, stats);
 
@@ -237,63 +296,62 @@ function extractTreeFeatures(baseRawPixels, baseMeta, augmentationName) {
     return features;
 }
 
+function parseRelativeGradientType(baseType) {
+    const match = baseType.match(/^hsv_rel_gradient_g(\d+)_dx(\d+)dy(\d+)$/);
+    if (!match) return null;
+    return {
+        gridSize: parseInt(match[1], 10),
+        dx: parseInt(match[2], 10),
+        dy: parseInt(match[3], 10),
+    };
+}
+
 /**
  * Generates a specific vector on-demand for a given image and vector spec.
- * Supports both gradient grid vectors and hierarchical tree vectors.
+ * Supports relative gradient vectors and hierarchical tree vectors.
  * @param {string} imagePath - Path to the image.
  * @param {object} spec - The specification of the required vector.
  * @param {string} [spec.augmentation] - Optional augmentation name.
  * @returns {Buffer|null} The calculated vector as a Buffer, or null if not applicable.
  */
 async function generateSpecificVector(imagePath, spec) {
-    const { vector_type, resolution_level, pos_x, pos_y, augmentation = 'original' } = spec;
+    const { vector_type, resolution_level, pos_x, pos_y } = spec;
     const baseType = vector_type.split('#')[0];
+    const effectiveAugmentation = spec.augmentation || extractAugmentationFromType(vector_type);
 
     const originalImage = sharp(imagePath);
-    const augmentedImage = applyAugmentation(originalImage, augmentation);
+    const baseMeta = await originalImage.metadata();
+    const augmentedImage = applyAugmentation(originalImage, effectiveAugmentation, baseMeta, imagePath);
+    const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
 
-    if (baseType === 'hsv_gradient_h' || baseType === 'hsv_gradient_v') {
-        const metadata = await augmentedImage.metadata();
-        const scale = 1 / Math.pow(2, resolution_level);
-        const width = Math.max(1, Math.floor(metadata.width * scale));
-        const height = Math.max(1, Math.floor(metadata.height * scale));
+    const gradientDescriptor = parseRelativeGradientType(baseType);
+    if (gradientDescriptor) {
+        const { gridSize, dx, dy } = gradientDescriptor;
+        if (pos_x >= gridSize || pos_y >= gridSize) return null;
 
-        if (width < GRID_SIZE || height < GRID_SIZE) return null;
+        const [startX, endX] = getBlockRange(gridSize, meta.width, pos_x);
+        const [startY, endY] = getBlockRange(gridSize, meta.height, pos_y);
+        const currentStats = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
 
-        const resized = augmentedImage.clone().resize(width, height, { fit: 'fill' });
-        const { rawPixels, meta } = await getRawPixels(resized);
+        const targetX = pos_x + dx;
+        const targetY = pos_y + dy;
+        if (targetX >= gridSize || targetY >= gridSize) return null;
+        const [targetStartX, targetEndX] = getBlockRange(gridSize, meta.width, targetX);
+        const [targetStartY, targetEndY] = getBlockRange(gridSize, meta.height, targetY);
+        const targetStats = calculateStatsForRegion(rawPixels, meta, targetStartX, targetStartY, targetEndX, targetEndY);
 
-        const [startX, endX] = getBlockRange(GRID_SIZE, meta.width, pos_x);
-        const [startY, endY] = getBlockRange(GRID_SIZE, meta.height, pos_y);
-        const currentBlock = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
-
-        if (baseType === 'hsv_gradient_h') {
-            if (pos_x >= GRID_SIZE - 1) return null;
-            const [rightStartX, rightEndX] = getBlockRange(GRID_SIZE, meta.width, pos_x + 1);
-            const rightBlock = calculateStatsForRegion(rawPixels, meta, rightStartX, startY, rightEndX, endY);
-            const grad = new Float32Array([
-                (rightBlock.h - currentBlock.h) / 360,
-                (rightBlock.s - currentBlock.s) / 100,
-                (rightBlock.v - currentBlock.v) / 100,
-                (rightBlock.luminance - currentBlock.luminance) / 255,
-            ]);
-            return Buffer.from(grad.buffer);
-        }
-
-        if (pos_y >= GRID_SIZE - 1) return null;
-        const [bottomStartY, bottomEndY] = getBlockRange(GRID_SIZE, meta.height, pos_y + 1);
-        const bottomBlock = calculateStatsForRegion(rawPixels, meta, startX, bottomStartY, endX, bottomEndY);
-        const grad = new Float32Array([
-            (bottomBlock.h - currentBlock.h) / 360,
-            (bottomBlock.s - currentBlock.s) / 100,
-            (bottomBlock.v - currentBlock.v) / 100,
-            (bottomBlock.luminance - currentBlock.luminance) / 255,
+        const vec = new Float32Array([
+            (targetStats.h - currentStats.h) / 360,
+            (targetStats.s - currentStats.s) / 100,
+            (targetStats.v - currentStats.v) / 100,
+            (targetStats.luminance - currentStats.luminance) / 255,
+            dx / gridSize,
+            dy / gridSize,
         ]);
-        return Buffer.from(grad.buffer);
+        return Buffer.from(vec.buffer);
     }
 
     if (baseType === 'hsv_tree_mean' || baseType === 'hsv_tree_delta') {
-        const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
         const gridSize = Math.pow(2, resolution_level);
         const [startX, endX] = getBlockRange(gridSize, meta.width, pos_x);
         const [startY, endY] = getBlockRange(gridSize, meta.height, pos_y);
@@ -340,16 +398,19 @@ async function extractAndStoreFeatures(imagePath) {
         console.log(`🔎 Processing image: ${imagePath}`);
 
         const originalImage = sharp(imagePath);
+        const baseMeta = await originalImage.metadata();
         const allFeatures = [];
 
         for (const augmentationName of AUGMENTATION_ORDER) {
             console.log(`\n-- Augmentation: ${augmentationName} --`);
-            const augmentedImage = applyAugmentation(originalImage, augmentationName);
+            const augmentedImage = applyAugmentation(originalImage, augmentationName, baseMeta, imagePath);
             const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
-            const gridFeatures = await extractGridGradientFeatures(augmentedImage, meta, augmentationName);
+
+            const gradientFeatures = extractRelativeGradientFeatures(rawPixels, meta, augmentationName);
             const treeFeatures = extractTreeFeatures(rawPixels, meta, augmentationName);
-            allFeatures.push(...gridFeatures, ...treeFeatures);
-            console.log(`  Extracted ${gridFeatures.length} grid gradients and ${treeFeatures.length} tree features.`);
+            allFeatures.push(...gradientFeatures, ...treeFeatures);
+
+            console.log(`  Extracted ${gradientFeatures.length} relative gradients and ${treeFeatures.length} quadtree vectors.`);
         }
 
         console.log(`\n🗄️  Connecting to database to store ${allFeatures.length} features...`);
@@ -394,8 +455,8 @@ async function extractAndStoreFeatures(imagePath) {
 
 module.exports = {
     generateSpecificVector,
-    RESOLUTION_LEVELS,
-    GRID_SIZE,
+    GRID_SIZES,
+    NEIGHBOR_OFFSETS,
     TREE_DEPTHS,
     AUGMENTATION_ORDER,
 };

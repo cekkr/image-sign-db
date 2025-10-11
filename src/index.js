@@ -3,23 +3,30 @@ const mysql = require('mysql2/promise');
 const express = require('express');
 const crypto = require('crypto');
 require('dotenv').config();
-const { generateSpecificVector } = require('./featureExtractor.js');
+const { generateSpecificVector, GRID_SIZES, NEIGHBOR_OFFSETS } = require('./featureExtractor.js');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const SIMILARITY_THRESHOLD = 0.1;
+const DEFAULT_GRID = GRID_SIZES[Math.floor(GRID_SIZES.length / 2)] || GRID_SIZES[0] || 8;
+const DEFAULT_OFFSET = NEIGHBOR_OFFSETS.find(({ dx, dy }) => dx === 1 && dy === 0) || NEIGHBOR_OFFSETS[0] || { dx: 1, dy: 0, key: 'dx1dy0' };
+const DEFAULT_VECTOR_TYPE = `hsv_rel_gradient_g${DEFAULT_GRID}_${DEFAULT_OFFSET.key}`;
 
 // --- SHARED LOGIC & DATABASE ---
 let dbConnection;
-const searchSessions = new Map(); // sessionId -> { candidateIds: number[], lastSpec: FeatureSpec }
+const searchSessions = new Map(); // sessionId -> { candidateIds: number[], anchorSpec, lastAskedSpec }
 
 async function connectToDatabase() {
-    if (dbConnection && dbConnection.connection._closing) dbConnection = null;
+    if (dbConnection && dbConnection.connection && dbConnection.connection._closing) {
+        dbConnection = null;
+    }
     if (dbConnection) return dbConnection;
     dbConnection = await mysql.createConnection({
-        host: process.env.DB_HOST, user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD, database: process.env.DB_NAME,
-        connectionLimit: 10
+        host: process.env.DB_HOST,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        database: process.env.DB_NAME,
+        connectionLimit: 10,
     });
     console.log("🗄️  Connected to MySQL database.");
     return dbConnection;
@@ -30,16 +37,63 @@ function euclideanDistance(buf1, buf2) {
     const vec1 = new Float32Array(buf1.buffer, buf1.byteOffset, buf1.length / Float32Array.BYTES_PER_ELEMENT);
     const vec2 = new Float32Array(buf2.buffer, buf2.byteOffset, buf2.length / Float32Array.BYTES_PER_ELEMENT);
     let sum = 0;
-    for (let i = 0; i < vec1.length; i++) sum += (vec1[i] - vec2[i]) ** 2;
+    for (let i = 0; i < vec1.length; i++) {
+        sum += (vec1[i] - vec2[i]) ** 2;
+    }
     return Math.sqrt(sum);
+}
+
+function extractAugmentationFromType(type) {
+    if (!type) return 'original';
+    const idx = type.indexOf('#');
+    return idx === -1 ? 'original' : type.slice(idx + 1);
+}
+
+function normalizeFeatureDetails(raw) {
+    if (!raw) return null;
+    const details = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const augmentation = details.augmentation || extractAugmentationFromType(details.type);
+    return {
+        type: details.type,
+        augmentation,
+        level: details.level,
+        x: details.x,
+        y: details.y,
+    };
+}
+
+function specsAreEqual(a, b) {
+    if (!a || !b) return false;
+    return (
+        a.vector_type === b.vector_type &&
+        a.resolution_level === b.resolution_level &&
+        a.pos_x === b.pos_x &&
+        a.pos_y === b.pos_y &&
+        (a.augmentation || extractAugmentationFromType(a.vector_type)) ===
+            (b.augmentation || extractAugmentationFromType(b.vector_type))
+    );
 }
 
 // --- CORE SEARCH ENGINE ---
 
 async function startSearch(probeVector) {
     const db = await connectToDatabase();
-    const { vector_type, resolution_level, pos_x, pos_y, vector_data } = probeVector;
-    const baseSpec = { vector_type, resolution_level, pos_x, pos_y };
+    const {
+        vector_type,
+        resolution_level,
+        pos_x,
+        pos_y,
+        vector_data,
+        augmentation,
+    } = probeVector;
+    const normalizedAugmentation = augmentation || extractAugmentationFromType(vector_type);
+    const baseSpec = {
+        vector_type,
+        resolution_level,
+        pos_x,
+        pos_y,
+        augmentation: normalizedAugmentation,
+    };
 
     const [allSimilarFeatures] = await db.execute(
         'SELECT image_id, vector_data FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ?',
@@ -57,11 +111,12 @@ async function startSearch(probeVector) {
     if (candidateImageIds.size === 1) return { status: 'MATCH_FOUND', imageId: [...candidateImageIds][0] };
 
     const sessionId = crypto.randomBytes(16).toString('hex');
-    searchSessions.set(sessionId, {
+    const sessionState = {
         candidateIds: [...candidateImageIds],
         anchorSpec: baseSpec,
         lastAskedSpec: baseSpec,
-    });
+    };
+    searchSessions.set(sessionId, sessionState);
     return { status: 'CANDIDATES_FOUND', sessionId, candidates: [...candidateImageIds], anchorSpec: baseSpec };
 }
 
@@ -71,7 +126,7 @@ async function findNextBestQuestion(candidateIds, anchorSpec, fallbackSpec) {
 
     const specsToTry = [];
     if (anchorSpec) specsToTry.push(anchorSpec);
-    if (fallbackSpec && (!anchorSpec || JSON.stringify(anchorSpec) !== JSON.stringify(fallbackSpec))) {
+    if (fallbackSpec && !specsAreEqual(anchorSpec, fallbackSpec)) {
         specsToTry.push(fallbackSpec);
     }
 
@@ -117,6 +172,7 @@ async function findNextBestQuestion(candidateIds, anchorSpec, fallbackSpec) {
             const row = correlatedRows[0];
             return {
                 type: row.vector_type,
+                augmentation: extractAugmentationFromType(row.vector_type),
                 level: row.level,
                 x: row.x,
                 y: row.y,
@@ -127,6 +183,7 @@ async function findNextBestQuestion(candidateIds, anchorSpec, fallbackSpec) {
                     mean_pearson: row.mean_pearson,
                     sample_size: row.sample_size,
                 },
+                source: 'correlation',
             };
         }
     }
@@ -141,14 +198,15 @@ async function findNextBestQuestion(candidateIds, anchorSpec, fallbackSpec) {
         WHERE kn.node_type = 'FEATURE'
           AND fv.image_id IN (?)
         GROUP BY kn.node_id
-        -- Prioritize nodes with high hit rate and sufficient data
         ORDER BY (kn.hit_count / (kn.hit_count + kn.miss_count + 1e-5)) DESC, (kn.hit_count + kn.miss_count) DESC
         LIMIT 1;
     `;
     const [rows] = await db.query(query, [candidateIds]);
-    
-    if (rows.length === 0) return null; // No knowledge found for this set
-    return rows[0].feature_details;
+    if (rows.length === 0) return null;
+
+    const details = normalizeFeatureDetails(rows[0].feature_details);
+    if (!details) return null;
+    return { ...details, source: 'knowledge' };
 }
 
 // --- EXPRESS SERVER MODE ---
@@ -159,12 +217,18 @@ function runServer() {
 
     app.post('/search/start', async (req, res) => {
         try {
-            const { vector_type, resolution_level, pos_x, pos_y, vector_base64 } = req.body;
+            const { vector_type, resolution_level, pos_x, pos_y, augmentation, vector_base64 } = req.body;
             const vector_data = Buffer.from(vector_base64, 'base64');
-            const probeSpec = { vector_type, resolution_level, pos_x, pos_y };
-            
-            const result = await startSearch({ vector_type, resolution_level, pos_x, pos_y, vector_data });
-            
+            const probeSpec = {
+                vector_type,
+                resolution_level,
+                pos_x,
+                pos_y,
+                augmentation: augmentation || extractAugmentationFromType(vector_type),
+            };
+
+            const result = await startSearch({ ...probeSpec, vector_data });
+
             if (result.status === 'CANDIDATES_FOUND') {
                 const nextQuestion = await findNextBestQuestion(result.candidates, probeSpec, probeSpec);
                 res.json({ ...result, nextQuestion });
@@ -188,41 +252,52 @@ function runServer() {
             const sessionState = searchSessions.get(sessionId);
             const candidateIds = sessionState.candidateIds;
             const refinedVector = Buffer.from(vector_base64, 'base64');
-            
-            const [features] = await db.query('SELECT image_id, vector_data FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ? AND image_id IN (?)', 
-                [spec.type, spec.level, spec.x, spec.y, candidateIds]
+
+            const normalizedSpec = {
+                type: spec.type,
+                augmentation: spec.augmentation || extractAugmentationFromType(spec.type),
+                level: spec.level,
+                x: spec.x,
+                y: spec.y,
+            };
+
+            const [features] = await db.query(
+                'SELECT image_id, vector_data FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ? AND image_id IN (?)',
+                [normalizedSpec.type, normalizedSpec.level, normalizedSpec.x, normalizedSpec.y, candidateIds]
             );
 
             const newCandidates = [];
-            for(const feature of features) {
+            for (const feature of features) {
                 if (euclideanDistance(refinedVector, feature.vector_data) < SIMILARITY_THRESHOLD) {
                     newCandidates.push(feature.image_id);
                 }
             }
-            
+
             if (newCandidates.length === 0) return res.json({ status: 'NO_MATCH' });
             if (newCandidates.length === 1) {
                 searchSessions.delete(sessionId);
                 return res.json({ status: 'MATCH_FOUND', imageId: newCandidates[0] });
             }
 
-            searchSessions.set(sessionId, {
-                ...sessionState,
+            const updatedState = {
                 candidateIds: newCandidates,
+                anchorSpec: sessionState.anchorSpec,
                 lastAskedSpec: {
-                    vector_type: spec.type,
-                    resolution_level: spec.level,
-                    pos_x: spec.x,
-                    pos_y: spec.y,
+                    vector_type: normalizedSpec.type,
+                    augmentation: normalizedSpec.augmentation,
+                    resolution_level: normalizedSpec.level,
+                    pos_x: normalizedSpec.x,
+                    pos_y: normalizedSpec.y,
                 },
-            });
+            };
+            searchSessions.set(sessionId, updatedState);
+
             const nextQuestion = await findNextBestQuestion(
                 newCandidates,
-                sessionState.anchorSpec,
-                { vector_type: spec.type, resolution_level: spec.level, pos_x: spec.x, pos_y: spec.y }
+                updatedState.anchorSpec,
+                updatedState.lastAskedSpec
             );
             res.json({ status: 'CANDIDATES_FOUND', candidates: newCandidates, nextQuestion });
-
         } catch (error) {
             console.error("API Error on /search/refine:", error);
             res.status(500).json({ error: "Internal Server Error" });
@@ -236,8 +311,13 @@ function runServer() {
 
 async function runCli(imagePath) {
     console.log(`🔎 Starting standalone search for: ${imagePath}`);
-    // 1. Generate the initial probe vector
-    const probeSpec = { vector_type: 'hsv_gradient_h', resolution_level: 2, pos_x: 0, pos_y: 0 };
+    const probeSpec = {
+        vector_type: DEFAULT_VECTOR_TYPE,
+        augmentation: 'original',
+        resolution_level: DEFAULT_GRID,
+        pos_x: 0,
+        pos_y: 0,
+    };
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
 
     if (!probeVector) {
@@ -245,15 +325,13 @@ async function runCli(imagePath) {
         return;
     }
 
-    // 2. Start the search
     let result = await startSearch({ ...probeSpec, vector_data: probeVector });
     console.log(`  Initial probe found ${result.candidates?.length || 0} candidates.`);
     const anchorSpec = probeSpec;
     let lastAskedSpec = probeSpec;
 
-    // 3. Iteratively refine the search
     let iterations = 0;
-    while(result.status === 'CANDIDATES_FOUND' && iterations < 10) {
+    while (result.status === 'CANDIDATES_FOUND' && iterations < 10) {
         iterations++;
         const nextQuestion = await findNextBestQuestion(result.candidates, anchorSpec, lastAskedSpec);
         if (!nextQuestion) {
@@ -261,40 +339,67 @@ async function runCli(imagePath) {
             result = { status: 'AMBIGUOUS', candidates: result.candidates };
             break;
         }
-        
-        console.log(`  [Iteration ${iterations}] Server asks for: ${nextQuestion.type} at level ${nextQuestion.level} [${nextQuestion.x}, ${nextQuestion.y}]`);
+
+        console.log(
+            `  [Iteration ${iterations}] Request: ${nextQuestion.type} (${nextQuestion.augmentation}) at level ${nextQuestion.level} [${nextQuestion.x}, ${nextQuestion.y}]`
+        );
         if (nextQuestion.metrics) {
             const stats = nextQuestion.metrics;
             console.log(
                 `    ↳ stats: mean distance=${stats.mean_distance?.toFixed(4)}, std=${stats.std_distance?.toFixed(4)}, mean cosine=${stats.mean_cosine?.toFixed(4)}, mean pearson=${stats.mean_pearson?.toFixed(4)}, samples=${stats.sample_size}`
             );
         }
-        const nextVector = await generateSpecificVector(imagePath, { vector_type: nextQuestion.type, resolution_level: nextQuestion.level, pos_x: nextQuestion.x, pos_y: nextQuestion.y });
 
-        // This is a local simulation of the /search/refine step
+        const nextVector = await generateSpecificVector(imagePath, {
+            vector_type: nextQuestion.type,
+            augmentation: nextQuestion.augmentation,
+            resolution_level: nextQuestion.level,
+            pos_x: nextQuestion.x,
+            pos_y: nextQuestion.y,
+        });
+
+        if (!nextVector) {
+            console.log("  Could not generate requested vector. Aborting.");
+            result = { status: 'NO_MATCH' };
+            break;
+        }
+
         const db = await connectToDatabase();
-        const [features] = await db.query('SELECT image_id, vector_data FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ? AND image_id IN (?)', 
+        const [features] = await db.query(
+            'SELECT image_id, vector_data FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ? AND image_id IN (?)',
             [nextQuestion.type, nextQuestion.level, nextQuestion.x, nextQuestion.y, result.candidates]
         );
+
         const newCandidates = [];
-        for(const feature of features) {
+        for (const feature of features) {
             if (euclideanDistance(nextVector, feature.vector_data) < SIMILARITY_THRESHOLD) {
                 newCandidates.push(feature.image_id);
             }
         }
-        result = { status: newCandidates.length > 1 ? 'CANDIDATES_FOUND' : newCandidates.length === 1 ? 'MATCH_FOUND' : 'NO_MATCH', candidates: newCandidates, imageId: newCandidates[0] };
+
+        result = {
+            status: newCandidates.length > 1 ? 'CANDIDATES_FOUND' : newCandidates.length === 1 ? 'MATCH_FOUND' : 'NO_MATCH',
+            candidates: newCandidates,
+            imageId: newCandidates[0],
+        };
         console.log(`  Refined search to ${newCandidates.length} candidates.`);
-        lastAskedSpec = { vector_type: nextQuestion.type, resolution_level: nextQuestion.level, pos_x: nextQuestion.x, pos_y: nextQuestion.y };
+        lastAskedSpec = {
+            vector_type: nextQuestion.type,
+            augmentation: nextQuestion.augmentation,
+            resolution_level: nextQuestion.level,
+            pos_x: nextQuestion.x,
+            pos_y: nextQuestion.y,
+        };
     }
 
     console.log('\n--- SEARCH COMPLETE ---');
     if (result.status === 'MATCH_FOUND') {
         const db = await connectToDatabase();
         const [rows] = await db.query('SELECT original_filename FROM images WHERE image_id = ?', [result.imageId]);
-        console.log(`✅ Match Found! Image ID: ${result.imageId} (${rows[0].original_filename})`);
+        console.log(`✅ Match Found! Image ID: ${result.imageId} (${rows[0]?.original_filename || 'unknown'})`);
     } else {
         console.log(`❌ No definitive match found. Status: ${result.status}`);
-        if(result.candidates) console.log('  Ambiguous candidates:', result.candidates);
+        if (result.candidates) console.log('  Ambiguous candidates:', result.candidates);
     }
 }
 

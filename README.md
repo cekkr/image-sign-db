@@ -18,26 +18,22 @@ Instead of treating an image as a flat, 2D grid of pixels, we model it as a 4D d
     
 *   **Dimension 3 (Channels):** The color space, primarily using **HSV (Hue, Saturation, Value)**, which is highly robust against lighting, filter, and contrast distortions.
     
-*   **Dimension 4 (Resolution):** A multi-scale pyramid, analyzing the image at full, half, and quarter resolution to capture both broad structural information and fine details.
+*   **Dimension 4 (Scale / Span):** A bundle of relative grids (6×6, 10×10, 14×14, …) and neighbor offsets that describe _how far_ a pattern moves as a percentage of the image instead of locking onto a fixed downsampled resolution.
     
 
-The system doesn't store static color values. Instead, it populates the database with thousands of tiny **"vector changes" (gradients)**—the difference in color and brightness between adjacent blocks in a grid at each resolution level. This collection of gradients forms the image's unique signature.
+The system doesn't store static color values. Instead, it populates the database with thousands of tiny **"relative vector changes"**—for each grid density it records the HSV/luminance delta between a block and several neighbours, together with the normalized offset that separates them. Because those offsets live in `[0,1]` space they remain comparable even if the source image is cropped, upscaled, mirrored, or re-filtered. The collection of these relative gradients plus the hierarchical quadtree descriptors forms the image's unique signature.
 
 In the latest revision the extractor also:
 
-*   Runs a configurable **augmentation sweep** (horizontal/vertical mirroring and a light Gaussian blur) so the database learns how an image behaves under common filters without ever storing the transformed picture itself.
+*   Runs a configurable **augmentation sweep** (horizontal/vertical mirroring, Gaussian blur, and three deterministic "random combo" crops/rotations/color jitters derived from the filename) so the database learns how an image behaves under common edits without ever persisting the transformed pixels.
 *   Builds a **deterministic quadtree** on top of every image. Each node contributes both its HSV/luminance signature (`hsv_tree_mean`) and how that node diverges from its parent (`hsv_tree_delta`). This gives the search engine a true coarse‑to‑fine "tree dividing" map that can express global context and local anomalies simultaneously.
-*   Persists all of these variants using a predictable naming convention (`vector_type#augmentation`) so downstream tools can request the precise feature they need (e.g. `hsv_gradient_v#mirror_horizontal`).
+*   Persists all of these variants using a predictable naming convention (`vector_type#augmentation`) so downstream tools can request the precise feature they need (e.g. `hsv_rel_gradient_g10_dx1dy0#mirror_horizontal` or `hsv_tree_delta#random_combo_2`).
 
 ### 2\. Hierarchical Knowledge Graph via MySQL
 
 The "brain" of the system is the `knowledge_nodes` table in MySQL. This table is designed as a self-referencing hierarchy to store learned information about feature utility. This knowledge graph is not static; it is a dynamic structure that is continuously updated and refined by the system's learning processes.
 
-*   **Leaf Nodes (`FEATURE`):** Each unique feature descriptor (e.g., "the horizontal HSV gradient at resolution 2, position
-    
-    3,4
-    
-    ") is a leaf node in the graph.
+*   **Leaf Nodes (`FEATURE`):** Each unique feature descriptor (e.g., "the relative HSV gradient on the 10×10 grid using offset Δx=1, Δy=0 at cell 3,4") is a leaf node in the graph.
     
 *   **Parent Nodes (`GROUP`):** The training script learns which combinations of leaf nodes are effective at distinguishing images. It can group these features under a parent node. This allows the system to build abstract knowledge, such as "The combination of _this_ texture in the top-left and _that_ color transition in the center is a powerful identifier."
     
@@ -61,7 +57,7 @@ The `train.js` script works without any human-provided labels. It operates "blin
     
 4.  The script then updates the `knowledge_nodes` table, increasing the `hit_count` for the features that successfully discriminated.
     
-During that pass it also records the mean Euclidean separation, spread (standard deviation), cosine similarity, and Pearson correlation between the winning feature pair and all of its false positives. Those aggregated metrics live in `feature_group_stats` and are consulted by the online search loop.
+During that pass it also records the mean Euclidean separation, spread (standard deviation), cosine similarity, and Pearson correlation between the winning feature pair and all of its false positives. Candidates that fail to clear minimum affinity or that require touching too many vectors are skipped outright, keeping the learned relationships tight and efficient. The aggregated metrics that make it through live in `feature_group_stats` and are consulted by the online search loop.
 
 This process, repeated thousands of times, builds a rich knowledge graph of which vectors and vector-group correlations are most useful for telling images apart.
 

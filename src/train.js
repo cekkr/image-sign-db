@@ -7,6 +7,9 @@ require('dotenv').config();
 const TRAINING_ITERATIONS = 50; 
 // How similar two vectors must be to be considered a potential match (Euclidean distance).
 const SIMILARITY_THRESHOLD = 0.1; 
+const MAX_CANDIDATE_SAMPLE = 256;
+const MIN_AFFINITY = 0.12;
+const MIN_SPREAD = 0.008;
 
 // --- DATABASE & HELPER FUNCTIONS ---
 
@@ -83,11 +86,12 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
         return null;
     }
 
+    const sampledCandidates = candidateFeatures.slice(0, MAX_CANDIDATE_SAMPLE);
     const distances = [];
     const cosineValues = [];
     const pearsonValues = [];
 
-    for (const candidate of candidateFeatures) {
+    for (const candidate of sampledCandidates) {
         distances.push(euclideanDistance(targetFeature.vector_data, candidate.vector_data));
         cosineValues.push(cosineSimilarity(targetFeature.vector_data, candidate.vector_data));
         pearsonValues.push(pearsonCorrelation(targetFeature.vector_data, candidate.vector_data));
@@ -97,11 +101,14 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
     const meanCosine = cosineValues.reduce((acc, val) => acc + val, 0) / cosineValues.length;
     const meanPearson = pearsonValues.reduce((acc, val) => acc + val, 0) / pearsonValues.length;
 
-    const separationScore =
-        (meanDistance || 0) +
-        (stdDistance || 0) +
-        (1 - (meanCosine || 0)) +
-        (1 - (meanPearson || 0));
+    const affinity = Math.max(0, (1 - (meanCosine || 0)) + (1 - (meanPearson || 0)));
+    const spread = Math.max(0, (meanDistance || 0) + (stdDistance || 0));
+    if (affinity < MIN_AFFINITY || spread < MIN_SPREAD) {
+        return null;
+    }
+
+    const costPenalty = Math.log1p(sampledCandidates.length);
+    const separationScore = (spread * affinity) / Math.max(costPenalty, 1);
 
     return {
         score: separationScore,
@@ -110,7 +117,10 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
             stdDistance,
             meanCosine,
             meanPearson,
-            sampleSize: candidateFeatures.length,
+            sampleSize: sampledCandidates.length,
+            originalCandidateCount: candidateFeatures.length,
+            affinity,
+            spread,
         },
     };
 }
@@ -288,13 +298,19 @@ async function runTraining() {
             if (bestDiscriminator) {
                 console.log(`  Found a good discriminating feature: ${bestDiscriminator.vector_type} at [${bestDiscriminator.pos_x}, ${bestDiscriminator.pos_y}]`);
                 if (bestMetrics) {
-                    console.log(`    -> Metrics: mean distance=${bestMetrics.meanDistance.toFixed(4)}, std=${bestMetrics.stdDistance.toFixed(4)}, mean cosine=${bestMetrics.meanCosine.toFixed(4)}, mean pearson=${bestMetrics.meanPearson.toFixed(4)}`);
+                    console.log(
+                        `    -> Metrics: spread=${bestMetrics.spread.toFixed(4)}, affinity=${bestMetrics.affinity.toFixed(4)}, mean distance=${bestMetrics.meanDistance.toFixed(4)}, std=${bestMetrics.stdDistance.toFixed(4)}, mean cosine=${bestMetrics.meanCosine.toFixed(4)}, mean pearson=${bestMetrics.meanPearson.toFixed(4)}, samples=${bestMetrics.sampleSize}/${bestMetrics.originalCandidateCount}`
+                    );
                 }
                 // 5. Update the knowledge base
                 const startNodeId = await getOrCreateFeatureNode(startFeature);
                 const discriminatorNodeId = await getOrCreateFeatureNode(bestDiscriminator);
 
-                const increment = bestMetrics?.sampleSize || 1;
+                const affinityFactor = bestMetrics ? Math.max(0.5, Math.min(bestMetrics.affinity, 2)) : 1;
+                const costNormalizer = bestMetrics ? Math.max(1, Math.log1p(bestMetrics.originalCandidateCount || bestMetrics.sampleSize || 1)) : 1;
+                const increment = bestMetrics
+                    ? Math.max(1, Math.round((bestMetrics.sampleSize * affinityFactor) / costNormalizer))
+                    : 1;
                 await updateNodeStats(startNodeId, 'hit', increment);
                 await updateNodeStats(discriminatorNodeId, 'hit', increment);
 

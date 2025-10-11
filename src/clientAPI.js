@@ -1,9 +1,12 @@
 // --- LIBRARIES ---
 const fs = require('fs/promises');
-const { generateSpecificVector } = require('./featureExtractor.js');
+const { generateSpecificVector, GRID_SIZES, NEIGHBOR_OFFSETS } = require('./featureExtractor.js');
 
 // --- CONFIGURATION ---
 const API_BASE_URL = 'http://localhost:3000';
+const DEFAULT_GRID = GRID_SIZES[Math.floor(GRID_SIZES.length / 2)] || GRID_SIZES[0] || 8;
+const DEFAULT_OFFSET = NEIGHBOR_OFFSETS.find(({ dx, dy }) => dx === 1 && dy === 0) || NEIGHBOR_OFFSETS[0] || { dx: 1, dy: 0, key: 'dx1dy0' };
+const DEFAULT_VECTOR_TYPE = `hsv_rel_gradient_g${DEFAULT_GRID}_${DEFAULT_OFFSET.key}`;
 
 // --- MAIN LOGIC ---
 
@@ -18,7 +21,13 @@ async function findImageRemotely(imagePath) {
     console.log(`🔎 Starting remote search for: ${imagePath}`);
     
     // 1. Generate the initial probe vector and start the session
-    const probeSpec = { vector_type: 'hsv_gradient_h', resolution_level: 2, pos_x: 0, pos_y: 0 };
+    const probeSpec = {
+        vector_type: DEFAULT_VECTOR_TYPE,
+        augmentation: 'original',
+        resolution_level: DEFAULT_GRID,
+        pos_x: 0,
+        pos_y: 0,
+    };
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
 
     if (!probeVector) {
@@ -31,6 +40,7 @@ async function findImageRemotely(imagePath) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             ...probeSpec,
+            augmentation: probeSpec.augmentation,
             vector_base64: probeVector.toString('base64')
         })
     });
@@ -44,7 +54,7 @@ async function findImageRemotely(imagePath) {
         iterations++;
         const nextQuestion = result.nextQuestion;
         
-        console.log(`  [Iteration ${iterations}] Server asks for: ${nextQuestion.type} at level ${nextQuestion.level} [${nextQuestion.x}, ${nextQuestion.y}]`);
+        console.log(`  [Iteration ${iterations}] Server asks for: ${nextQuestion.type} (${nextQuestion.augmentation}) at level ${nextQuestion.level} [${nextQuestion.x}, ${nextQuestion.y}]`);
         if (nextQuestion.metrics) {
             const stats = nextQuestion.metrics;
             console.log(
@@ -53,6 +63,7 @@ async function findImageRemotely(imagePath) {
         }
         const nextVector = await generateSpecificVector(imagePath, {
             vector_type: nextQuestion.type,
+            augmentation: nextQuestion.augmentation,
             resolution_level: nextQuestion.level,
             pos_x: nextQuestion.x,
             pos_y: nextQuestion.y
