@@ -219,8 +219,25 @@ async function discoverCorrelations({
 
             for (const row of targetRows) {
                 const candidate = hydrateFeatureRow(row);
-                const [candidateRows] = await dbConnection.execute(
-                    `SELECT fv.*, vt.descriptor_json
+
+                let placeholders = ""
+                let _candidateImageIds = []
+                for(let i=0; i < candidateImageIds.size; i++){ // the old way
+                    if(i > 0) placeholders += ", "
+
+                    if(false){
+                        placeholders += "?"
+                        _candidateImageIds.push(candidateImageIds[i])                
+                    }
+                    else {
+                        placeholders += "'"+candidateImageIds[i]+"'"
+                    }
+                }
+
+                if(candidateImageIds.size > 1 || true) 
+                    placeholders = "("+placeholders+")";
+
+                let query = `SELECT fv.*, vt.descriptor_json
                      FROM feature_vectors fv
                      JOIN value_types vt ON vt.value_type_id = fv.value_type
                      WHERE fv.value_type = ?
@@ -229,7 +246,10 @@ async function discoverCorrelations({
                        AND fv.pos_y = ?
                        AND ABS(fv.rel_x - ?) < 1e-6
                        AND ABS(fv.rel_y - ?) < 1e-6
-                       AND fv.image_id IN (?)`,
+                       AND fv.image_id IN ${placeholders}`
+
+                const [candidateRows] = await dbConnection.execute(
+                    query,
                     [
                         candidate.value_type,
                         candidate.resolution_level,
@@ -237,7 +257,7 @@ async function discoverCorrelations({
                         candidate.pos_y,
                         candidate.rel_x,
                         candidate.rel_y,
-                        [...candidateImageIds],
+                        //_candidateImageIds,
                     ]
                 );
 
