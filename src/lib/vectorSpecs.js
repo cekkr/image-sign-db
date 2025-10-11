@@ -1,4 +1,5 @@
-const { GRID_SIZES, NEIGHBOR_OFFSETS } = require('./constants');
+const { GRID_SIZES, NEIGHBOR_OFFSETS, CHANNEL_DIMENSIONS } = require('./constants');
+const { createDescriptorKey } = require('./descriptor');
 
 function resolveDefaultProbeSpec(override = {}) {
     const gridSize =
@@ -11,6 +12,15 @@ function resolveDefaultProbeSpec(override = {}) {
         NEIGHBOR_OFFSETS.find(({ dx, dy }) => dx === 1 && dy === 0) ??
         NEIGHBOR_OFFSETS[0] ?? { dx: 1, dy: 0 };
 
+    const channel = override.channel ?? CHANNEL_DIMENSIONS[0];
+    const descriptor = override.descriptor ?? {
+        family: 'delta',
+        channel,
+        neighbor_dx: override.dx ?? offset.dx,
+        neighbor_dy: override.dy ?? offset.dy,
+    };
+    const descriptorKey = createDescriptorKey(descriptor);
+
     return {
         gridSize,
         pos_x: override.pos_x ?? 0,
@@ -18,7 +28,8 @@ function resolveDefaultProbeSpec(override = {}) {
         dx: override.dx ?? offset.dx,
         dy: override.dy ?? offset.dy,
         augmentation: override.augmentation ?? 'original',
-        channel: override.channel ?? 'h',
+        descriptor,
+        descriptorKey,
     };
 }
 

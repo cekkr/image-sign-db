@@ -5,16 +5,18 @@ const crypto = require('crypto');
 require('dotenv').config();
 const { generateSpecificVector, resolveDefaultProbeSpec } = require('./featureExtractor');
 const { euclideanDistance } = require('./lib/correlationMetrics');
+const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
+const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
+const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const VALUE_THRESHOLD = 0.08;
-const CHANNEL_ROTATION = ['h', 's', 'v', 'luminance', 'stddev'];
 
 // --- DATABASE / CACHE ---
 let dbConnection;
-const valueTypeCache = new Map(); // channel -> id
-const searchSessions = new Map(); // sessionId -> { candidateIds, askedChannels, probeSpec }
+const descriptorCache = new Map(); // descriptorKey -> { id, descriptor }
+const searchSessions = new Map(); // sessionId -> { candidateIds, askedDescriptorKeys, probeSpec }
 
 async function connectToDatabase() {
     if (dbConnection && dbConnection.connection && !dbConnection.connection._closing) {
@@ -30,18 +32,58 @@ async function connectToDatabase() {
     return dbConnection;
 }
 
-async function resolveValueTypeId(db, channel) {
-    if (valueTypeCache.has(channel)) return valueTypeCache.get(channel);
-    const [rows] = await db.execute('SELECT value_type_id FROM value_types WHERE channel_name = ?', [channel]);
-    if (rows.length === 0) {
-        throw new Error(`Unknown channel '${channel}'. Please ensure value_types is seeded.`);
+function normalizeProbeSpec(spec) {
+    const normalized = { ...spec };
+    const defaultGrid = GRID_SIZES[Math.floor(GRID_SIZES.length / 2)] ?? GRID_SIZES[0] ?? 10;
+    normalized.gridSize = normalized.gridSize ?? normalized.resolution_level ?? defaultGrid;
+    normalized.dx = normalized.dx ?? 1;
+    normalized.dy = normalized.dy ?? 0;
+    normalized.pos_x = normalized.pos_x ?? 0;
+    normalized.pos_y = normalized.pos_y ?? 0;
+    normalized.augmentation = normalized.augmentation ?? 'original';
+    normalized.rel_x = normalized.rel_x ?? normalized.dx / normalized.gridSize;
+    normalized.rel_y = normalized.rel_y ?? normalized.dy / normalized.gridSize;
+    normalized.size = normalized.size ?? 1 / normalized.gridSize;
+
+    if (!normalized.descriptor) {
+        const channel = normalized.channel ?? CHANNEL_DIMENSIONS[0];
+        normalized.descriptor = {
+            family: 'delta',
+            channel,
+            neighbor_dx: normalized.dx,
+            neighbor_dy: normalized.dy,
+        };
     }
-    const id = rows[0].value_type_id;
-    valueTypeCache.set(channel, id);
-    return id;
+    normalized.descriptorKey = normalized.descriptorKey ?? createDescriptorKey(normalized.descriptor);
+    return normalized;
+}
+
+async function ensureValueTypeRecord(db, descriptor) {
+    const descriptorKey = createDescriptorKey(descriptor);
+    if (descriptorCache.has(descriptorKey)) return descriptorCache.get(descriptorKey);
+
+    const [rows] = await db.execute(
+        'SELECT value_type_id, descriptor_json FROM value_types WHERE descriptor_hash = ?',
+        [descriptorKey]
+    );
+    if (rows.length > 0) {
+        const parsed = parseDescriptor(rows[0].descriptor_json) || descriptor;
+        const record = { id: rows[0].value_type_id, descriptor: parsed, descriptorKey };
+        descriptorCache.set(descriptorKey, record);
+        return record;
+    }
+
+    const [result] = await db.execute(
+        'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
+        [descriptorKey, serializeDescriptor(descriptor)]
+    );
+    const record = { id: result.insertId, descriptor, descriptorKey };
+    descriptorCache.set(descriptorKey, record);
+    return record;
 }
 
 function rowToFeature(row) {
+    const descriptor = parseDescriptor(row.descriptor_json);
     return {
         ...row,
         value_type: row.value_type,
@@ -52,20 +94,25 @@ function rowToFeature(row) {
         rel_y: row.rel_y,
         value: row.value,
         size: row.size,
+        descriptor,
+        descriptorKey: descriptor ? createDescriptorKey(descriptor) : null,
     };
 }
 
 async function findCandidateImages(db, probe) {
-    const valueTypeId = await resolveValueTypeId(db, probe.channel);
+    const valueTypeRecord = await ensureValueTypeRecord(db, probe.descriptor);
+    const valueTypeId = valueTypeRecord.id;
+
     const [rows] = await db.execute(
-        `SELECT vector_id, image_id, value_type, resolution_level, pos_x, pos_y, rel_x, rel_y, value, size
-         FROM feature_vectors
-         WHERE value_type = ?
-           AND resolution_level = ?
-           AND pos_x = ?
-           AND pos_y = ?
-           AND ABS(rel_x - ?) < 1e-6
-           AND ABS(rel_y - ?) < 1e-6`,
+        `SELECT fv.vector_id, fv.image_id, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, fv.rel_x, fv.rel_y, fv.value, fv.size, vt.descriptor_json
+         FROM feature_vectors fv
+         JOIN value_types vt ON vt.value_type_id = fv.value_type
+         WHERE fv.value_type = ?
+           AND fv.resolution_level = ?
+           AND fv.pos_x = ?
+           AND fv.pos_y = ?
+           AND ABS(fv.rel_x - ?) < 1e-6
+           AND ABS(fv.rel_y - ?) < 1e-6`,
         [
             valueTypeId,
             probe.gridSize,
@@ -80,28 +127,25 @@ async function findCandidateImages(db, probe) {
     for (const row of rows) {
         const feature = rowToFeature(row);
         const distance = euclideanDistance(
-            { ...probe, value_type: valueTypeId, resolution_level: probe.gridSize, size: probe.size },
+            {
+                ...probe,
+                value_type: valueTypeId,
+                resolution_level: probe.gridSize,
+                size: probe.size,
+            },
             feature
         );
         if (distance <= VALUE_THRESHOLD) {
             candidates.add(row.image_id);
         }
     }
-    return { candidates: [...candidates], valueTypeId };
-}
-
-function chooseNextChannel(session) {
-    for (const channel of CHANNEL_ROTATION) {
-        if (!session.askedChannels.has(channel)) {
-            return channel;
-        }
-    }
-    return null;
+    return { candidates: [...candidates], valueTypeId, descriptorKey: valueTypeRecord.descriptorKey };
 }
 
 async function startSearch(probeSpec) {
+    const normalizedProbe = normalizeProbeSpec(probeSpec);
     const db = await connectToDatabase();
-    const { candidates, valueTypeId } = await findCandidateImages(db, probeSpec);
+    const { candidates, valueTypeId, descriptorKey } = await findCandidateImages(db, normalizedProbe);
 
     if (candidates.length === 0) return { status: 'NO_MATCH' };
     if (candidates.length === 1) return { status: 'MATCH_FOUND', imageId: candidates[0] };
@@ -109,8 +153,8 @@ async function startSearch(probeSpec) {
     const sessionId = crypto.randomBytes(16).toString('hex');
     searchSessions.set(sessionId, {
         candidateIds: candidates,
-        probeSpec: { ...probeSpec, valueTypeId },
-        askedChannels: new Set([probeSpec.channel]),
+        probeSpec: { ...normalizedProbe, valueTypeId, descriptorKey },
+        askedDescriptorKeys: new Set([descriptorKey]),
     });
     return { status: 'CANDIDATES_FOUND', sessionId, candidates };
 }
@@ -122,7 +166,8 @@ async function refineSearch(sessionId, probeSpec) {
     }
 
     const db = await connectToDatabase();
-    const { candidates, valueTypeId } = await findCandidateImages(db, probeSpec);
+    const normalizedProbe = normalizeProbeSpec(probeSpec);
+    const { candidates, valueTypeId, descriptorKey } = await findCandidateImages(db, normalizedProbe);
     const remaining = candidates.filter((id) => session.candidateIds.includes(id));
 
     if (remaining.length === 0) {
@@ -135,26 +180,42 @@ async function refineSearch(sessionId, probeSpec) {
     }
 
     session.candidateIds = remaining;
-    session.askedChannels.add(probeSpec.channel);
-    session.probeSpec = { ...probeSpec, valueTypeId };
+    session.askedDescriptorKeys.add(descriptorKey);
+    session.probeSpec = { ...normalizedProbe, valueTypeId, descriptorKey };
     searchSessions.set(sessionId, session);
 
     return { status: 'CANDIDATES_FOUND', candidates: remaining };
 }
 
 function buildNextQuestion(session) {
-    const nextChannel = chooseNextChannel(session);
-    if (!nextChannel) return null;
+    const baseDescriptor = session.probeSpec.descriptor;
+    const template = baseDescriptor ? { ...baseDescriptor } : null;
 
-    return {
-        channel: nextChannel,
-        gridSize: session.probeSpec.gridSize,
-        pos_x: session.probeSpec.pos_x,
-        pos_y: session.probeSpec.pos_y,
-        dx: session.probeSpec.dx,
-        dy: session.probeSpec.dy,
-        augmentation: session.probeSpec.augmentation,
-    };
+    for (const channel of CHANNEL_DIMENSIONS) {
+        const descriptor = template ? { ...template, channel } : {
+            family: 'delta',
+            channel,
+            neighbor_dx: session.probeSpec.dx,
+            neighbor_dy: session.probeSpec.dy,
+        };
+        const descriptorKey = createDescriptorKey(descriptor);
+        if (!session.askedDescriptorKeys.has(descriptorKey)) {
+            return {
+                gridSize: session.probeSpec.gridSize,
+                pos_x: session.probeSpec.pos_x,
+                pos_y: session.probeSpec.pos_y,
+                dx: session.probeSpec.dx,
+                dy: session.probeSpec.dy,
+                augmentation: session.probeSpec.augmentation,
+                descriptor,
+                descriptorKey,
+                rel_x: session.probeSpec.rel_x,
+                rel_y: session.probeSpec.rel_y,
+                size: session.probeSpec.size,
+            };
+        }
+    }
+    return null;
 }
 
 // --- EXPRESS SERVER ---
@@ -165,7 +226,7 @@ function runServer() {
 
     app.post('/search/start', async (req, res) => {
         try {
-            const probeSpec = req.body;
+            const probeSpec = normalizeProbeSpec(req.body);
             const result = await startSearch(probeSpec);
             if (result.status === 'CANDIDATES_FOUND') {
                 const session = searchSessions.get(result.sessionId);
@@ -182,7 +243,7 @@ function runServer() {
     app.post('/search/refine', async (req, res) => {
         try {
             const { sessionId, probe } = req.body;
-            const result = await refineSearch(sessionId, probe);
+            const result = await refineSearch(sessionId, normalizeProbeSpec(probe));
             if (result.error) {
                 return res.status(404).json({ error: result.error });
             }
@@ -195,6 +256,48 @@ function runServer() {
         } catch (error) {
             console.error('API Error on /search/refine:', error);
             res.status(500).json({ error: 'Internal Server Error' });
+        }
+    });
+
+    app.post('/images', async (req, res) => {
+        try {
+            const { path: imagePath, discover = 0 } = req.body || {};
+            if (!imagePath) {
+                return res.status(400).json({ error: 'Missing image path.' });
+            }
+            const { imageId, featureCount } = await ingestImage(imagePath, Number(discover));
+            res.json({ status: 'OK', imageId, featureCount });
+        } catch (error) {
+            console.error('API Error on POST /images:', error);
+            res.status(500).json({ error: error.message || 'Internal Server Error' });
+        }
+    });
+
+    app.delete('/images/:identifier', async (req, res) => {
+        try {
+            const identifier = req.params.identifier;
+            if (!identifier) {
+                return res.status(400).json({ error: 'Missing image identifier.' });
+            }
+            const result = await removeImage(identifier);
+            if (!result.removed) {
+                return res.status(404).json({ error: result.reason || 'Image not found.' });
+            }
+            res.json({ status: 'OK', imageId: result.imageId });
+        } catch (error) {
+            console.error('API Error on DELETE /images:', error);
+            res.status(500).json({ error: error.message || 'Internal Server Error' });
+        }
+    });
+
+    app.post('/discover', async (req, res) => {
+        try {
+            const iterations = req.body?.iterations ?? req.query?.iterations ?? 50;
+            await bootstrapCorrelations(iterations);
+            res.json({ status: 'OK', iterations: Number(iterations) });
+        } catch (error) {
+            console.error('API Error on POST /discover:', error);
+            res.status(500).json({ error: error.message || 'Internal Server Error' });
         }
     });
 
@@ -217,8 +320,10 @@ async function runCli(imagePath) {
         ...probeSpec,
         rel_x: probeSpec.dx / probeSpec.gridSize,
         rel_y: probeSpec.dy / probeSpec.gridSize,
-        value: vector[probeSpec.channel],
+        value: vector.value,
         size: vector.size,
+        descriptor: probeSpec.descriptor,
+        descriptorKey: probeSpec.descriptorKey,
     };
 
     const result = await startSearch(probe);
@@ -239,15 +344,20 @@ async function runCli(imagePath) {
     let nextQuestion = buildNextQuestion(session);
     let iteration = 0;
 
-    while (nextQuestion && iteration < CHANNEL_ROTATION.length) {
+    while (nextQuestion && iteration < CHANNEL_DIMENSIONS.length) {
         iteration += 1;
+        console.log(
+            `  [Iteration ${iteration}] Requesting descriptor ${nextQuestion.descriptorKey} (channel ${nextQuestion.descriptor?.channel ?? '?'})`
+        );
         const nextVector = await generateSpecificVector(imagePath, nextQuestion);
         const probeUpdate = {
             ...nextQuestion,
             rel_x: nextQuestion.dx / nextQuestion.gridSize,
             rel_y: nextQuestion.dy / nextQuestion.gridSize,
-            value: nextVector[nextQuestion.channel],
+            value: nextVector.value,
             size: nextVector.size,
+            descriptor: nextQuestion.descriptor,
+            descriptorKey: nextQuestion.descriptorKey,
         };
 
         const refinement = await refineSearch(sessionId, probeUpdate);

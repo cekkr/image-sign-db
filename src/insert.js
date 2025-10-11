@@ -32,7 +32,7 @@ function parseArgs(argv) {
     return { command, positional, options };
 }
 
-async function removeImageSign(identifier) {
+async function removeImage(identifier) {
     const connection = await createDbConnection();
     try {
         let imageId = null;
@@ -70,13 +70,28 @@ async function runCorrelationDiscovery(iterations) {
             }
         },
         onDiscriminatorSelected({ iterationNumber, startFeature, discriminatorFeature, metrics, ambiguousCandidates }) {
+            const startChannel = startFeature.descriptor?.channel ?? `#${startFeature.value_type}`;
+            const discChannel = discriminatorFeature.descriptor?.channel ?? `#${discriminatorFeature.value_type}`;
             console.log(
-                `  [${iterationNumber}] Learned correlation channel ${startFeature.value_type} (res=${startFeature.resolution_level}) ` +
-                `→ channel ${discriminatorFeature.value_type} (res=${discriminatorFeature.resolution_level}) ` +
+                `  [${iterationNumber}] Learned correlation ${startChannel} (res=${startFeature.resolution_level}) ` +
+                `→ ${discChannel} (res=${discriminatorFeature.resolution_level}) ` +
                 `(spread=${metrics.spread.toFixed(4)}, affinity=${metrics.affinity.toFixed(4)}, candidates=${ambiguousCandidates})`
             );
         },
     });
+}
+
+async function ingestImage(imagePath, discoverIterations = 0) {
+    const resolvedPath = path.resolve(process.cwd(), imagePath);
+    console.log(`\n📥 Ingesting image: ${resolvedPath}`);
+    const { imageId, featureCount } = await extractAndStoreFeatures(resolvedPath);
+    console.log(`   → Stored ${featureCount} feature vectors (image_id=${imageId})`);
+
+    if (discoverIterations > 0) {
+        await runCorrelationDiscovery(discoverIterations);
+    }
+
+    return { imageId, featureCount };
 }
 
 async function handleAddCommand(positional, options) {
@@ -85,15 +100,8 @@ async function handleAddCommand(positional, options) {
         throw new Error('Missing image path. Usage: node src/insert.js add <path_to_image> [--discover=25]');
     }
 
-    const resolvedPath = path.resolve(process.cwd(), imagePath);
-    console.log(`\n📥 Ingesting image: ${resolvedPath}`);
-    const { imageId, featureCount } = await extractAndStoreFeatures(resolvedPath);
-    console.log(`   → Stored ${featureCount} feature vectors (image_id=${imageId})`);
-
     const discoverIterations = Number.parseInt(options.discover ?? '0', 10);
-    if (discoverIterations > 0) {
-        await runCorrelationDiscovery(discoverIterations);
-    }
+    await ingestImage(imagePath, discoverIterations);
 }
 
 async function handleRemoveCommand(positional) {
@@ -102,7 +110,7 @@ async function handleRemoveCommand(positional) {
         throw new Error('Missing image identifier. Usage: node src/insert.js remove <image_id|original_filename>');
     }
 
-    const result = await removeImageSign(identifier);
+    const result = await removeImage(identifier);
     if (!result.removed) {
         console.log(`⚠️  Nothing removed: ${result.reason}`);
     } else {
@@ -110,14 +118,19 @@ async function handleRemoveCommand(positional) {
     }
 }
 
-async function handleBootstrapCommand(positional, options) {
-    const iterations = Number.parseInt(positional[0] ?? options.iterations ?? '75', 10);
-    if (Number.isNaN(iterations) || iterations <= 0) {
+async function bootstrapCorrelations(iterations) {
+    const total = Number.parseInt(iterations, 10);
+    if (Number.isNaN(total) || total <= 0) {
         throw new Error('Bootstrap requires a positive number of iterations.');
     }
 
-    console.log(`\n🧠 Bootstrapping correlations for ${iterations} iteration(s)`);
-    await runCorrelationDiscovery(iterations);
+    console.log(`\n🧠 Bootstrapping correlations for ${total} iteration(s)`);
+    await runCorrelationDiscovery(total);
+}
+
+async function handleBootstrapCommand(positional, options) {
+    const iterations = positional[0] ?? options.iterations ?? '75';
+    await bootstrapCorrelations(iterations);
 }
 
 async function main() {
@@ -150,3 +163,9 @@ async function main() {
 if (require.main === module) {
     main();
 }
+
+module.exports = {
+    ingestImage,
+    removeImage,
+    bootstrapCorrelations,
+};

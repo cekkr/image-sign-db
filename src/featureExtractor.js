@@ -32,27 +32,28 @@ async function collectFeaturesForAugmentations(originalImage, imagePath, augment
     return featureBatches;
 }
 
-async function ensureValueTypeId(dbConnection, channelName, cache) {
-    if (cache.has(channelName)) return cache.get(channelName);
+async function ensureValueTypeId(dbConnection, descriptor, cache) {
+    const descriptorKey = createDescriptorKey(descriptor);
+    if (cache.has(descriptorKey)) return cache.get(descriptorKey);
     const [rows] = await dbConnection.execute(
-        'SELECT value_type_id FROM value_types WHERE channel_name = ?',
-        [channelName]
+        'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
+        [descriptorKey]
     );
     if (rows.length > 0) {
-        cache.set(channelName, rows[0].value_type_id);
+        cache.set(descriptorKey, rows[0].value_type_id);
         return rows[0].value_type_id;
     }
     const [result] = await dbConnection.execute(
-        'INSERT INTO value_types (channel_name, description) VALUES (?, ?)',
-        [channelName, `${channelName} channel`]
+        'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
+        [descriptorKey, serializeDescriptor(descriptor)]
     );
-    cache.set(channelName, result.insertId);
+    cache.set(descriptorKey, result.insertId);
     return result.insertId;
 }
 
 async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTypeCache) {
     for (const feature of featureBatch.allFeatures) {
-        const valueTypeId = await ensureValueTypeId(dbConnection, feature.channel, valueTypeCache);
+        const valueTypeId = await ensureValueTypeId(dbConnection, feature.descriptor, valueTypeCache);
         await dbConnection.execute(
             `INSERT INTO feature_vectors (
                 image_id,

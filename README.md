@@ -27,7 +27,7 @@ In the latest revision the extractor also:
 
 *   Runs a configurable **augmentation sweep** (horizontal/vertical mirroring, Gaussian blur, and three deterministic "random combo" crops/rotations/color jitters derived from the filename) so the database learns how an image behaves under common edits without ever persisting the transformed pixels.
 *   Builds a **deterministic quadtree** on top of every image. Each node contributes both its HSV/luminance signature (`hsv_tree_mean`) and how that node diverges from its parent (`hsv_tree_delta`). This gives the search engine a true coarse‑to‑fine "tree dividing" map that can express global context and local anomalies simultaneously.
-*   Persists every measurement as a relative row (`value_type`, resolution, grid index, displacement, value, size) so downstream tools can rebuild comparisons without depending on opaque vector identifiers.
+*   Persists every measurement as a relative row (`value_type` id, resolution, grid index, displacement, value, size). Vector semantics live in hashed descriptor blobs (`value_types.descriptor_hash`/`descriptor_json`), keeping the database agnostic while the JavaScript layer can evolve descriptors freely.
 
 ### 2\. Hierarchical Knowledge Graph via MySQL
 
@@ -100,7 +100,7 @@ The project is divided into several standalone scripts that interact via the cen
     
 *   `src/insert.js`: The "conductor." Adds or removes images, optionally triggers targeted correlation discovery, and exposes a `bootstrap` mode for the initial learning pass over a dataset.
     
-*   `src/index.js`: The main application engine. Contains the core search logic, performs real-time learning, and can be run as a standalone CLI tool or as an Express web server.
+*   `src/index.js`: The main application engine. Contains the core search logic, performs real-time learning, and can be run as a standalone CLI tool or as an Express web server. The server also exposes `/images` (add/remove signed images), `/discover` (kick off correlation learning), and the `/search/*` endpoints.
     
 *   `src/clientAPI.js`: A simple command-line client that demonstrates how to interact with the Express server's secure API and now prints the correlation metrics that guided each follow-up question.
     

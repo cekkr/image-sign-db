@@ -18,21 +18,10 @@ CREATE TABLE IF NOT EXISTS images (
 const createValueTypesTableSQL = `
 CREATE TABLE IF NOT EXISTS value_types (
     value_type_id MEDIUMINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    channel_name VARCHAR(32) NOT NULL,
-    description VARCHAR(255),
-    UNIQUE KEY uq_channel_name (channel_name)
+    descriptor_hash CHAR(40) NOT NULL,
+    descriptor_json JSON,
+    UNIQUE KEY uq_descriptor_hash (descriptor_hash)
 ) ENGINE=InnoDB;`;
-
-const VALUE_TYPE_SEEDS = [
-    ['r', 'Red channel'],
-    ['g', 'Green channel'],
-    ['b', 'Blue channel'],
-    ['h', 'Hue (HSV)'],
-    ['s', 'Saturation (HSV)'],
-    ['v', 'Value/Brightness (HSV)'],
-    ['luminance', 'Relative luminance'],
-    ['stddev', 'Standard deviation of luminance'],
-];
 
 const createFeatureVectorsTableSQL = `
 CREATE TABLE IF NOT EXISTS feature_vectors (
@@ -115,12 +104,6 @@ async function setupDatabase() {
         console.log(" -> Creating 'value_types' table...");
         await connection.query(createValueTypesTableSQL);
         console.log("    ✅ Table 'value_types' is ready.");
-        for (const [channel, description] of VALUE_TYPE_SEEDS) {
-            await connection.query(
-                'INSERT IGNORE INTO value_types (channel_name, description) VALUES (?, ?)',
-                [channel, description]
-            );
-        }
 
         console.log(" -> Creating 'feature_vectors' table...");
         await connection.query(createFeatureVectorsTableSQL);

@@ -1,6 +1,7 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
+const { parseDescriptor, createDescriptorKey } = require('./descriptor');
 
 async function createDbConnection() {
     return mysql.createConnection({
@@ -145,22 +146,29 @@ async function discoverCorrelations({
             onIterationStart?.(iterationNumber, iterations);
 
             const targetImageId = imageIds[Math.floor(Math.random() * imageIds.length)];
-            const [startFeatures] = await dbConnection.execute(
-                `SELECT * FROM feature_vectors WHERE image_id = ? ORDER BY RAND() LIMIT 1`,
+            const [startRows] = await dbConnection.execute(
+                `SELECT fv.*, vt.descriptor_json
+                 FROM feature_vectors fv
+                 JOIN value_types vt ON vt.value_type_id = fv.value_type
+                 WHERE fv.image_id = ?
+                 ORDER BY RAND()
+                 LIMIT 1`,
                 [targetImageId]
             );
-            const startFeature = startFeatures[0];
-            if (!startFeature) continue;
+            if (startRows.length === 0) continue;
+            const startFeature = hydrateFeatureRow(startRows[0]);
 
-            const [similarFeatures] = await dbConnection.execute(
-                `SELECT * FROM feature_vectors
-                 WHERE value_type = ?
-                   AND resolution_level = ?
-                   AND pos_x = ?
-                   AND pos_y = ?
-                   AND ABS(rel_x - ?) < 1e-6
-                   AND ABS(rel_y - ?) < 1e-6
-                   AND image_id != ?`,
+            const [similarRows] = await dbConnection.execute(
+                `SELECT fv.*, vt.descriptor_json
+                 FROM feature_vectors fv
+                 JOIN value_types vt ON vt.value_type_id = fv.value_type
+                 WHERE fv.value_type = ?
+                   AND fv.resolution_level = ?
+                   AND fv.pos_x = ?
+                   AND fv.pos_y = ?
+                   AND ABS(fv.rel_x - ?) < 1e-6
+                   AND ABS(fv.rel_y - ?) < 1e-6
+                   AND fv.image_id != ?`,
                 [
                     startFeature.value_type,
                     startFeature.resolution_level,
@@ -173,7 +181,8 @@ async function discoverCorrelations({
             );
 
             const candidateImageIds = new Set();
-            for (const feature of similarFeatures) {
+            for (const row of similarRows) {
+                const feature = hydrateFeatureRow(row);
                 if (euclideanDistance(startFeature, feature) < similarityThreshold) {
                     candidateImageIds.add(feature.image_id);
                 }
@@ -185,21 +194,27 @@ async function discoverCorrelations({
             let bestMetrics = null;
             let bestScore = -Infinity;
 
-            const [targetFeatures] = await dbConnection.execute(
-                'SELECT * FROM feature_vectors WHERE image_id = ?',
+            const [targetRows] = await dbConnection.execute(
+                `SELECT fv.*, vt.descriptor_json
+                 FROM feature_vectors fv
+                 JOIN value_types vt ON vt.value_type_id = fv.value_type
+                 WHERE fv.image_id = ?`,
                 [targetImageId]
             );
 
-            for (const candidate of targetFeatures) {
-                const [candidateFeatures] = await dbConnection.execute(
-                    `SELECT * FROM feature_vectors
-                     WHERE value_type = ?
-                       AND resolution_level = ?
-                       AND pos_x = ?
-                       AND pos_y = ?
-                       AND ABS(rel_x - ?) < 1e-6
-                       AND ABS(rel_y - ?) < 1e-6
-                       AND image_id IN (?)`,
+            for (const row of targetRows) {
+                const candidate = hydrateFeatureRow(row);
+                const [candidateRows] = await dbConnection.execute(
+                    `SELECT fv.*, vt.descriptor_json
+                     FROM feature_vectors fv
+                     JOIN value_types vt ON vt.value_type_id = fv.value_type
+                     WHERE fv.value_type = ?
+                       AND fv.resolution_level = ?
+                       AND fv.pos_x = ?
+                       AND fv.pos_y = ?
+                       AND ABS(fv.rel_x - ?) < 1e-6
+                       AND ABS(fv.rel_y - ?) < 1e-6
+                       AND fv.image_id IN (?)`,
                     [
                         candidate.value_type,
                         candidate.resolution_level,
@@ -211,7 +226,8 @@ async function discoverCorrelations({
                     ]
                 );
 
-                const evaluation = scoreCandidateFeature(candidate, candidateFeatures);
+                const hydratedCandidates = candidateRows.map(hydrateFeatureRow);
+                const evaluation = scoreCandidateFeature(candidate, hydratedCandidates);
                 if (!evaluation) continue;
 
                 if (evaluation.score > bestScore) {

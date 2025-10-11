@@ -33,8 +33,10 @@ async function findImageRemotely(imagePath) {
         ...probeSpec,
         rel_x: probeSpec.dx / probeSpec.gridSize,
         rel_y: probeSpec.dy / probeSpec.gridSize,
-        value: probeVector[probeSpec.channel],
+        value: probeVector.value,
         size: probeVector.size,
+        descriptor: probeSpec.descriptor,
+        descriptorKey: probeSpec.descriptorKey,
     };
 
     let response = await fetch(`${API_BASE_URL}/search/start`, {
@@ -54,7 +56,7 @@ async function findImageRemotely(imagePath) {
         const nextQuestion = result.nextQuestion;
         if (!nextQuestion) break;
 
-        console.log(`  [Iteration ${iterations}] Server requests channel '${nextQuestion.channel}' at grid ${nextQuestion.gridSize} [${nextQuestion.pos_x}, ${nextQuestion.pos_y}] Δ(${nextQuestion.dx},${nextQuestion.dy})`);
+        console.log(`  [Iteration ${iterations}] Server requests descriptor ${nextQuestion.descriptorKey} (channel: ${nextQuestion.descriptor?.channel ?? '?'}) at grid ${nextQuestion.gridSize} [${nextQuestion.pos_x}, ${nextQuestion.pos_y}] Δ(${nextQuestion.dx},${nextQuestion.dy})`);
 
         const nextVector = await generateSpecificVector(imagePath, nextQuestion);
         if (!nextVector) {
@@ -66,8 +68,10 @@ async function findImageRemotely(imagePath) {
             ...nextQuestion,
             rel_x: nextQuestion.dx / nextQuestion.gridSize,
             rel_y: nextQuestion.dy / nextQuestion.gridSize,
-            value: nextVector[nextQuestion.channel],
+            value: nextVector.value,
             size: nextVector.size,
+            descriptor: nextQuestion.descriptor,
+            descriptorKey: nextQuestion.descriptorKey,
         };
 
         response = await fetch(`${API_BASE_URL}/search/refine`, {

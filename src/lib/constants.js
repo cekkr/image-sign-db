@@ -12,7 +12,7 @@ const TREE_DEPTHS = Object.freeze([0, 1, 2, 3]);
 
 const STOCHASTIC_AUGMENTATIONS = Object.freeze(['random_combo_0', 'random_combo_1', 'random_combo_2']);
 
-const CHANNEL_DIMENSIONS = Object.freeze(['r', 'g', 'b', 'h', 's', 'v', 'luminance', 'stdDev']);
+const CHANNEL_DIMENSIONS = Object.freeze(['h', 's', 'v', 'luminance', 'stddev']);
 
 module.exports = {
     GRID_SIZES,

@@ -1,11 +1,12 @@
 // --- LIBRARIES ---
 const mysql = require('mysql2/promise');
 require('dotenv').config();
+const { createDescriptorKey, serializeDescriptor } = require('./lib/descriptor');
 
 // --- SAMPLE DATA ---
 const sampleCorrelations = [
     {
-        channel: 'h',
+        descriptor: { family: 'delta', channel: 'h', neighbor_dx: 1, neighbor_dy: 0 },
         resolution_level: 10,
         avg_length: 0.25,
         avg_angle: 0.12,
@@ -16,7 +17,7 @@ const sampleCorrelations = [
         mean_pearson: 0.28,
     },
     {
-        channel: 's',
+        descriptor: { family: 'delta', channel: 's', neighbor_dx: 1, neighbor_dy: 1 },
         resolution_level: 14,
         avg_length: 0.33,
         avg_angle: -0.35,
@@ -27,7 +28,7 @@ const sampleCorrelations = [
         mean_pearson: 0.18,
     },
     {
-        channel: 'luminance',
+        descriptor: { family: 'delta', channel: 'luminance', neighbor_dx: 2, neighbor_dy: 0 },
         resolution_level: 6,
         avg_length: 0.18,
         avg_angle: 0.48,
@@ -51,15 +52,23 @@ async function testAndSeedCorrelations() {
         });
 
         console.log("\n🌱 Seeding sample correlation stats...");
-        const [valueTypeRows] = await connection.execute('SELECT value_type_id, channel_name FROM value_types');
-        const valueTypeMap = new Map(valueTypeRows.map((row) => [row.channel_name, row.value_type_id]));
-
         for (const rule of sampleCorrelations) {
-            const valueTypeId = valueTypeMap.get(rule.channel);
-            if (!valueTypeId) {
-                console.warn(`  ⚠️  Skipping rule for unknown channel '${rule.channel}'`);
+            const descriptorKey = createDescriptorKey(rule.descriptor);
+            await connection.execute(
+                `INSERT INTO value_types (descriptor_hash, descriptor_json)
+                 VALUES (?, ?)
+                 ON DUPLICATE KEY UPDATE descriptor_json = VALUES(descriptor_json)`,
+                [descriptorKey, serializeDescriptor(rule.descriptor)]
+            );
+            const [rows] = await connection.execute(
+                'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
+                [descriptorKey]
+            );
+            if (rows.length === 0) {
+                console.warn(`  ⚠️  Could not resolve descriptor for ${descriptorKey}`);
                 continue;
             }
+            const valueTypeId = rows[0].value_type_id;
 
             const sql = `
                 INSERT INTO feature_group_stats (
@@ -93,7 +102,7 @@ async function testAndSeedCorrelations() {
                 rule.mean_cosine,
                 rule.mean_pearson,
             ]);
-            console.log(`  -> Upserted stats for channel '${rule.channel}' at resolution ${rule.resolution_level}.`);
+            console.log(`  -> Upserted stats for descriptor ${descriptorKey} at resolution ${rule.resolution_level}.`);
         }
 
         console.log("\n✅ Seeding complete. Verifying data...");

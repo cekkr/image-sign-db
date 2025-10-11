@@ -1,7 +1,8 @@
 const sharp = require('sharp');
-const { GRID_SIZES, NEIGHBOR_OFFSETS } = require('./constants');
+const { GRID_SIZES, NEIGHBOR_OFFSETS, CHANNEL_DIMENSIONS } = require('./constants');
 const { applyAugmentation } = require('./augmentations');
 const { getBlockRange, calculateStatsForRegion, getRawPixels } = require('./gridStats');
+const { createDescriptorKey } = require('./descriptor');
 
 function collectBlockStats(rawPixels, meta, gridSize) {
     const cache = new Array(gridSize * gridSize);
@@ -42,8 +43,18 @@ function generateRelativeGradientFeatures(rawPixels, meta) {
                         stddev: (neighborBlock.stdDev - currentBlock.stdDev) / 255,
                     };
 
-                    for (const [channel, value] of Object.entries(channelValues)) {
+                    for (const channel of CHANNEL_DIMENSIONS) {
+                        const descriptor = {
+                            family: 'delta',
+                            channel,
+                            neighbor_dx: offset.dx,
+                            neighbor_dy: offset.dy,
+                        };
+                        const descriptorKey = createDescriptorKey(descriptor);
+                        const value = channelValues[channel];
                         features.push({
+                            descriptor,
+                            descriptorKey,
                             channel,
                             resolution_level: gridSize,
                             pos_x: x,
@@ -83,6 +94,8 @@ async function generateSpecificVector(imagePath, spec) {
         dx,
         dy,
         augmentation = 'original',
+        descriptor,
+        descriptorKey,
     } = spec;
 
     if (pos_x >= gridSize || pos_y >= gridSize) return null;
@@ -103,12 +116,19 @@ async function generateSpecificVector(imagePath, spec) {
     const [targetStartY, targetEndY] = getBlockRange(gridSize, meta.height, targetY);
     const targetStats = calculateStatsForRegion(rawPixels, meta, targetStartX, targetStartY, targetEndX, targetEndY);
 
-    return {
+    const channelValues = {
         h: (targetStats.h - currentStats.h) / 360,
         s: (targetStats.s - currentStats.s) / 100,
         v: (targetStats.v - currentStats.v) / 100,
         luminance: (targetStats.luminance - currentStats.luminance) / 255,
         stddev: (targetStats.stdDev - currentStats.stdDev) / 255,
+    };
+
+    return {
+        descriptor,
+        descriptorKey: descriptorKey ?? (descriptor ? createDescriptorKey(descriptor) : null),
+        channelValues,
+        value: descriptor ? channelValues[descriptor.channel] : null,
         rel_x: dx / gridSize,
         rel_y: dy / gridSize,
         size: 1 / gridSize,
