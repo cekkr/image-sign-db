@@ -149,6 +149,9 @@ Initialize the database schema by running the setup script once.
 
 Create a folder (e.g., `training_dataset`) and fill it with the images you want the system to learn. Use the insertion tool to ingest each image (it calls the extractor internally and writes rows into `feature_vectors` with relative coordinates and channel IDs from `value_types`).
 
+    # Kick off training
+    node src/train.js ./path/to/dataset --discover=15 --bootstrap=75 --reprobe=50
+
     # Repeat for every image in your dataset
     node src/insert.js add path/to/training_dataset/image1.jpg --discover=15
     node src/insert.js add path/to/training_dataset/image2.png
@@ -185,7 +188,7 @@ You can find a match for a new image in two ways. The system will continue to le
     curl -X POST http://localhost:3000/settings/max-db-size -H "Content-Type: application/json" -d '{"value":6}'
         
     Every `/search/start` and `/search/refine` response now embeds the statistical profile that informed the next question. The CLI prints those metrics so you can monitor how separation quality evolves during the dialog.
-    
+        
 
 **B) Standalone CLI Mode**
 
