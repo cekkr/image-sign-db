@@ -27,19 +27,19 @@ In the latest revision the extractor also:
 
 *   Runs a configurable **augmentation sweep** (horizontal/vertical mirroring, Gaussian blur, and three deterministic "random combo" crops/rotations/color jitters derived from the filename) so the database learns how an image behaves under common edits without ever persisting the transformed pixels.
 *   Builds a **deterministic quadtree** on top of every image. Each node contributes both its HSV/luminance signature (`hsv_tree_mean`) and how that node diverges from its parent (`hsv_tree_delta`). This gives the search engine a true coarse‑to‑fine "tree dividing" map that can express global context and local anomalies simultaneously.
-*   Persists all of these variants using a predictable naming convention (`vector_type#augmentation`) so downstream tools can request the precise feature they need (e.g. `hsv_rel_gradient_g10_dx1dy0#mirror_horizontal` or `hsv_tree_delta#random_combo_2`).
+*   Persists every measurement as a relative row (`value_type`, resolution, grid index, displacement, value, size) so downstream tools can rebuild comparisons without depending on opaque vector identifiers.
 
 ### 2\. Hierarchical Knowledge Graph via MySQL
 
 The "brain" of the system is the `knowledge_nodes` table in MySQL. This table is designed as a self-referencing hierarchy to store learned information about feature utility. This knowledge graph is not static; it is a dynamic structure that is continuously updated and refined by the system's learning processes.
 
-*   **Leaf Nodes (`FEATURE`):** Each unique feature descriptor (e.g., "the relative HSV gradient on the 10×10 grid using offset Δx=1, Δy=0 at cell 3,4") is a leaf node in the graph.
+*   **Leaf Nodes (`FEATURE`):** Each row in `knowledge_nodes` points at a single feature vector stored in `feature_vectors`. The node stores the relative vector value observed for that feature (`vector_value`) so it can be re-weighted without touching the original measurement.
     
-*   **Parent Nodes (`GROUP`):** The training script learns which combinations of leaf nodes are effective at distinguishing images. It can group these features under a parent node. This allows the system to build abstract knowledge, such as "The combination of _this_ texture in the top-left and _that_ color transition in the center is a powerful identifier."
+*   **Group Nodes (`GROUP`):** When the system notices that two feature vectors co-operate well, it links their IDs and records the relative geometry between them (`vector_length`, `vector_angle`, and `vector_value`). This keeps the knowledge base lightweight while still capturing directionality (“vector 42 tends to follow vector 7 at a 0.4 radian turn and +0.12 intensity”).
     
-*   **Learning via Stats:** Each node has a `hit_count` and `miss_count`. These are updated during the training phase. A "hit" means the feature helped correctly identify an image or rule out a false positive. A "miss" means it didn't. The ratio of hits to misses determines the feature's calculated utility score.
+*   **Learning via Stats:** Each node tracks raw `hit_count` and `miss_count`. These counters are updated whenever a feature (or feature pair) proves useful, providing the utility score that guides the search loop.
     
-Complementing the graph is the new `feature_group_stats` table. It records real-time statistical summaries (mean distance, standard deviation, mean cosine similarity, and mean Pearson correlation) for every feature pair that training discovers to be useful. The search API now prefers those discriminators when they exist, falling back to raw `knowledge_nodes` scores only when no correlation has been learned yet.
+Complementing the graph is the `feature_group_stats` table. It aggregates relative statistics per channel and resolution (average vector length, angle, separation metrics) so discovery sweeps can be summarised without duplicating individual links. The search API can consult these stats or pick alternative channels on the fly.
 
 ### 3\. The Learning Process: Discovery and Refinement
 
@@ -96,7 +96,7 @@ The project is divided into several standalone scripts that interact via the cen
 
 *   `src/setupDatabase.js`: Creates the necessary MySQL database and tables (`images`, `feature_vectors`, `knowledge_nodes`, `feature_group_stats`). Run this first.
     
-*   `src/featureExtractor.js`: The "farmer." Reads an image, applies the augmentation sweep, calculates grid gradients plus quadtree features, and populates the database. It can also be used as a module to generate specific vectors (including augmented variants) on demand.
+*   `src/featureExtractor.js`: The "farmer." Reads an image, applies the augmentation sweep, and writes per-channel gradient vectors with relative coordinates (`value_types` + `feature_vectors`). It can also be used as a module to generate probe vectors on demand.
     
 *   `src/insert.js`: The "conductor." Adds or removes images, optionally triggers targeted correlation discovery, and exposes a `bootstrap` mode for the initial learning pass over a dataset.
     
@@ -137,7 +137,7 @@ Initialize the database schema by running the setup script once.
 
 ### Step 3: Populate with Data
 
-Create a folder (e.g., `training_dataset`) and fill it with the images you want the system to learn. Use the insertion tool to ingest each image (it calls the extractor internally).
+Create a folder (e.g., `training_dataset`) and fill it with the images you want the system to learn. Use the insertion tool to ingest each image (it calls the extractor internally and writes rows into `feature_vectors` with relative coordinates and channel IDs from `value_types`).
 
     # Repeat for every image in your dataset
     node src/insert.js add path/to/training_dataset/image1.jpg --discover=15

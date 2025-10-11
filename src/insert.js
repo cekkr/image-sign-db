@@ -63,7 +63,7 @@ async function runCorrelationDiscovery(iterations) {
     if (!iterations || iterations <= 0) return;
     await discoverCorrelations({
         iterations,
-        similarityThreshold: 0.1,
+        similarityThreshold: 0.2,
         onIterationStart(iteration, total) {
             if (iteration === 1) {
                 console.log(`\n🔁 Starting correlation sweep for ${total} iteration(s)`);
@@ -71,7 +71,8 @@ async function runCorrelationDiscovery(iterations) {
         },
         onDiscriminatorSelected({ iterationNumber, startFeature, discriminatorFeature, metrics, ambiguousCandidates }) {
             console.log(
-                `  [${iterationNumber}] Learned correlation ${startFeature.vector_type} ↦ ${discriminatorFeature.vector_type} ` +
+                `  [${iterationNumber}] Learned correlation channel ${startFeature.value_type} (res=${startFeature.resolution_level}) ` +
+                `→ channel ${discriminatorFeature.value_type} (res=${discriminatorFeature.resolution_level}) ` +
                 `(spread=${metrics.spread.toFixed(4)}, affinity=${metrics.affinity.toFixed(4)}, candidates=${ambiguousCandidates})`
             );
         },

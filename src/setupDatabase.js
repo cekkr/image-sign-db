@@ -15,68 +15,78 @@ CREATE TABLE IF NOT EXISTS images (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;`;
 
-// Table for individual feature vectors. Unchanged.
+const createValueTypesTableSQL = `
+CREATE TABLE IF NOT EXISTS value_types (
+    value_type_id MEDIUMINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    channel_name VARCHAR(32) NOT NULL,
+    description VARCHAR(255),
+    UNIQUE KEY uq_channel_name (channel_name)
+) ENGINE=InnoDB;`;
+
+const VALUE_TYPE_SEEDS = [
+    ['r', 'Red channel'],
+    ['g', 'Green channel'],
+    ['b', 'Blue channel'],
+    ['h', 'Hue (HSV)'],
+    ['s', 'Saturation (HSV)'],
+    ['v', 'Value/Brightness (HSV)'],
+    ['luminance', 'Relative luminance'],
+    ['stddev', 'Standard deviation of luminance'],
+];
+
 const createFeatureVectorsTableSQL = `
 CREATE TABLE IF NOT EXISTS feature_vectors (
     vector_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     image_id INT NOT NULL,
-    vector_type VARCHAR(50) NOT NULL,
+    value_type MEDIUMINT UNSIGNED NOT NULL,
     resolution_level TINYINT UNSIGNED NOT NULL,
     pos_x SMALLINT UNSIGNED NOT NULL,
     pos_y SMALLINT UNSIGNED NOT NULL,
-    vector_data BLOB NOT NULL,
+    rel_x FLOAT NOT NULL,
+    rel_y FLOAT NOT NULL,
+    value FLOAT NOT NULL,
+    size FLOAT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (image_id) REFERENCES images(image_id) ON DELETE CASCADE,
-    INDEX idx_feature_lookup (vector_type, resolution_level, pos_x, pos_y)
+    FOREIGN KEY (value_type) REFERENCES value_types(value_type_id),
+    INDEX idx_feature_lookup (value_type, resolution_level, pos_x, pos_y)
 ) ENGINE=InnoDB;`;
 
-// The NEW "knowledge base" of the system. This hierarchical structure can represent
-// relationships between individual features and groups of features.
 const createKnowledgeNodesTableSQL = `
 CREATE TABLE IF NOT EXISTS knowledge_nodes (
     node_id INT AUTO_INCREMENT PRIMARY KEY,
-    -- Self-referencing key to create the hierarchy. NULL for top-level nodes.
     parent_node_id INT,
-    -- Differentiates a leaf ('FEATURE') from a learned combination ('GROUP').
     node_type ENUM('FEATURE', 'GROUP') NOT NULL,
-    -- A flexible way to describe a leaf feature node without many columns.
-    feature_details JSON,
-    -- Raw counters for the learning algorithm to calculate utility.
+    vector_1_id BIGINT NOT NULL,
+    vector_2_id BIGINT,
+    vector_length FLOAT NOT NULL,
+    vector_angle FLOAT NOT NULL,
+    vector_value FLOAT NOT NULL,
     hit_count BIGINT DEFAULT 0,
     miss_count BIGINT DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (parent_node_id) REFERENCES knowledge_nodes(node_id) ON DELETE CASCADE,
-    -- Ensure feature definitions are unique to avoid duplicate leaf nodes.
-    UNIQUE KEY uq_feature_definition (node_type, feature_details(256))
+    FOREIGN KEY (vector_1_id) REFERENCES feature_vectors(vector_id) ON DELETE CASCADE,
+    FOREIGN KEY (vector_2_id) REFERENCES feature_vectors(vector_id) ON DELETE SET NULL,
+    UNIQUE KEY uq_vector_relation (node_type, vector_1_id, vector_2_id, vector_length, vector_angle)
 ) ENGINE=InnoDB;`;
 
 const createFeatureGroupStatsTableSQL = `
 CREATE TABLE IF NOT EXISTS feature_group_stats (
     stat_id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    start_vector_type VARCHAR(80) NOT NULL,
-    start_resolution_level TINYINT UNSIGNED NOT NULL,
-    start_pos_x SMALLINT UNSIGNED NOT NULL,
-    start_pos_y SMALLINT UNSIGNED NOT NULL,
-    discriminator_vector_type VARCHAR(80) NOT NULL,
-    discriminator_resolution_level TINYINT UNSIGNED NOT NULL,
-    discriminator_pos_x SMALLINT UNSIGNED NOT NULL,
-    discriminator_pos_y SMALLINT UNSIGNED NOT NULL,
+    value_type MEDIUMINT UNSIGNED NOT NULL,
+    resolution_level TINYINT UNSIGNED NOT NULL,
+    avg_length FLOAT NOT NULL,
+    avg_angle FLOAT NOT NULL,
     sample_size INT UNSIGNED DEFAULT 0,
     mean_distance DOUBLE DEFAULT 0,
     std_distance DOUBLE DEFAULT 0,
     mean_cosine DOUBLE DEFAULT 0,
     mean_pearson DOUBLE DEFAULT 0,
-    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uq_feature_pair (
-        start_vector_type,
-        start_resolution_level,
-        start_pos_x,
-        start_pos_y,
-        discriminator_vector_type,
-        discriminator_resolution_level,
-        discriminator_pos_x,
-        discriminator_pos_y
+    FOREIGN KEY (value_type) REFERENCES value_types(value_type_id),
+    UNIQUE KEY uq_feature_statistics (
+        value_type,
+        resolution_level
     )
 ) ENGINE=InnoDB;`;
 
@@ -102,13 +112,20 @@ async function setupDatabase() {
         await connection.query(createImagesTableSQL);
         console.log("    ✅ Table 'images' is ready.");
 
+        console.log(" -> Creating 'value_types' table...");
+        await connection.query(createValueTypesTableSQL);
+        console.log("    ✅ Table 'value_types' is ready.");
+        for (const [channel, description] of VALUE_TYPE_SEEDS) {
+            await connection.query(
+                'INSERT IGNORE INTO value_types (channel_name, description) VALUES (?, ?)',
+                [channel, description]
+            );
+        }
+
         console.log(" -> Creating 'feature_vectors' table...");
         await connection.query(createFeatureVectorsTableSQL);
         console.log("    ✅ Table 'feature_vectors' is ready.");
         
-        // Dropping the old table if it exists to ensure a clean slate.
-        console.log(" -> Dropping old 'vector_correlations' table if it exists...");
-        await connection.query('DROP TABLE IF EXISTS vector_correlations;');
         console.log(" -> Creating new 'knowledge_nodes' table...");
         await connection.query(createKnowledgeNodesTableSQL);
         console.log("    ✅ Table 'knowledge_nodes' is ready.");

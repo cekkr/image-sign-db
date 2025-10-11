@@ -24,23 +24,27 @@ async function findImageRemotely(imagePath) {
     // 1. Generate the initial probe vector and start the session
     const probeSpec = { ...DEFAULT_PROBE_SPEC };
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
-
     if (!probeVector) {
         console.error("Could not generate initial probe vector.");
         return;
     }
 
+    const probe = {
+        ...probeSpec,
+        rel_x: probeSpec.dx / probeSpec.gridSize,
+        rel_y: probeSpec.dy / probeSpec.gridSize,
+        value: probeVector[probeSpec.channel],
+        size: probeVector.size,
+    };
+
     let response = await fetch(`${API_BASE_URL}/search/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            ...probeSpec,
-            augmentation: probeSpec.augmentation,
-            vector_base64: probeVector.toString('base64')
-        })
+        body: JSON.stringify(probe)
     });
     
     let result = await response.json();
+    let sessionId = result.sessionId;
     console.log(`  Initial probe found ${result.candidates?.length || 0} candidates.`);
     
     // 2. Iteratively refine the search based on server requests
@@ -48,37 +52,36 @@ async function findImageRemotely(imagePath) {
     while (result.status === 'CANDIDATES_FOUND' && result.nextQuestion && iterations < 10) {
         iterations++;
         const nextQuestion = result.nextQuestion;
-        
-        console.log(`  [Iteration ${iterations}] Server asks for: ${nextQuestion.type} (${nextQuestion.augmentation}) at level ${nextQuestion.level} [${nextQuestion.x}, ${nextQuestion.y}]`);
-        if (nextQuestion.metrics) {
-            const stats = nextQuestion.metrics;
-            console.log(
-                `    ↳ stats: mean distance=${stats.mean_distance?.toFixed(4)}, std=${stats.std_distance?.toFixed(4)}, mean cosine=${stats.mean_cosine?.toFixed(4)}, mean pearson=${stats.mean_pearson?.toFixed(4)}, samples=${stats.sample_size}`
-            );
-        }
-        const nextVector = await generateSpecificVector(imagePath, {
-            vector_type: nextQuestion.type,
-            augmentation: nextQuestion.augmentation,
-            resolution_level: nextQuestion.level,
-            pos_x: nextQuestion.x,
-            pos_y: nextQuestion.y
-        });
+        if (!nextQuestion) break;
 
+        console.log(`  [Iteration ${iterations}] Server requests channel '${nextQuestion.channel}' at grid ${nextQuestion.gridSize} [${nextQuestion.pos_x}, ${nextQuestion.pos_y}] Δ(${nextQuestion.dx},${nextQuestion.dy})`);
+
+        const nextVector = await generateSpecificVector(imagePath, nextQuestion);
         if (!nextVector) {
             console.log("  Could not generate requested vector. Aborting.");
             break;
         }
 
+        const probeUpdate = {
+            ...nextQuestion,
+            rel_x: nextQuestion.dx / nextQuestion.gridSize,
+            rel_y: nextQuestion.dy / nextQuestion.gridSize,
+            value: nextVector[nextQuestion.channel],
+            size: nextVector.size,
+        };
+
         response = await fetch(`${API_BASE_URL}/search/refine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                sessionId: result.sessionId,
-                spec: nextQuestion,
-                vector_base64: nextVector.toString('base64')
+                sessionId,
+                probe: probeUpdate,
             })
         });
         result = await response.json();
+        if (result.sessionId) {
+            sessionId = result.sessionId;
+        }
         console.log(`  Refined search to ${result.candidates?.length || 0} candidates.`);
     }
 

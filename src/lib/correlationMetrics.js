@@ -1,47 +1,49 @@
 const MAX_CANDIDATE_SAMPLE = 256;
-const MIN_AFFINITY = 0.12;
-const MIN_SPREAD = 0.008;
+const MIN_AFFINITY = 0.05;
+const MIN_SPREAD = 0.002;
 
-function euclideanDistance(buf1, buf2) {
-    if (!buf1 || !buf2 || buf1.length !== buf2.length) {
-        return Infinity;
-    }
-    const vec1 = new Float32Array(buf1.buffer, buf1.byteOffset, buf1.length / Float32Array.BYTES_PER_ELEMENT);
-    const vec2 = new Float32Array(buf2.buffer, buf2.byteOffset, buf2.length / Float32Array.BYTES_PER_ELEMENT);
+function buildFeatureVector(feature) {
+    return [
+        feature.value ?? 0,
+        feature.rel_x ?? 0,
+        feature.rel_y ?? 0,
+        feature.magnitude ?? feature.size ?? 0,
+    ];
+}
 
+function euclideanDistance(a, b) {
+    if (!a || !b) return Infinity;
+    if (a.value_type !== b.value_type || a.resolution_level !== b.resolution_level) return Infinity;
+    const componentsA = buildFeatureVector(a);
+    const componentsB = buildFeatureVector(b);
     let sum = 0;
-    for (let i = 0; i < vec1.length; i++) {
-        sum += (vec1[i] - vec2[i]) ** 2;
+    for (let i = 0; i < componentsA.length; i++) {
+        sum += (componentsA[i] - componentsB[i]) ** 2;
     }
     return Math.sqrt(sum);
 }
 
-function bufferToFloat32Array(buffer) {
-    if (!buffer) return null;
-    return new Float32Array(buffer.buffer, buffer.byteOffset, buffer.length / Float32Array.BYTES_PER_ELEMENT);
-}
-
-function cosineSimilarity(buf1, buf2) {
-    if (!buf1 || !buf2 || buf1.length !== buf2.length) return 0;
-    const vec1 = bufferToFloat32Array(buf1);
-    const vec2 = bufferToFloat32Array(buf2);
+function cosineSimilarity(a, b) {
+    if (!a || !b) return 0;
+    const componentsA = buildFeatureVector(a);
+    const componentsB = buildFeatureVector(b);
     let dot = 0;
-    let norm1 = 0;
-    let norm2 = 0;
-    for (let i = 0; i < vec1.length; i++) {
-        dot += vec1[i] * vec2[i];
-        norm1 += vec1[i] * vec1[i];
-        norm2 += vec2[i] * vec2[i];
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < componentsA.length; i++) {
+        dot += componentsA[i] * componentsB[i];
+        normA += componentsA[i] * componentsA[i];
+        normB += componentsB[i] * componentsB[i];
     }
-    if (norm1 === 0 || norm2 === 0) return 0;
-    return dot / (Math.sqrt(norm1) * Math.sqrt(norm2));
+    if (normA === 0 || normB === 0) return 0;
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
-function pearsonCorrelation(buf1, buf2) {
-    if (!buf1 || !buf2 || buf1.length !== buf2.length) return 0;
-    const vec1 = bufferToFloat32Array(buf1);
-    const vec2 = bufferToFloat32Array(buf2);
-    const n = vec1.length;
+function pearsonCorrelation(a, b) {
+    if (!a || !b) return 0;
+    const componentsA = buildFeatureVector(a);
+    const componentsB = buildFeatureVector(b);
+    const n = componentsA.length;
     if (n === 0) return 0;
 
     let sumX = 0;
@@ -50,8 +52,8 @@ function pearsonCorrelation(buf1, buf2) {
     let sumX2 = 0;
     let sumY2 = 0;
     for (let i = 0; i < n; i++) {
-        const x = vec1[i];
-        const y = vec2[i];
+        const x = componentsA[i];
+        const y = componentsB[i];
         sumX += x;
         sumY += y;
         sumXY += x * y;
@@ -67,23 +69,27 @@ function pearsonCorrelation(buf1, buf2) {
 function meanAndStd(values) {
     if (!values || values.length === 0) return { mean: 0, std: 0 };
     const mean = values.reduce((acc, val) => acc + val, 0) / values.length;
-    const variance = values.reduce((acc, val) => acc + (val - mean) * (val - mean), 0) / values.length;
+    const variance = values.reduce((acc, val) => acc + (val - mean) ** 2, 0) / values.length;
     return { mean, std: Math.sqrt(Math.max(variance, 0)) };
 }
 
 function scoreCandidateFeature(targetFeature, candidateFeatures) {
     if (!candidateFeatures || candidateFeatures.length === 0) return null;
 
-    const sampledCandidates = candidateFeatures.slice(0, MAX_CANDIDATE_SAMPLE);
+    const sampled = candidateFeatures.slice(0, MAX_CANDIDATE_SAMPLE);
     const distances = [];
     const cosineValues = [];
     const pearsonValues = [];
 
-    for (const candidate of sampledCandidates) {
-        distances.push(euclideanDistance(targetFeature.vector_data, candidate.vector_data));
-        cosineValues.push(cosineSimilarity(targetFeature.vector_data, candidate.vector_data));
-        pearsonValues.push(pearsonCorrelation(targetFeature.vector_data, candidate.vector_data));
+    for (const candidate of sampled) {
+        const distance = euclideanDistance(targetFeature, candidate);
+        if (!Number.isFinite(distance)) continue;
+        distances.push(distance);
+        cosineValues.push(cosineSimilarity(targetFeature, candidate));
+        pearsonValues.push(pearsonCorrelation(targetFeature, candidate));
     }
+
+    if (distances.length === 0) return null;
 
     const { mean: meanDistance, std: stdDistance } = meanAndStd(distances);
     const meanCosine = cosineValues.reduce((acc, val) => acc + val, 0) / cosineValues.length;
@@ -91,11 +97,9 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
 
     const affinity = Math.max(0, (1 - (meanCosine || 0)) + (1 - (meanPearson || 0)));
     const spread = Math.max(0, (meanDistance || 0) + (stdDistance || 0));
-    if (affinity < MIN_AFFINITY || spread < MIN_SPREAD) {
-        return null;
-    }
+    if (affinity < MIN_AFFINITY || spread < MIN_SPREAD) return null;
 
-    const costPenalty = Math.log1p(sampledCandidates.length);
+    const costPenalty = Math.log1p(sampled.length);
     const separationScore = (spread * affinity) / Math.max(costPenalty, 1);
 
     return {
@@ -105,7 +109,7 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
             stdDistance,
             meanCosine,
             meanPearson,
-            sampleSize: sampledCandidates.length,
+            sampleSize: sampled.length,
             originalCandidateCount: candidateFeatures.length,
             affinity,
             spread,

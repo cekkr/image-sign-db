@@ -6,8 +6,8 @@ const mysql = require('mysql2/promise');
 require('dotenv').config();
 
 // --- INTERNAL MODULES ---
-const { GRID_SIZES, NEIGHBOR_OFFSETS, TREE_DEPTHS } = require('./lib/constants');
-const { AUGMENTATION_ORDER, applyAugmentation } = require('./lib/augmentations');
+const { GRID_SIZES } = require('./lib/constants');
+const { AUGMENTATION_ORDER } = require('./lib/augmentations');
 const { generateAllFeaturesForAugmentation, generateSpecificVector } = require('./lib/vectorGenerators');
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 
@@ -17,7 +17,7 @@ async function collectFeaturesForAugmentations(originalImage, imagePath, augment
     const featureBatches = [];
 
     for (const augmentationName of augmentations) {
-        const { gradientFeatures, treeFeatures, allFeatures } = await generateAllFeaturesForAugmentation(
+        const { gradientFeatures, allFeatures } = await generateAllFeaturesForAugmentation(
             originalImage,
             imagePath,
             augmentationName
@@ -25,7 +25,6 @@ async function collectFeaturesForAugmentations(originalImage, imagePath, augment
         featureBatches.push({
             augmentation: augmentationName,
             gradientFeatures,
-            treeFeatures,
             allFeatures,
         });
     }
@@ -33,12 +32,51 @@ async function collectFeaturesForAugmentations(originalImage, imagePath, augment
     return featureBatches;
 }
 
-async function persistFeatureBatch(dbConnection, imageId, featureBatch) {
+async function ensureValueTypeId(dbConnection, channelName, cache) {
+    if (cache.has(channelName)) return cache.get(channelName);
+    const [rows] = await dbConnection.execute(
+        'SELECT value_type_id FROM value_types WHERE channel_name = ?',
+        [channelName]
+    );
+    if (rows.length > 0) {
+        cache.set(channelName, rows[0].value_type_id);
+        return rows[0].value_type_id;
+    }
+    const [result] = await dbConnection.execute(
+        'INSERT INTO value_types (channel_name, description) VALUES (?, ?)',
+        [channelName, `${channelName} channel`]
+    );
+    cache.set(channelName, result.insertId);
+    return result.insertId;
+}
+
+async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTypeCache) {
     for (const feature of featureBatch.allFeatures) {
+        const valueTypeId = await ensureValueTypeId(dbConnection, feature.channel, valueTypeCache);
         await dbConnection.execute(
-            `INSERT INTO feature_vectors (image_id, vector_type, resolution_level, pos_x, pos_y, vector_data)
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [imageId, feature.vector_type, feature.resolution_level, feature.pos_x, feature.pos_y, feature.vector_data]
+            `INSERT INTO feature_vectors (
+                image_id,
+                value_type,
+                resolution_level,
+                pos_x,
+                pos_y,
+                rel_x,
+                rel_y,
+                value,
+                size
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                imageId,
+                valueTypeId,
+                feature.resolution_level,
+                feature.pos_x,
+                feature.pos_y,
+                feature.rel_x,
+                feature.rel_y,
+                feature.value,
+                feature.size,
+            ]
         );
     }
 }
@@ -60,8 +98,9 @@ async function storeFeatures(imagePath, featureBatches) {
         );
         const imageId = imageResult.insertId;
 
+        const valueTypeCache = new Map();
         for (const batch of featureBatches) {
-            await persistFeatureBatch(connection, imageId, batch);
+            await persistFeatureBatch(connection, imageId, batch, valueTypeCache);
         }
 
         await connection.commit();
@@ -101,10 +140,7 @@ module.exports = {
     generateSpecificVector,
     resolveDefaultProbeSpec,
     GRID_SIZES,
-    NEIGHBOR_OFFSETS,
-    TREE_DEPTHS,
     AUGMENTATION_ORDER,
-    applyAugmentation,
 };
 
 // --- CLI EXECUTION ---

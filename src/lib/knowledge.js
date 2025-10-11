@@ -1,7 +1,6 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
-const { extractAugmentationFromType } = require('./vectorSpecs');
 
 async function createDbConnection() {
     return mysql.createConnection({
@@ -13,23 +12,24 @@ async function createDbConnection() {
 }
 
 async function getOrCreateFeatureNode(dbConnection, feature) {
-    const details = JSON.stringify({
-        type: feature.vector_type,
-        augmentation: extractAugmentationFromType(feature.vector_type),
-        level: feature.resolution_level,
-        x: feature.pos_x,
-        y: feature.pos_y,
-    });
-
     const [rows] = await dbConnection.execute(
-        `SELECT node_id FROM knowledge_nodes WHERE node_type = 'FEATURE' AND feature_details = ?`,
-        [details]
+        `SELECT node_id FROM knowledge_nodes
+         WHERE node_type = 'FEATURE' AND vector_1_id = ?`,
+        [feature.vector_id]
     );
     if (rows.length > 0) return rows[0].node_id;
 
     const [result] = await dbConnection.execute(
-        `INSERT INTO knowledge_nodes (node_type, feature_details) VALUES ('FEATURE', ?);`,
-        [details]
+        `INSERT INTO knowledge_nodes (
+            parent_node_id,
+            node_type,
+            vector_1_id,
+            vector_2_id,
+            vector_length,
+            vector_angle,
+            vector_value
+        ) VALUES (NULL, 'FEATURE', ?, NULL, 0, 0, ?);`,
+        [feature.vector_id, feature.value]
     );
     return result.insertId;
 }
@@ -42,60 +42,87 @@ async function updateNodeStats(dbConnection, nodeId, outcome, amount = 1) {
     );
 }
 
+function deriveVectorGeometry(baseFeature, relatedFeature) {
+    const baseScale = baseFeature.resolution_level || 1;
+    const relatedScale = relatedFeature.resolution_level || 1;
+    const baseX = (baseFeature.pos_x + 0.5) / baseScale;
+    const baseY = (baseFeature.pos_y + 0.5) / baseScale;
+    const relatedX = (relatedFeature.pos_x + 0.5) / relatedScale;
+    const relatedY = (relatedFeature.pos_y + 0.5) / relatedScale;
+    const dx = relatedX - baseX;
+    const dy = relatedY - baseY;
+    const length = Math.sqrt(dx * dx + dy * dy);
+    const angle = Math.atan2(dy, dx);
+    const valueDelta = relatedFeature.value - baseFeature.value;
+    return { length, angle, valueDelta };
+}
+
 async function getOrCreateFeatureGroupNode(dbConnection, parentNodeId, startFeature, discriminatorFeature) {
-    const details = JSON.stringify({
-        type: 'PAIR',
-        discriminator: {
-            vector_type: discriminatorFeature.vector_type,
-            level: discriminatorFeature.resolution_level,
-            x: discriminatorFeature.pos_x,
-            y: discriminatorFeature.pos_y,
-        },
-    });
+    const { length, angle, valueDelta } = deriveVectorGeometry(startFeature, discriminatorFeature);
 
     const [rows] = await dbConnection.execute(
-        `SELECT node_id FROM knowledge_nodes WHERE node_type = 'GROUP' AND parent_node_id = ? AND feature_details = ?`,
-        [parentNodeId, details]
+        `SELECT node_id FROM knowledge_nodes
+         WHERE node_type = 'GROUP'
+           AND parent_node_id = ?
+           AND vector_1_id = ?
+           AND vector_2_id = ?
+           AND ABS(vector_length - ?) < 1e-6
+           AND ABS(vector_angle - ?) < 1e-6`,
+        [parentNodeId, startFeature.vector_id, discriminatorFeature.vector_id, length, angle]
     );
     if (rows.length > 0) return rows[0].node_id;
 
     const [result] = await dbConnection.execute(
-        `INSERT INTO knowledge_nodes (parent_node_id, node_type, feature_details) VALUES (?, 'GROUP', ?)`,
-        [parentNodeId, details]
+        `INSERT INTO knowledge_nodes (
+            parent_node_id,
+            node_type,
+            vector_1_id,
+            vector_2_id,
+            vector_length,
+            vector_angle,
+            vector_value
+        ) VALUES (?, 'GROUP', ?, ?, ?, ?, ?)`,
+        [parentNodeId, startFeature.vector_id, discriminatorFeature.vector_id, length, angle, valueDelta]
     );
     return result.insertId;
 }
 
 async function upsertFeatureGroupStats(dbConnection, startFeature, discriminatorFeature, metrics) {
-    const sql = `
-        INSERT INTO feature_group_stats (
-            start_vector_type, start_resolution_level, start_pos_x, start_pos_y,
-            discriminator_vector_type, discriminator_resolution_level, discriminator_pos_x, discriminator_pos_y,
-            sample_size, mean_distance, std_distance, mean_cosine, mean_pearson
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const { length, angle } = deriveVectorGeometry(startFeature, discriminatorFeature);
+
+    await dbConnection.execute(
+        `INSERT INTO feature_group_stats (
+            value_type,
+            resolution_level,
+            avg_length,
+            avg_angle,
+            sample_size,
+            mean_distance,
+            std_distance,
+            mean_cosine,
+            mean_pearson
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
+            avg_length = ((avg_length * sample_size) + (VALUES(avg_length) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
+            avg_angle = ((avg_angle * sample_size) + (VALUES(avg_angle) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
             mean_distance = ((mean_distance * sample_size) + (VALUES(mean_distance) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
             std_distance = ((std_distance * sample_size) + (VALUES(std_distance) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
             mean_cosine = ((mean_cosine * sample_size) + (VALUES(mean_cosine) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
             mean_pearson = ((mean_pearson * sample_size) + (VALUES(mean_pearson) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
             sample_size = sample_size + VALUES(sample_size)
-    `;
-
-    await dbConnection.execute(sql, [
-        startFeature.vector_type,
-        startFeature.resolution_level,
-        startFeature.pos_x,
-        startFeature.pos_y,
-        discriminatorFeature.vector_type,
-        discriminatorFeature.resolution_level,
-        discriminatorFeature.pos_x,
-        discriminatorFeature.pos_y,
-        metrics.sampleSize,
-        metrics.meanDistance ?? 0,
-        metrics.stdDistance ?? 0,
-        metrics.meanCosine ?? 0,
-        metrics.meanPearson ?? 0,
-    ]);
+        `,
+        [
+            startFeature.value_type,
+            startFeature.resolution_level,
+            length,
+            angle,
+            metrics.sampleSize,
+            metrics.meanDistance ?? 0,
+            metrics.stdDistance ?? 0,
+            metrics.meanCosine ?? 0,
+            metrics.meanPearson ?? 0,
+        ]
+    );
 }
 
 async function discoverCorrelations({
@@ -119,27 +146,40 @@ async function discoverCorrelations({
 
             const targetImageId = imageIds[Math.floor(Math.random() * imageIds.length)];
             const [startFeatures] = await dbConnection.execute(
-                'SELECT * FROM feature_vectors WHERE image_id = ? ORDER BY RAND() LIMIT 1',
+                `SELECT * FROM feature_vectors WHERE image_id = ? ORDER BY RAND() LIMIT 1`,
                 [targetImageId]
             );
             const startFeature = startFeatures[0];
             if (!startFeature) continue;
 
-            const [allSimilarFeatures] = await dbConnection.execute(
-                'SELECT * FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ? AND image_id != ?',
-                [startFeature.vector_type, startFeature.resolution_level, startFeature.pos_x, startFeature.pos_y, targetImageId]
+            const [similarFeatures] = await dbConnection.execute(
+                `SELECT * FROM feature_vectors
+                 WHERE value_type = ?
+                   AND resolution_level = ?
+                   AND pos_x = ?
+                   AND pos_y = ?
+                   AND ABS(rel_x - ?) < 1e-6
+                   AND ABS(rel_y - ?) < 1e-6
+                   AND image_id != ?`,
+                [
+                    startFeature.value_type,
+                    startFeature.resolution_level,
+                    startFeature.pos_x,
+                    startFeature.pos_y,
+                    startFeature.rel_x,
+                    startFeature.rel_y,
+                    targetImageId,
+                ]
             );
 
             const candidateImageIds = new Set();
-            for (const feature of allSimilarFeatures) {
-                if (euclideanDistance(startFeature.vector_data, feature.vector_data) < similarityThreshold) {
+            for (const feature of similarFeatures) {
+                if (euclideanDistance(startFeature, feature) < similarityThreshold) {
                     candidateImageIds.add(feature.image_id);
                 }
             }
 
-            if (candidateImageIds.size === 0) {
-                continue;
-            }
+            if (candidateImageIds.size === 0) continue;
 
             let bestDiscriminator = null;
             let bestMetrics = null;
@@ -152,8 +192,23 @@ async function discoverCorrelations({
 
             for (const candidate of targetFeatures) {
                 const [candidateFeatures] = await dbConnection.execute(
-                    'SELECT * FROM feature_vectors WHERE vector_type = ? AND resolution_level = ? AND pos_x = ? AND pos_y = ? AND image_id IN (?)',
-                    [candidate.vector_type, candidate.resolution_level, candidate.pos_x, candidate.pos_y, [...candidateImageIds]]
+                    `SELECT * FROM feature_vectors
+                     WHERE value_type = ?
+                       AND resolution_level = ?
+                       AND pos_x = ?
+                       AND pos_y = ?
+                       AND ABS(rel_x - ?) < 1e-6
+                       AND ABS(rel_y - ?) < 1e-6
+                       AND image_id IN (?)`,
+                    [
+                        candidate.value_type,
+                        candidate.resolution_level,
+                        candidate.pos_x,
+                        candidate.pos_y,
+                        candidate.rel_x,
+                        candidate.rel_y,
+                        [...candidateImageIds],
+                    ]
                 );
 
                 const evaluation = scoreCandidateFeature(candidate, candidateFeatures);
@@ -190,7 +245,12 @@ async function discoverCorrelations({
             await updateNodeStats(dbConnection, startNodeId, 'hit', increment);
             await updateNodeStats(dbConnection, discriminatorNodeId, 'hit', increment);
 
-            const groupNodeId = await getOrCreateFeatureGroupNode(dbConnection, startNodeId, startFeature, bestDiscriminator);
+            const groupNodeId = await getOrCreateFeatureGroupNode(
+                dbConnection,
+                startNodeId,
+                startFeature,
+                bestDiscriminator
+            );
             await updateNodeStats(dbConnection, groupNodeId, 'hit', increment);
 
             if (bestMetrics && bestMetrics.sampleSize > 0) {
