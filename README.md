@@ -41,6 +41,14 @@ The "brain" of the system is the `knowledge_nodes` table in MySQL. This table is
     
 Complementing the graph is the `feature_group_stats` table. It aggregates relative statistics per channel and resolution (average vector length, angle, separation metrics) so discovery sweeps can be summarised without duplicating individual links. The search API can consult these stats or pick alternative channels on the fly.
 
+### 3½. Adaptive Caching & Pruning
+
+To keep the system responsive over time the database tracks lightweight metadata outside the core feature store:
+
+*   **`feature_usage`** increments whenever a vector participates in a search or learning step. The pruning logic removes the least-used vectors first when the database grows beyond the configured budget.
+*   **`skip_patterns`** records descriptor hashes that repeatedly fail to discriminate. After a handful of misses the server automatically avoids these “dead ends” unless new evidence reinforces them.
+*   **`system_settings`** holds runtime tunables such as `max_db_size_gb`. The ingestion pipeline checks this value after every insert and trims surplus vectors so storage stays within bounds without manual intervention.
+
 ### 3\. The Learning Process: Discovery and Refinement
 
 The system learns in two primary ways: through batch analysis for broad discovery and through real-time updates for continuous refinement.
@@ -100,11 +108,13 @@ The project is divided into several standalone scripts that interact via the cen
     
 *   `src/insert.js`: The "conductor." Adds or removes images, optionally triggers targeted correlation discovery, and exposes a `bootstrap` mode for the initial learning pass over a dataset.
     
-*   `src/index.js`: The main application engine. Contains the core search logic, performs real-time learning, and can be run as a standalone CLI tool or as an Express web server. The server also exposes `/images` (add/remove signed images), `/discover` (kick off correlation learning), and the `/search/*` endpoints.
-    
+*   `src/index.js`: The main application engine. Contains the core search logic, performs real-time learning, and can be run as a standalone CLI tool or as an Express web server. The server also exposes `/images` (add/remove signed images), `/discover` (kick off correlation learning), `/search/*`, and `/settings/max-db-size` for runtime configuration.
+
 *   `src/clientAPI.js`: A simple command-line client that demonstrates how to interact with the Express server's secure API and now prints the correlation metrics that guided each follow-up question.
     
 *   `src/testCorrelations.js`: Utility script to seed and inspect `feature_group_stats` with synthetic sample data.
+
+*   `src/lib/storageManager.js`: Utility helpers for descriptor hashing, vector usage tracking, skip-pattern bookkeeping, and automatic pruning based on `system_settings`.
     
 
 How to Use
@@ -143,7 +153,7 @@ Create a folder (e.g., `training_dataset`) and fill it with the images you want 
     node src/insert.js add path/to/training_dataset/image1.jpg --discover=15
     node src/insert.js add path/to/training_dataset/image2.png
     
-The extractor automatically generates augmented mirrors/blurred/jittered variants and builds the quadtree hierarchy before persisting the vectors, so one pass per source image is still all that's required. Adding `--discover=<n>` triggers a small correlation sweep focused on the newly inserted data.
+The extractor automatically generates augmented mirrors/blurred/jittered variants and builds the quadtree hierarchy before persisting the vectors, so one pass per source image is still all that's required. Adding `--discover=<n>` triggers a small correlation sweep focused on the newly inserted data. After each ingestion the storage manager checks `system_settings.max_db_size_gb` and prunes the coldest vectors if the database exceeds the configured footprint.
 
 Need to prune the dataset later? Run:
 
@@ -169,7 +179,10 @@ You can find a match for a new image in two ways. The system will continue to le
     
 2.  **Run the Client:** In a separate terminal, use the client script to find a match for a new image.
     
-        node src/clientAPI.js path/to/your/image_to_find.jpg
+    node src/clientAPI.js path/to/your/image_to_find.jpg
+
+    # Optional: adjust the maximum on-disk footprint (in gigabytes)
+    curl -X POST http://localhost:3000/settings/max-db-size -H "Content-Type: application/json" -d '{"value":6}'
         
     Every `/search/start` and `/search/refine` response now embeds the statistical profile that informed the next question. The CLI prints those metrics so you can monitor how separation quality evolves during the dialog.
     

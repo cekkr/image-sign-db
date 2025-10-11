@@ -1,7 +1,8 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
-const { parseDescriptor, createDescriptorKey } = require('./descriptor');
+const { parseDescriptor } = require('./descriptor');
+const { recordVectorUsage } = require('./storageManager');
 
 async function createDbConnection() {
     return mysql.createConnection({
@@ -10,6 +11,14 @@ async function createDbConnection() {
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME,
     });
+}
+
+function hydrateFeatureRow(row) {
+    const descriptor = parseDescriptor(row.descriptor_json);
+    return {
+        ...row,
+        descriptor,
+    };
 }
 
 async function getOrCreateFeatureNode(dbConnection, feature) {
@@ -157,6 +166,7 @@ async function discoverCorrelations({
             );
             if (startRows.length === 0) continue;
             const startFeature = hydrateFeatureRow(startRows[0]);
+            await recordVectorUsage(dbConnection, [startFeature.vector_id], 1, 0);
 
             const [similarRows] = await dbConnection.execute(
                 `SELECT fv.*, vt.descriptor_json
@@ -181,11 +191,16 @@ async function discoverCorrelations({
             );
 
             const candidateImageIds = new Set();
+            const similarVectorIds = [];
             for (const row of similarRows) {
                 const feature = hydrateFeatureRow(row);
                 if (euclideanDistance(startFeature, feature) < similarityThreshold) {
                     candidateImageIds.add(feature.image_id);
+                    similarVectorIds.push(feature.vector_id);
                 }
+            }
+            if (similarVectorIds.length) {
+                await recordVectorUsage(dbConnection, similarVectorIds, 1, 0);
             }
 
             if (candidateImageIds.size === 0) continue;
@@ -238,6 +253,7 @@ async function discoverCorrelations({
             }
 
             if (!bestDiscriminator) continue;
+            await recordVectorUsage(dbConnection, [bestDiscriminator.vector_id], 2, bestMetrics?.score ?? 0);
 
             onDiscriminatorSelected?.({
                 iterationNumber,

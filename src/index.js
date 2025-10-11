@@ -8,15 +8,39 @@ const { euclideanDistance } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
 const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
 const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
+const { recordVectorUsage, saveSkipPattern } = require('./lib/storageManager');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const VALUE_THRESHOLD = 0.08;
+const SKIP_THRESHOLD = 3;
 
 // --- DATABASE / CACHE ---
 let dbConnection;
 const descriptorCache = new Map(); // descriptorKey -> { id, descriptor }
+const skipCache = new Map(); // descriptorKey -> skip count
 const searchSessions = new Map(); // sessionId -> { candidateIds, askedDescriptorKeys, probeSpec }
+
+function bumpSkipCache(descriptorKey, amount = 1) {
+    const next = (skipCache.get(descriptorKey) || 0) + amount;
+    skipCache.set(descriptorKey, next);
+}
+
+function getSkipCount(descriptorKey) {
+    return skipCache.get(descriptorKey) || 0;
+}
+
+let skipCacheLoaded = false;
+
+async function warmSkipCache(db) {
+    if (skipCacheLoaded) return;
+    const [rows] = await db.execute('SELECT descriptor_hash, skip_count FROM skip_patterns');
+    for (const row of rows) {
+        const count = Number(row.skip_count) || 0;
+        skipCache.set(row.descriptor_hash, count);
+    }
+    skipCacheLoaded = true;
+}
 
 async function connectToDatabase() {
     if (dbConnection && dbConnection.connection && !dbConnection.connection._closing) {
@@ -29,6 +53,7 @@ async function connectToDatabase() {
         database: process.env.DB_NAME,
     });
     console.log('🗄️  Connected to MySQL database.');
+    await warmSkipCache(dbConnection);
     return dbConnection;
 }
 
@@ -124,6 +149,7 @@ async function findCandidateImages(db, probe) {
     );
 
     const candidates = new Set();
+    const matchingVectorIds = [];
     for (const row of rows) {
         const feature = rowToFeature(row);
         const distance = euclideanDistance(
@@ -137,7 +163,11 @@ async function findCandidateImages(db, probe) {
         );
         if (distance <= VALUE_THRESHOLD) {
             candidates.add(row.image_id);
+            matchingVectorIds.push(row.vector_id);
         }
+    }
+    if (matchingVectorIds.length > 0) {
+        await recordVectorUsage(db, matchingVectorIds, 1, 0);
     }
     return { candidates: [...candidates], valueTypeId, descriptorKey: valueTypeRecord.descriptorKey };
 }
@@ -145,15 +175,33 @@ async function findCandidateImages(db, probe) {
 async function startSearch(probeSpec) {
     const normalizedProbe = normalizeProbeSpec(probeSpec);
     const db = await connectToDatabase();
-    const { candidates, valueTypeId, descriptorKey } = await findCandidateImages(db, normalizedProbe);
+    let probeToUse = { ...normalizedProbe };
+    if (getSkipCount(probeToUse.descriptorKey) >= SKIP_THRESHOLD) {
+        for (const channel of CHANNEL_DIMENSIONS) {
+            const descriptor = { ...probeToUse.descriptor, channel };
+            const descriptorKey = createDescriptorKey(descriptor);
+            if (getSkipCount(descriptorKey) >= SKIP_THRESHOLD) continue;
+            probeToUse = {
+                ...probeToUse,
+                descriptor,
+                descriptorKey,
+            };
+            break;
+        }
+    }
+    const { candidates, valueTypeId, descriptorKey } = await findCandidateImages(db, probeToUse);
 
-    if (candidates.length === 0) return { status: 'NO_MATCH' };
+    if (candidates.length === 0) {
+        await saveSkipPattern(db, probeToUse.descriptor);
+        bumpSkipCache(probeToUse.descriptorKey);
+        return { status: 'NO_MATCH' };
+    }
     if (candidates.length === 1) return { status: 'MATCH_FOUND', imageId: candidates[0] };
 
     const sessionId = crypto.randomBytes(16).toString('hex');
     searchSessions.set(sessionId, {
         candidateIds: candidates,
-        probeSpec: { ...normalizedProbe, valueTypeId, descriptorKey },
+        probeSpec: { ...probeToUse, valueTypeId, descriptorKey },
         askedDescriptorKeys: new Set([descriptorKey]),
     });
     return { status: 'CANDIDATES_FOUND', sessionId, candidates };
@@ -165,13 +213,21 @@ async function refineSearch(sessionId, probeSpec) {
         return { error: 'Session not found or expired.' };
     }
 
-    const db = await connectToDatabase();
     const normalizedProbe = normalizeProbeSpec(probeSpec);
+    const db = await connectToDatabase();
+    if (getSkipCount(normalizedProbe.descriptorKey) >= SKIP_THRESHOLD) {
+        await saveSkipPattern(db, normalizedProbe.descriptor);
+        bumpSkipCache(normalizedProbe.descriptorKey);
+        session.askedDescriptorKeys.add(normalizedProbe.descriptorKey);
+        return { status: 'NO_MATCH' };
+    }
     const { candidates, valueTypeId, descriptorKey } = await findCandidateImages(db, normalizedProbe);
     const remaining = candidates.filter((id) => session.candidateIds.includes(id));
 
     if (remaining.length === 0) {
         searchSessions.delete(sessionId);
+        await saveSkipPattern(db, normalizedProbe.descriptor);
+        bumpSkipCache(normalizedProbe.descriptorKey);
         return { status: 'NO_MATCH' };
     }
     if (remaining.length === 1) {
@@ -199,7 +255,8 @@ function buildNextQuestion(session) {
             neighbor_dy: session.probeSpec.dy,
         };
         const descriptorKey = createDescriptorKey(descriptor);
-        if (!session.askedDescriptorKeys.has(descriptorKey)) {
+        if (session.askedDescriptorKeys.has(descriptorKey)) continue;
+        if (getSkipCount(descriptorKey) >= SKIP_THRESHOLD) continue;
             return {
                 gridSize: session.probeSpec.gridSize,
                 pos_x: session.probeSpec.pos_x,
@@ -301,6 +358,28 @@ function runServer() {
         }
     });
 
+    app.post('/settings/max-db-size', async (req, res) => {
+        try {
+            const rawValue = req.body?.value;
+            const numeric = Number(rawValue);
+            if (!rawValue || Number.isNaN(numeric) || numeric <= 0) {
+                return res.status(400).json({ error: 'Invalid value. Provide a positive number in gigabytes.' });
+            }
+
+            const db = await connectToDatabase();
+            await db.execute(
+                `INSERT INTO system_settings (setting_key, setting_value)
+                 VALUES ('max_db_size_gb', ?)
+                 ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+                [String(numeric)]
+            );
+            res.json({ status: 'OK', value: numeric });
+        } catch (error) {
+            console.error('API Error on POST /settings/max-db-size:', error);
+            res.status(500).json({ error: error.message || 'Internal Server Error' });
+        }
+    });
+
     app.listen(PORT, () => {
         console.log(`🚀 Server listening on http://localhost:${PORT}`);
     });
@@ -309,7 +388,7 @@ function runServer() {
 // --- CLI MODE ---
 
 async function runCli(imagePath) {
-    const probeSpec = resolveDefaultProbeSpec();
+    const probeSpec = normalizeProbeSpec(resolveDefaultProbeSpec());
     const vector = await generateSpecificVector(imagePath, probeSpec);
     if (!vector) {
         console.error('Unable to generate probe vector.');

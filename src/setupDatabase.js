@@ -23,6 +23,30 @@ CREATE TABLE IF NOT EXISTS value_types (
     UNIQUE KEY uq_descriptor_hash (descriptor_hash)
 ) ENGINE=InnoDB;`;
 
+const createFeatureUsageTableSQL = `
+CREATE TABLE IF NOT EXISTS feature_usage (
+    vector_id BIGINT PRIMARY KEY,
+    usage_count BIGINT DEFAULT 0,
+    last_used TIMESTAMP NULL,
+    last_score DOUBLE DEFAULT 0,
+    FOREIGN KEY (vector_id) REFERENCES feature_vectors(vector_id) ON DELETE CASCADE
+) ENGINE=InnoDB;`;
+
+const createSkipPatternsTableSQL = `
+CREATE TABLE IF NOT EXISTS skip_patterns (
+    descriptor_hash CHAR(40) PRIMARY KEY,
+    descriptor_json JSON,
+    skip_count BIGINT DEFAULT 0,
+    last_used TIMESTAMP NULL
+) ENGINE=InnoDB;`;
+
+const createSystemSettingsTableSQL = `
+CREATE TABLE IF NOT EXISTS system_settings (
+    setting_key VARCHAR(64) PRIMARY KEY,
+    setting_value VARCHAR(255),
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB;`;
+
 const createFeatureVectorsTableSQL = `
 CREATE TABLE IF NOT EXISTS feature_vectors (
     vector_id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -115,6 +139,21 @@ async function setupDatabase() {
         console.log(" -> Creating 'feature_group_stats' table...");
         await connection.query(createFeatureGroupStatsTableSQL);
         console.log("    ✅ Table 'feature_group_stats' is ready.");
+
+        console.log(" -> Creating 'feature_usage' table...");
+        await connection.query(createFeatureUsageTableSQL);
+        console.log("    ✅ Table 'feature_usage' is ready.");
+
+        console.log(" -> Creating 'skip_patterns' table...");
+        await connection.query(createSkipPatternsTableSQL);
+        console.log("    ✅ Table 'skip_patterns' is ready.");
+
+        console.log(" -> Creating 'system_settings' table...");
+        await connection.query(createSystemSettingsTableSQL);
+        console.log("    ✅ Table 'system_settings' is ready.");
+        await connection.query(
+            `INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES ('max_db_size_gb', '4')`
+        );
 
         console.log("\n🎉 Database setup completed successfully with the new schema!");
 

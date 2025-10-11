@@ -8,6 +8,9 @@ require('dotenv').config();
 // --- INTERNAL MODULES ---
 const { extractAndStoreFeatures } = require('./featureExtractor');
 const { discoverCorrelations, createDbConnection } = require('./lib/knowledge');
+const { ensureStorageCapacity } = require('./lib/storageManager');
+
+const DB_SCHEMA = process.env.DB_NAME || 'image_hypercube_db';
 
 // --- HELPERS ---
 
@@ -79,6 +82,13 @@ async function runCorrelationDiscovery(iterations) {
             );
         },
     });
+
+    const db = await createDbConnection();
+    try {
+        await ensureStorageCapacity(db, DB_SCHEMA);
+    } finally {
+        await db.end();
+    }
 }
 
 async function ingestImage(imagePath, discoverIterations = 0) {
@@ -89,6 +99,13 @@ async function ingestImage(imagePath, discoverIterations = 0) {
 
     if (discoverIterations > 0) {
         await runCorrelationDiscovery(discoverIterations);
+    } else {
+        const db = await createDbConnection();
+        try {
+            await ensureStorageCapacity(db, DB_SCHEMA);
+        } finally {
+            await db.end();
+        }
     }
 
     return { imageId, featureCount };
@@ -115,6 +132,12 @@ async function handleRemoveCommand(positional) {
         console.log(`⚠️  Nothing removed: ${result.reason}`);
     } else {
         console.log(`🗑️  Removed image ID ${result.imageId} and associated vectors.`);
+        const db = await createDbConnection();
+        try {
+            await ensureStorageCapacity(db, DB_SCHEMA);
+        } finally {
+            await db.end();
+        }
     }
 }
 

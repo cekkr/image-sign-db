@@ -10,6 +10,7 @@ const { GRID_SIZES } = require('./lib/constants');
 const { AUGMENTATION_ORDER } = require('./lib/augmentations');
 const { generateAllFeaturesForAugmentation, generateSpecificVector } = require('./lib/vectorGenerators');
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
+const { createDescriptorKey, serializeDescriptor } = require('./lib/descriptor');
 
 // --- FEATURE EXTRACTION HELPERS ---
 
@@ -54,7 +55,7 @@ async function ensureValueTypeId(dbConnection, descriptor, cache) {
 async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTypeCache) {
     for (const feature of featureBatch.allFeatures) {
         const valueTypeId = await ensureValueTypeId(dbConnection, feature.descriptor, valueTypeCache);
-        await dbConnection.execute(
+        const [result] = await dbConnection.execute(
             `INSERT INTO feature_vectors (
                 image_id,
                 value_type,
@@ -79,6 +80,16 @@ async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTyp
                 feature.size,
             ]
         );
+
+        const vectorId = result.insertId;
+        if (vectorId) {
+            await dbConnection.execute(
+                `INSERT INTO feature_usage (vector_id, usage_count, last_used, last_score)
+                 VALUES (?, 0, NULL, 0)
+                 ON DUPLICATE KEY UPDATE vector_id = vector_id`,
+                [vectorId]
+            );
+        }
     }
 }
 
