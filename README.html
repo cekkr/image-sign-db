@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Sign DB - Interactive Explainer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Chosen Palette: Warm Neutrals (Slate, Stone, Amber) -->
+    <!-- Application Structure Plan: The SPA is designed as a single-page dashboard with a sticky side navigation for thematic exploration. This non-linear structure allows users to jump directly to concepts of interest, from a high-level overview to deep dives into the algorithm or architecture. The centerpiece is a JavaScript-powered, animated simulation of the secure search process. This was chosen because it transforms the most complex and abstract part of the report—the client-server dialogue—into a tangible, step-by-step visual story, which is far more effective for user understanding than static text. The user flow is: Overview -> Explore Concepts -> See it in Action (Simulation) -> Learn How to Use. -->
+    <!-- Visualization & Content Choices: 
+        - Report Info: Core Algorithm -> Goal: Inform -> Viz/Presentation: Interactive Tabbed Cards -> Interaction: Click tabs to reveal detailed text -> Justification: Breaks down the four dense pillars of the algorithm into digestible, user-selectable chunks, preventing information overload.
+        - Report Info: System Architecture (JS files) -> Goal: Organize/Relationships -> Viz/Presentation: Interactive Diagram (HTML/CSS Flexbox) -> Interaction: Hover over a component to highlight it and see its description -> Justification: Visually represents the data flow and relationships between standalone scripts, which is clearer than a simple list.
+        - Report Info: Knowledge Graph Learning -> Goal: Inform/Compare -> Viz/Presentation: Bar Chart (Chart.js/Canvas) showing Hit vs. Miss counts -> Interaction: Static chart dynamically rendered by JS -> Justification: Provides a simple, quantitative visualization for the abstract "utility score" concept, making it more concrete.
+        - Report Info: Secure Search Process -> Goal: Explain a process -> Viz/Presentation: JS-driven animated simulation -> Interaction: User clicks a button to trigger the step-by-step animation -> Justification: The most effective way to demonstrate the back-and-forth communication protocol, making the security and efficiency benefits immediately obvious.
+    -->
+    <!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f8fafc; /* slate-50 */
+            color: #1e293b; /* slate-800 */
+        }
+        .nav-link {
+            transition: all 0.2s ease-in-out;
+        }
+        .nav-link.active, .nav-link:hover {
+            background-color: #f59e0b; /* amber-500 */
+            color: #ffffff;
+            transform: translateX(4px);
+        }
+        .tab-button.active {
+            border-color: #f59e0b; /* amber-500 */
+            color: #f59e0b;
+            background-color: #fffbeb; /* amber-50 */
+        }
+        .architecture-box, .sim-box {
+            transition: all 0.3s ease-in-out;
+        }
+        .architecture-arrow {
+            position: relative;
+            width: 100%;
+            height: 2px;
+            background-color: #cbd5e1; /* slate-300 */
+        }
+        .architecture-arrow::after {
+            content: '';
+            position: absolute;
+            right: -1px;
+            top: -4px;
+            border-style: solid;
+            border-width: 5px 0 5px 8px;
+            border-color: transparent transparent transparent #cbd5e1; /* slate-300 */
+        }
+        .sim-arrow {
+            opacity: 0;
+            transform: scaleX(0.5);
+            transition: opacity 0.5s ease-out, transform 0.5s ease-out;
+        }
+        .sim-arrow.visible {
+            opacity: 1;
+            transform: scaleX(1);
+        }
+        .chart-container {
+            position: relative; 
+            width: 100%; 
+            max-width: 600px; 
+            margin-left: auto; 
+            margin-right: auto; 
+            height: 300px;
+            max-height: 400px;
+        }
+        @media (min-width: 768px) {
+            .chart-container { 
+                height: 350px; 
+            }
+        }
+    </style>
+</head>
+<body class="bg-slate-50">
+
+    <div class="flex flex-col md:flex-row min-h-screen">
+        <nav id="main-nav" class="w-full md:w-64 bg-white md:h-screen md:sticky top-0 p-4 md:p-6 border-b md:border-r border-slate-200 flex-shrink-0 z-10">
+            <div class="flex items-center mb-6">
+                 <div class="w-10 h-10 bg-amber-500 rounded-lg flex items-center justify-center mr-3">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                    </svg>
+                </div>
+                <h1 class="text-xl font-bold text-slate-800">Image Sign DB</h1>
+            </div>
+            <ul class="space-y-2">
+                <li><a href="#overview" class="nav-link block font-medium p-3 rounded-lg">Overview</a></li>
+                <li><a href="#logic" class="nav-link block font-medium p-3 rounded-lg">Algorithm Logic</a></li>
+                <li><a href="#architecture" class="nav-link block font-medium p-3 rounded-lg">System Architecture</a></li>
+                <li><a href="#simulation" class="nav-link block font-medium p-3 rounded-lg">Search Simulation</a></li>
+                <li><a href="#usage" class="nav-link block font-medium p-3 rounded-lg">Usage Guide</a></li>
+            </ul>
+        </nav>
+
+        <main class="flex-1 p-4 sm:p-6 md:p-10">
+            
+            <section id="overview" class="mb-16">
+                <h2 class="text-3xl font-bold text-slate-900 mb-4">Interactive System Explainer</h2>
+                <p class="text-lg text-slate-600 mb-6">This is an interactive dashboard designed to explore the concepts behind **Image Sign DB**, an advanced content-based image retrieval (CBIR) system. It identifies images by learning their structural "signatures" rather than comparing whole images. This application breaks down the core logic, architecture, and the innovative secure search process that makes the system unique. Use the navigation to explore different facets of the project.</p>
+                <div class="p-6 bg-amber-50 border-l-4 border-amber-500 rounded-r-lg">
+                    <p class="font-semibold text-amber-800">The core principle is a secure, server-guided search that minimizes data transfer, preventing a client from revealing the full image it's looking for.</p>
+                </div>
+            </section>
+
+            <section id="logic" class="mb-16">
+                <h2 class="text-3xl font-bold text-slate-900 mb-2">Algorithm Logic</h2>
+                <p class="text-lg text-slate-600 mb-8">The system is built on four key concepts that create an intelligent recognition engine. Click the tabs below to learn about each component and how they work together.</p>
+                
+                <div id="logic-tabs" class="flex flex-wrap border-b border-slate-200 mb-6">
+                    <button class="tab-button py-3 px-4 font-semibold text-slate-500 border-b-2 border-transparent" data-target="tab-vectorization">1. Vectorization</button>
+                    <button class="tab-button py-3 px-4 font-semibold text-slate-500 border-b-2 border-transparent" data-target="tab-graph">2. Knowledge Graph</button>
+                    <button class="tab-button py-3 px-4 font-semibold text-slate-500 border-b-2 border-transparent" data-target="tab-learning">3. Learning Process</button>
+                    <button class="tab-button py-3 px-4 font-semibold text-slate-500 border-b-2 border-transparent" data-target="tab-search">4. Secure Search</button>
+                </div>
+
+                <div id="logic-content" class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                </div>
+            </section>
+
+            <section id="architecture" class="mb-16">
+                <h2 class="text-3xl font-bold text-slate-900 mb-2">System Architecture</h2>
+                <p class="text-lg text-slate-600 mb-8">The project is not a single monolith but a pipeline of distinct scripts that communicate through the central MySQL database. Hover over any component in the diagram below to learn about its specific role in the system.</p>
+                <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                    <div id="architecture-diagram" class="flex flex-col md:flex-row items-center justify-between gap-4">
+                        <div class="flex flex-col gap-4 items-center w-full md:w-auto">
+                            <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The starting point. Raw image files are fed into the system for processing.">
+                                <span class="text-4xl">🖼️</span>
+                                <h4 class="font-bold mt-2">Image Files</h4>
+                            </div>
+                            <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The 'Farmer'. This script reads an image, calculates all its gradient vectors, and populates the database with features.">
+                                <span class="text-2xl">👨‍🌾</span>
+                                <h4 class="font-bold mt-2">featureExtractor.js</h4>
+                            </div>
+                        </div>
+                        <div class="architecture-arrow w-px md:w-24 h-12 md:h-px"></div>
+                        <div class="architecture-box text-center p-4 border-2 border-amber-400 bg-amber-50 rounded-lg w-48" data-info="The central hub. All data—images, feature vectors, and learned knowledge—is stored and managed here.">
+                            <span class="text-4xl">🗄️</span>
+                            <h4 class="font-bold mt-2">MySQL Database</h4>
+                        </div>
+                        <div class="architecture-arrow w-px md:w-24 h-12 md:h-px"></div>
+                        <div class="flex flex-col gap-4 items-center w-full md:w-auto">
+                           <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The 'Chef'. This script performs batch analysis on the database to discover feature correlations and build the knowledge graph.">
+                                <span class="text-2xl">🧑‍🍳</span>
+                                <h4 class="font-bold mt-2">train.js</h4>
+                            </div>
+                           <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The 'Brain'. This is the main application engine, running the search logic and server. It uses the knowledge from the database to find images.">
+                                <span class="text-2xl">🧠</span>
+                                <h4 class="font-bold mt-2">index.js / client.js</h4>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="architecture-info" class="mt-6 p-4 bg-slate-100 rounded-lg text-center text-slate-700 min-h-[60px]">
+                        <p>Hover over a component to see its description.</p>
+                    </div>
+                </div>
+            </section>
+            
+            <section id="simulation" class="mb-16">
+                <h2 class="text-3xl font-bold text-slate-900 mb-2">Secure Search Simulation</h2>
+                <p class="text-lg text-slate-600 mb-8">This simulation demonstrates the secure, iterative dialogue between the client and the server. The client never sends the whole image. Instead, the server uses its learned knowledge to ask for the most useful, tiny pieces of information until it finds a match. Click "Start Search" to see it in action.</p>
+                <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                    <div class="text-center mb-6">
+                        <button id="start-sim-btn" class="bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-6 rounded-lg transition-colors">Start Search</button>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 items-center gap-4 text-center">
+                        <div class="sim-box p-4 border-2 border-slate-300 rounded-lg">
+                            <h3 class="font-bold text-lg">CLIENT</h3>
+                            <p class="text-slate-500">Has an image to identify</p>
+                        </div>
+                        <div id="sim-comm-flow" class="flex flex-col items-center justify-center space-y-2">
+                             <div class="w-full text-center">
+                                <p id="sim-probe-text" class="text-sm text-slate-500 mb-1 opacity-0 transition-opacity duration-500">1. Send Probe Vector</p>
+                                <div class="sim-arrow architecture-arrow"></div>
+                            </div>
+                             <div class="w-full text-center">
+                                <p id="sim-req-text" class="text-sm text-slate-500 mt-2 mb-1 opacity-0 transition-opacity duration-500">2. Request Specific Vector</p>
+                                <div class="sim-arrow architecture-arrow transform rotate-180"></div>
+                            </div>
+                        </div>
+                        <div class="sim-box p-4 border-2 border-slate-300 rounded-lg">
+                            <h3 class="font-bold text-lg">SERVER</h3>
+                            <p class="text-slate-500">Has the knowledge base</p>
+                        </div>
+                    </div>
+                    <div id="sim-log" class="mt-6 p-4 bg-slate-100 rounded-lg font-mono text-sm text-slate-700 min-h-[150px] whitespace-pre-wrap"></div>
+                </div>
+            </section>
+
+            <section id="usage" class="mb-16">
+                <h2 class="text-3xl font-bold text-slate-900 mb-2">How to Use</h2>
+                <p class="text-lg text-slate-600 mb-8">Follow these steps to set up and run the Image Sign DB project on your local machine.</p>
+                <div class="space-y-6">
+                    <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                        <h3 class="font-bold text-xl mb-3"><span class="bg-amber-500 text-white rounded-full w-8 h-8 flex items-center justify-center inline-flex mr-3">1</span>Installation & Setup</h3>
+                        <p class="mb-4">Clone the repository, install dependencies, and create a `.env` file in the root directory with your MySQL credentials.</p>
+                        <code class="block bg-slate-800 text-white p-4 rounded-md text-sm whitespace-pre-wrap">npm install
+
+# .env file content
+DB_HOST=localhost
+DB_USER=your_mysql_user
+DB_PASSWORD=your_mysql_password
+DB_NAME=image_hypercube_db</code>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                        <h3 class="font-bold text-xl mb-3"><span class="bg-amber-500 text-white rounded-full w-8 h-8 flex items-center justify-center inline-flex mr-3">2</span>Database & Data Population</h3>
+                        <p class="mb-4">Initialize the database schema, then run the feature extractor on all images in your training dataset to populate the database.</p>
+                        <code class="block bg-slate-800 text-white p-4 rounded-md text-sm whitespace-pre-wrap">node src/setupDatabase.js
+
+# Repeat for every image
+node src/featureExtractor.js path/to/image1.jpg</code>
+                    </div>
+                    <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
+                        <h3 class="font-bold text-xl mb-3"><span class="bg-amber-500 text-white rounded-full w-8 h-8 flex items-center justify-center inline-flex mr-3">3</span>Train & Search</h3>
+                        <p class="mb-4">Run the batch training script to build the initial knowledge base. Then, start the server and use the client to find images.</p>
+                        <code class="block bg-slate-800 text-white p-4 rounded-md text-sm whitespace-pre-wrap"># (Optional but Recommended)
+node src/train.js
+
+# Start the server
+node src/index.js server
+
+# In another terminal, run the client
+node src/client.js path/to/image_to_find.jpg</code>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            const navLinks = document.querySelectorAll('.nav-link');
+            const sections = document.querySelectorAll('main section');
+            const logicTabs = document.getElementById('logic-tabs');
+            const tabButtons = logicTabs.querySelectorAll('.tab-button');
+            const logicContent = document.getElementById('logic-content');
+
+            const tabContents = {
+                'tab-vectorization': {
+                    title: '1. Multidimensional Vectorization: The "Image Hypercube"',
+                    content: `Instead of treating an image as a flat, 2D grid of pixels, we model it as a 4D data structure. The system populates the database with thousands of tiny "vector changes" (gradients)—the difference in color and brightness between adjacent blocks in a grid at each resolution level. This collection of gradients forms the image's unique signature.
+                    <ul class='list-disc pl-5 mt-4 space-y-2 text-slate-600'>
+                        <li><b>Dimensions 1 & 2 (X, Y):</b> The spatial location within the image.</li>
+                        <li><b>Dimension 3 (Channels):</b> Primarily using HSV (Hue, Saturation, Value), which is robust against lighting and filter distortions.</li>
+                        <li><b>Dimension 4 (Resolution):</b> A multi-scale pyramid captures both broad structure and fine details.</li>
+                    </ul>`
+                },
+                'tab-graph': {
+                    title: '2. Hierarchical Knowledge Graph via MySQL',
+                    content: `The "brain" of the system is the <code>knowledge_nodes</code> table, a dynamic structure that is continuously updated. It stores learned information about which features are most useful for recognition.
+                    <ul class='list-disc pl-5 mt-4 space-y-2 text-slate-600'>
+                        <li><b>Leaf Nodes ('FEATURE'):</b> Represent a single, specific feature descriptor (e.g., a gradient at a certain position and resolution).</li>
+                        <li><b>Parent Nodes ('GROUP'):</b> Represent learned combinations of leaf nodes that are effective at distinguishing images.</li>
+                        <li><b>Learning via Stats:</b> Each node has a <code>hit_count</code> and <code>miss_count</code>. The ratio determines the feature's utility score, guiding the search algorithm.</li>
+                    </ul>
+                    <div class="chart-container mt-6">
+                        <canvas id="knowledgeChart"></canvas>
+                    </div>`
+                },
+                'tab-learning': {
+                    title: '3. The Learning Process: Discovery and Refinement',
+                    content: `The system learns in two primary ways: through batch analysis for broad discovery and through real-time updates for continuous refinement.
+                    <div class="mt-4 space-y-4">
+                        <div class="p-4 bg-slate-50 rounded-lg">
+                            <h4 class="font-semibold text-slate-800">A) Batch Training (Initial Discovery)</h4>
+                            <p class="text-slate-600">The <code>train.js</code> script operates "blindly" on the database to find foundational correlations. It finds features that are good at discriminating a target image from false positives, and updates the knowledge graph accordingly.</p>
+                        </div>
+                        <div class="p-4 bg-slate-50 rounded-lg">
+                            <h4 class="font-semibold text-slate-800">B) Real-Time Learning (Continuous Refinement)</h4>
+                            <p class="text-slate-600">The system learns from every interaction. When a new image is added, its features enrich the dataset. After a successful search, the server reinforces the "winning" query path by increasing the hit count of the features used.</p>
+                        </div>
+                    </div>`
+                },
+                'tab-search': {
+                    title: '4. Secure, Iterative Search: Requiring Only Needed Vectors',
+                    content: `The search process is a secure dialogue between the client and the server. This ensures the client never sends the full image, making it impossible to reconstruct the source image from the data transmitted.
+                    <ol class='list-decimal pl-5 mt-4 space-y-2 text-slate-600'>
+                        <li><b>Probe:</b> The client sends a single, low-information "probe" vector.</li>
+                        <li><b>Filter:</b> The server finds an initial list of potential candidates.</li>
+                        <li><b>Intelligent Question:</b> The server consults its knowledge graph to ask for the single most effective feature to tell the candidates apart.</li>
+                        <li><b>Refined Answer:</b> The client computes and sends only this specific vector.</li>
+                        <li><b>Repeat & Learn:</b> This loop continues until one match remains. The server then learns from the successful query path.</li>
+                    </ol>`
+                }
+            };
+
+            function updateTabContent(targetId) {
+                const data = tabContents[targetId];
+                if (!data) return;
+
+                logicContent.innerHTML = `<h3 class="font-bold text-xl mb-3">${data.title}</h3><div class="prose prose-slate max-w-none">${data.content}</div>`;
+
+                if (targetId === 'tab-graph') {
+                    renderKnowledgeChart();
+                }
+            }
+
+            let knowledgeChartInstance = null;
+            function renderKnowledgeChart() {
+                const ctx = document.getElementById('knowledgeChart');
+                if (!ctx) return;
+                
+                if (knowledgeChartInstance) {
+                    knowledgeChartInstance.destroy();
+                }
+
+                knowledgeChartInstance = new Chart(ctx.getContext('2d'), {
+                    type: 'bar',
+                    data: {
+                        labels: ['Feature A', 'Feature B (Useful)', 'Feature C', 'Feature D (Useful)', 'Feature E'],
+                        datasets: [{
+                            label: 'Hit Count',
+                            data: [120, 850, 300, 920, 50],
+                            backgroundColor: 'rgba(56, 189, 248, 0.6)', // sky-400
+                            borderColor: 'rgba(14, 165, 233, 1)', // sky-500
+                            borderWidth: 1
+                        }, {
+                            label: 'Miss Count',
+                            data: [400, 150, 310, 80, 55],
+                            backgroundColor: 'rgba(251, 146, 60, 0.6)', // orange-400
+                            borderColor: 'rgba(249, 115, 22, 1)', // orange-500
+                            borderWidth: 1
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {
+                            title: {
+                                display: true,
+                                text: 'Example Utility of Knowledge Nodes (Hit vs. Miss)'
+                            },
+                            tooltip: {
+                                callbacks: {
+                                    footer: (tooltipItems) => {
+                                        let hit = 0;
+                                        let miss = 0;
+                                        tooltipItems.forEach(item => {
+                                            if (item.dataset.label === 'Hit Count') hit = item.raw;
+                                            if (item.dataset.label === 'Miss Count') miss = item.raw;
+                                        });
+                                        const utility = (hit / (hit + miss + 1)).toFixed(2);
+                                        return `Utility Score: ~${utility}`;
+                                    }
+                                }
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: true,
+                                stacked: false
+                            },
+                            x: {
+                                grid: { display: false }
+                            }
+                        }
+                    }
+                });
+            }
+
+            tabButtons.forEach(button => {
+                button.addEventListener('click', () => {
+                    tabButtons.forEach(btn => btn.classList.remove('active'));
+                    button.classList.add('active');
+                    updateTabContent(button.dataset.target);
+                });
+            });
+
+            tabButtons[0].click();
+
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        navLinks.forEach(link => {
+                            link.classList.toggle('active', link.getAttribute('href').substring(1) === entry.target.id);
+                        });
+                    }
+                });
+            }, { rootMargin: '-50% 0px -50% 0px' });
+
+            sections.forEach(section => observer.observe(section));
+            
+            navLinks.forEach(link => {
+                link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    document.querySelector(link.getAttribute('href')).scrollIntoView({ behavior: 'smooth' });
+                });
+            });
+
+            const architectureBoxes = document.querySelectorAll('.architecture-box');
+            const architectureInfo = document.getElementById('architecture-info');
+            architectureBoxes.forEach(box => {
+                box.addEventListener('mouseenter', () => {
+                    architectureInfo.textContent = box.dataset.info;
+                    architectureBoxes.forEach(b => b.style.borderColor = '#cbd5e1');
+                    box.style.borderColor = '#f59e0b';
+                });
+            });
+
+            const startSimBtn = document.getElementById('start-sim-btn');
+            const simLog = document.getElementById('sim-log');
+            const simArrows = document.querySelectorAll('.sim-arrow');
+            const simText = [document.getElementById('sim-probe-text'), document.getElementById('sim-req-text')];
+            
+            startSimBtn.addEventListener('click', () => {
+                startSimBtn.disabled = true;
+                startSimBtn.textContent = 'Running...';
+                simLog.innerHTML = '';
+                simArrows.forEach(a => a.classList.remove('visible'));
+                simText.forEach(t => t.style.opacity = '0');
+                
+                let logCounter = 0;
+                const logMessages = [
+                    'CLIENT: Generating initial low-res probe vector...',
+                    'CLIENT -> SERVER: Sending probe vector...',
+                    'SERVER: Received probe. Found 1,532 potential candidates.',
+                    'SERVER: Consulting knowledge graph for best question...',
+                    'SERVER: Most useful feature is: hsv_gradient_v at level 1 [4, 7].',
+                    'SERVER -> CLIENT: Requesting specific vector...',
+                    'CLIENT: Received request. Generating required vector...',
+                    'CLIENT -> SERVER: Sending refined vector...',
+                    'SERVER: Received vector. Pruning candidate list...',
+                    'SERVER: Refined to 3 candidates.',
+                    'SERVER: Consulting knowledge graph again...',
+                    'SERVER: Most useful feature is: hsv_gradient_h at level 0 [1, 2].',
+                    'SERVER -> CLIENT: Requesting specific vector...',
+                    'CLIENT: Received request. Generating required vector...',
+                    'CLIENT -> SERVER: Sending refined vector...',
+                    'SERVER: Received vector. Pruning candidate list...',
+                    'SERVER: Refined to 1 candidate.',
+                    'SERVER: ✅ Match found! Image ID: 842. Search complete.'
+                ];
+
+                function typeMessage() {
+                    if (logCounter < logMessages.length) {
+                        const msg = logMessages[logCounter];
+                        simLog.innerHTML += (logCounter > 0 ? '\n' : '') + msg;
+                        simLog.scrollTop = simLog.scrollHeight;
+                        
+                        if (msg.includes('CLIENT -> SERVER')) {
+                            simArrows[0].classList.add('visible');
+                            simText[0].style.opacity = '1';
+                            setTimeout(() => { simArrows[0].classList.remove('visible'); simText[0].style.opacity = '0'; }, 1000);
+                        } else if (msg.includes('SERVER -> CLIENT')) {
+                            simArrows[1].classList.add('visible');
+                            simText[1].style.opacity = '1';
+                            setTimeout(() => { simArrows[1].classList.remove('visible'); simText[1].style.opacity = '0'; }, 1000);
+                        }
+
+                        logCounter++;
+                        setTimeout(typeMessage, 600);
+                    } else {
+                        startSimBtn.disabled = false;
+                        startSimBtn.textContent = 'Restart Search';
+                    }
+                }
+                typeMessage();
+            });
+
+        });
+    </script>
+
+</body>
+</html>

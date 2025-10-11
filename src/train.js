@@ -29,6 +29,92 @@ function euclideanDistance(buf1, buf2) {
     return Math.sqrt(sum);
 }
 
+function bufferToFloat32Array(buffer) {
+    if (!buffer) return null;
+    return new Float32Array(buffer.buffer, buffer.byteOffset, buffer.length / Float32Array.BYTES_PER_ELEMENT);
+}
+
+function cosineSimilarity(buf1, buf2) {
+    if (!buf1 || !buf2 || buf1.length !== buf2.length) return 0;
+    const vec1 = bufferToFloat32Array(buf1);
+    const vec2 = bufferToFloat32Array(buf2);
+    let dot = 0, norm1 = 0, norm2 = 0;
+    for (let i = 0; i < vec1.length; i++) {
+        dot += vec1[i] * vec2[i];
+        norm1 += vec1[i] * vec1[i];
+        norm2 += vec2[i] * vec2[i];
+    }
+    if (norm1 === 0 || norm2 === 0) return 0;
+    return dot / (Math.sqrt(norm1) * Math.sqrt(norm2));
+}
+
+function pearsonCorrelation(buf1, buf2) {
+    if (!buf1 || !buf2 || buf1.length !== buf2.length) return 0;
+    const vec1 = bufferToFloat32Array(buf1);
+    const vec2 = bufferToFloat32Array(buf2);
+    const n = vec1.length;
+    if (n === 0) return 0;
+
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
+    for (let i = 0; i < n; i++) {
+        const x = vec1[i];
+        const y = vec2[i];
+        sumX += x;
+        sumY += y;
+        sumXY += x * y;
+        sumX2 += x * x;
+        sumY2 += y * y;
+    }
+    const numerator = n * sumXY - sumX * sumY;
+    const denominator = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
+    if (!isFinite(denominator) || denominator === 0) return 0;
+    return numerator / denominator;
+}
+
+function meanAndStd(values) {
+    if (!values || values.length === 0) return { mean: 0, std: 0 };
+    const mean = values.reduce((acc, val) => acc + val, 0) / values.length;
+    const variance = values.reduce((acc, val) => acc + (val - mean) * (val - mean), 0) / values.length;
+    return { mean, std: Math.sqrt(Math.max(variance, 0)) };
+}
+
+function scoreCandidateFeature(targetFeature, candidateFeatures) {
+    if (!candidateFeatures || candidateFeatures.length === 0) {
+        return null;
+    }
+
+    const distances = [];
+    const cosineValues = [];
+    const pearsonValues = [];
+
+    for (const candidate of candidateFeatures) {
+        distances.push(euclideanDistance(targetFeature.vector_data, candidate.vector_data));
+        cosineValues.push(cosineSimilarity(targetFeature.vector_data, candidate.vector_data));
+        pearsonValues.push(pearsonCorrelation(targetFeature.vector_data, candidate.vector_data));
+    }
+
+    const { mean: meanDistance, std: stdDistance } = meanAndStd(distances);
+    const meanCosine = cosineValues.reduce((acc, val) => acc + val, 0) / cosineValues.length;
+    const meanPearson = pearsonValues.reduce((acc, val) => acc + val, 0) / pearsonValues.length;
+
+    const separationScore =
+        (meanDistance || 0) +
+        (stdDistance || 0) +
+        (1 - (meanCosine || 0)) +
+        (1 - (meanPearson || 0));
+
+    return {
+        score: separationScore,
+        metrics: {
+            meanDistance,
+            stdDistance,
+            meanCosine,
+            meanPearson,
+            sampleSize: candidateFeatures.length,
+        },
+    };
+}
+
 /**
  * Gets or creates a 'FEATURE' node in the knowledge base.
  * Returns the node_id.
@@ -59,12 +145,68 @@ async function getOrCreateFeatureNode(feature) {
 /**
  * Increments the hit or miss count for a given knowledge node.
  */
-async function updateNodeStats(nodeId, outcome) {
+async function updateNodeStats(nodeId, outcome, amount = 1) {
     const field = outcome === 'hit' ? 'hit_count' : 'miss_count';
     await dbConnection.execute(
-        `UPDATE knowledge_nodes SET ${field} = ${field} + 1 WHERE node_id = ?`,
-        [nodeId]
+        `UPDATE knowledge_nodes SET ${field} = ${field} + ? WHERE node_id = ?`,
+        [amount, nodeId]
     );
+}
+
+async function getOrCreateFeatureGroupNode(parentNodeId, startFeature, discriminatorFeature) {
+    const details = JSON.stringify({
+        type: 'PAIR',
+        discriminator: {
+            vector_type: discriminatorFeature.vector_type,
+            level: discriminatorFeature.resolution_level,
+            x: discriminatorFeature.pos_x,
+            y: discriminatorFeature.pos_y,
+        },
+    });
+
+    const [rows] = await dbConnection.execute(
+        `SELECT node_id FROM knowledge_nodes WHERE node_type = 'GROUP' AND parent_node_id = ? AND feature_details = ?`,
+        [parentNodeId, details]
+    );
+    if (rows.length > 0) return rows[0].node_id;
+
+    const [result] = await dbConnection.execute(
+        `INSERT INTO knowledge_nodes (parent_node_id, node_type, feature_details) VALUES (?, 'GROUP', ?)`,
+        [parentNodeId, details]
+    );
+    return result.insertId;
+}
+
+async function upsertFeatureGroupStats(startFeature, discriminatorFeature, metrics) {
+    const sql = `
+        INSERT INTO feature_group_stats (
+            start_vector_type, start_resolution_level, start_pos_x, start_pos_y,
+            discriminator_vector_type, discriminator_resolution_level, discriminator_pos_x, discriminator_pos_y,
+            sample_size, mean_distance, std_distance, mean_cosine, mean_pearson
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            mean_distance = ((mean_distance * sample_size) + (VALUES(mean_distance) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
+            std_distance = ((std_distance * sample_size) + (VALUES(std_distance) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
+            mean_cosine = ((mean_cosine * sample_size) + (VALUES(mean_cosine) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
+            mean_pearson = ((mean_pearson * sample_size) + (VALUES(mean_pearson) * VALUES(sample_size))) / GREATEST(sample_size + VALUES(sample_size), 1),
+            sample_size = sample_size + VALUES(sample_size)
+    `;
+
+    await dbConnection.execute(sql, [
+        startFeature.vector_type,
+        startFeature.resolution_level,
+        startFeature.pos_x,
+        startFeature.pos_y,
+        discriminatorFeature.vector_type,
+        discriminatorFeature.resolution_level,
+        discriminatorFeature.pos_x,
+        discriminatorFeature.pos_y,
+        metrics.sampleSize,
+        metrics.meanDistance ?? 0,
+        metrics.stdDistance ?? 0,
+        metrics.meanCosine ?? 0,
+        metrics.meanPearson ?? 0,
+    ]);
 }
 
 
@@ -121,7 +263,8 @@ async function runTraining() {
 
             // 4. THE LEARNING STEP: Find a second feature that best discriminates the target from the candidates.
             let bestDiscriminator = null;
-            let maxSpread = -1;
+            let bestMetrics = null;
+            let bestScore = -Infinity;
 
             const [targetFeatures] = await dbConnection.execute('SELECT * FROM feature_vectors WHERE image_id = ?', [targetImageId]);
             
@@ -132,31 +275,35 @@ async function runTraining() {
                     [potentialDiscriminator.vector_type, potentialDiscriminator.resolution_level, potentialDiscriminator.pos_x, potentialDiscriminator.pos_y, [...candidateImageIds]]
                 );
 
-                if (candidateFeatures.length === 0) continue;
+                const evaluation = scoreCandidateFeature(potentialDiscriminator, candidateFeatures);
+                if (!evaluation) continue;
 
-                // Calculate the "spread" - the average distance from the target's feature to the candidates' features.
-                let totalDistance = 0;
-                for (const cf of candidateFeatures) {
-                    totalDistance += euclideanDistance(potentialDiscriminator.vector_data, cf.vector_data);
-                }
-                const avgDistance = totalDistance / candidateFeatures.length;
-
-                if (avgDistance > maxSpread) {
-                    maxSpread = avgDistance;
+                if (evaluation.score > bestScore) {
+                    bestScore = evaluation.score;
                     bestDiscriminator = potentialDiscriminator;
+                    bestMetrics = evaluation.metrics;
                 }
             }
 
             if (bestDiscriminator) {
                 console.log(`  Found a good discriminating feature: ${bestDiscriminator.vector_type} at [${bestDiscriminator.pos_x}, ${bestDiscriminator.pos_y}]`);
+                if (bestMetrics) {
+                    console.log(`    -> Metrics: mean distance=${bestMetrics.meanDistance.toFixed(4)}, std=${bestMetrics.stdDistance.toFixed(4)}, mean cosine=${bestMetrics.meanCosine.toFixed(4)}, mean pearson=${bestMetrics.meanPearson.toFixed(4)}`);
+                }
                 // 5. Update the knowledge base
                 const startNodeId = await getOrCreateFeatureNode(startFeature);
                 const discriminatorNodeId = await getOrCreateFeatureNode(bestDiscriminator);
 
-                await updateNodeStats(startNodeId, 'hit');
-                await updateNodeStats(discriminatorNodeId, 'hit');
-                // Here you would also create/update a 'GROUP' node for the pair, which is a more advanced step.
-                // For now, we'll just update the individual feature stats.
+                const increment = bestMetrics?.sampleSize || 1;
+                await updateNodeStats(startNodeId, 'hit', increment);
+                await updateNodeStats(discriminatorNodeId, 'hit', increment);
+
+                const groupNodeId = await getOrCreateFeatureGroupNode(startNodeId, startFeature, bestDiscriminator);
+                await updateNodeStats(groupNodeId, 'hit', increment);
+
+                if (bestMetrics && bestMetrics.sampleSize > 0) {
+                    await upsertFeatureGroupStats(startFeature, bestDiscriminator, bestMetrics);
+                }
 
                 console.log(`  📈 Updated knowledge base for the useful feature combination.`);
             } else {

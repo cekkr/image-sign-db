@@ -51,6 +51,35 @@ CREATE TABLE IF NOT EXISTS knowledge_nodes (
     UNIQUE KEY uq_feature_definition (node_type, feature_details(256))
 ) ENGINE=InnoDB;`;
 
+const createFeatureGroupStatsTableSQL = `
+CREATE TABLE IF NOT EXISTS feature_group_stats (
+    stat_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    start_vector_type VARCHAR(80) NOT NULL,
+    start_resolution_level TINYINT UNSIGNED NOT NULL,
+    start_pos_x SMALLINT UNSIGNED NOT NULL,
+    start_pos_y SMALLINT UNSIGNED NOT NULL,
+    discriminator_vector_type VARCHAR(80) NOT NULL,
+    discriminator_resolution_level TINYINT UNSIGNED NOT NULL,
+    discriminator_pos_x SMALLINT UNSIGNED NOT NULL,
+    discriminator_pos_y SMALLINT UNSIGNED NOT NULL,
+    sample_size INT UNSIGNED DEFAULT 0,
+    mean_distance DOUBLE DEFAULT 0,
+    std_distance DOUBLE DEFAULT 0,
+    mean_cosine DOUBLE DEFAULT 0,
+    mean_pearson DOUBLE DEFAULT 0,
+    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_feature_pair (
+        start_vector_type,
+        start_resolution_level,
+        start_pos_x,
+        start_pos_y,
+        discriminator_vector_type,
+        discriminator_resolution_level,
+        discriminator_pos_x,
+        discriminator_pos_y
+    )
+) ENGINE=InnoDB;`;
+
 // --- MAIN EXECUTION LOGIC ---
 async function setupDatabase() {
     let connection;
@@ -83,6 +112,9 @@ async function setupDatabase() {
         console.log(" -> Creating new 'knowledge_nodes' table...");
         await connection.query(createKnowledgeNodesTableSQL);
         console.log("    ✅ Table 'knowledge_nodes' is ready.");
+        console.log(" -> Creating 'feature_group_stats' table...");
+        await connection.query(createFeatureGroupStatsTableSQL);
+        console.log("    ✅ Table 'feature_group_stats' is ready.");
 
         console.log("\n🎉 Database setup completed successfully with the new schema!");
 
@@ -98,4 +130,3 @@ async function setupDatabase() {
 }
 
 setupDatabase();
-

@@ -3,33 +3,22 @@ const mysql = require('mysql2/promise');
 require('dotenv').config();
 
 // --- SAMPLE DATA ---
-// This is a list of hypothetical "knowledge" we might learn later.
-// It asserts that certain feature combinations are useful for specific tasks.
 const sampleCorrelations = [
     {
-        feature_A_type: 'hsv_gradient_h',
-        feature_A_location: 'level:2,quadrant:top_left',
-        feature_B_type: 'hsv_gradient_v',
-        feature_B_location: 'level:2,quadrant:top_left',
-        utility_score: 0.85,
-        best_for_distortion: 'color_filter'
+        start: { vector_type: 'hsv_gradient_h', level: 2, x: 0, y: 0 },
+        discriminator: { vector_type: 'hsv_tree_mean', level: 1, x: 1, y: 1 },
+        stats: { mean_distance: 0.48, std_distance: 0.17, mean_cosine: 0.32, mean_pearson: 0.28, sample_size: 24 },
     },
     {
-        feature_A_type: 'hsv_gradient_v',
-        feature_A_location: 'level:0,pos_x:0,pos_y:0',
-        feature_B_type: 'hsv_gradient_v',
-        feature_B_location: 'level:0,pos_x:7,pos_y:7',
-        utility_score: 0.65,
-        best_for_distortion: 'mirroring'
+        start: { vector_type: 'hsv_gradient_v#mirror_horizontal', level: 1, x: 3, y: 2 },
+        discriminator: { vector_type: 'hsv_tree_delta#mirror_horizontal', level: 2, x: 6, y: 5 },
+        stats: { mean_distance: 0.61, std_distance: 0.21, mean_cosine: 0.15, mean_pearson: 0.18, sample_size: 19 },
     },
     {
-        feature_A_type: 'hsv_gradient_h',
-        feature_A_location: 'level:1,quadrant:center',
-        feature_B_type: 'hsv_gradient_h',
-        feature_B_location: 'level:2,quadrant:center',
-        utility_score: 0.40, // A less useful correlation
-        best_for_distortion: 'low_quality'
-    }
+        start: { vector_type: 'hsv_tree_mean', level: 0, x: 0, y: 0 },
+        discriminator: { vector_type: 'hsv_gradient_h', level: 1, x: 2, y: 3 },
+        stats: { mean_distance: 0.32, std_distance: 0.08, mean_cosine: 0.54, mean_pearson: 0.49, sample_size: 31 },
+    },
 ];
 
 // --- MAIN LOGIC ---
@@ -43,30 +32,45 @@ async function testAndSeedCorrelations() {
             password: process.env.DB_PASSWORD, database: process.env.DB_NAME,
         });
 
-        console.log("\n🌱 Seeding sample correlation rules...");
+        console.log("\n🌱 Seeding sample correlation stats...");
         for (const rule of sampleCorrelations) {
-            // "ON DUPLICATE KEY UPDATE" is a safe way to insert data. If a rule with the
-            // same unique key already exists, it will update it instead of failing.
             const sql = `
-                INSERT INTO vector_correlations 
-                    (feature_A_type, feature_A_location, feature_B_type, feature_B_location, utility_score, best_for_distortion)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE utility_score = VALUES(utility_score);
+                INSERT INTO feature_group_stats (
+                    start_vector_type, start_resolution_level, start_pos_x, start_pos_y,
+                    discriminator_vector_type, discriminator_resolution_level, discriminator_pos_x, discriminator_pos_y,
+                    sample_size, mean_distance, std_distance, mean_cosine, mean_pearson
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE
+                    sample_size = GREATEST(sample_size, VALUES(sample_size)),
+                    mean_distance = VALUES(mean_distance),
+                    std_distance = VALUES(std_distance),
+                    mean_cosine = VALUES(mean_cosine),
+                    mean_pearson = VALUES(mean_pearson);
             `;
             await connection.execute(sql, [
-                rule.feature_A_type, rule.feature_A_location,
-                rule.feature_B_type, rule.feature_B_location,
-                rule.utility_score, rule.best_for_distortion
+                rule.start.vector_type,
+                rule.start.level,
+                rule.start.x,
+                rule.start.y,
+                rule.discriminator.vector_type,
+                rule.discriminator.level,
+                rule.discriminator.x,
+                rule.discriminator.y,
+                rule.stats.sample_size,
+                rule.stats.mean_distance,
+                rule.stats.std_distance,
+                rule.stats.mean_cosine,
+                rule.stats.mean_pearson,
             ]);
-            console.log(`  -> Processed rule for '${rule.feature_A_type}' & '${rule.feature_B_type}'.`);
+            console.log(`  -> Processed pair '${rule.start.vector_type}' → '${rule.discriminator.vector_type}'.`);
         }
 
         console.log("\n✅ Seeding complete. Verifying data...");
 
-        // Retrieve all data from the table to verify it was inserted.
-        const [rows] = await connection.query('SELECT * FROM vector_correlations;');
+        const [rows] = await connection.query('SELECT * FROM feature_group_stats;');
         
-        console.log("\n--- Current Data in 'vector_correlations' ---");
+        console.log("\n--- Current Data in 'feature_group_stats' ---");
         console.table(rows);
         console.log("----------------------------------------------");
         
