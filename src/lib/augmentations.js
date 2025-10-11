@@ -34,7 +34,10 @@ function applyRandomCombo(baseImage, baseMeta, imagePath, augmentationName) {
     const rotation = rand() * 12 - 6;
     const saturation = 0.85 + rand() * 0.3;
     const brightness = 0.9 + rand() * 0.2;
-    const hueShift = rand() * 36 - 18;
+    const hueShift = rand() * 36 - 18; // float range [-18, +18]
+    // sharp.modulate expects integer degrees; normalize to [0, 359]
+    let hueShiftDeg = Math.round(hueShift);
+    hueShiftDeg = ((hueShiftDeg % 360) + 360) % 360;
     const blurSigma = 0.4 + rand() * 0.6;
 
     const cropWidth = Math.max(1, Math.floor(baseMeta.width * cropRatio));
@@ -56,7 +59,7 @@ function applyRandomCombo(baseImage, baseMeta, imagePath, augmentationName) {
         .modulate({
             saturation,
             brightness,
-            hue: hueShift,
+            hue: hueShiftDeg,
         });
 
     if (rand() > 0.5) {
