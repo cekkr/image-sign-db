@@ -149,13 +149,13 @@
                         </div>
                         <div class="architecture-arrow w-px md:w-24 h-12 md:h-px"></div>
                         <div class="flex flex-col gap-4 items-center w-full md:w-auto">
-                           <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The 'Chef'. This script performs batch analysis on the database to discover feature correlations and build the knowledge graph.">
+                           <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The 'Conductor'. This tool ingests or removes images and can trigger correlation discovery sweeps or full bootstraps.">
                                 <span class="text-2xl">🧑‍🍳</span>
-                                <h4 class="font-bold mt-2">train.js</h4>
+                                <h4 class="font-bold mt-2">insert.js</h4>
                             </div>
                            <div class="architecture-box text-center p-4 border-2 border-slate-300 rounded-lg w-48" data-info="The 'Brain'. This is the main application engine, running the search logic and server. It uses the knowledge from the database to find images.">
                                 <span class="text-2xl">🧠</span>
-                                <h4 class="font-bold mt-2">index.js / client.js</h4>
+                                <h4 class="font-bold mt-2">index.js / clientAPI.js</h4>
                             </div>
                         </div>
                     </div>
@@ -213,23 +213,23 @@ DB_NAME=image_hypercube_db</code>
                     </div>
                     <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
                         <h3 class="font-bold text-xl mb-3"><span class="bg-amber-500 text-white rounded-full w-8 h-8 flex items-center justify-center inline-flex mr-3">2</span>Database & Data Population</h3>
-                        <p class="mb-4">Initialize the database schema, then run the feature extractor on all images in your training dataset to populate the database.</p>
+                        <p class="mb-4">Initialize the database schema, then ingest each image in your dataset with the insertion tool (which invokes the extractor internally).</p>
                         <code class="block bg-slate-800 text-white p-4 rounded-md text-sm whitespace-pre-wrap">node src/setupDatabase.js
 
 # Repeat for every image
-node src/featureExtractor.js path/to/image1.jpg</code>
+node src/insert.js add path/to/image1.jpg --discover=15</code>
                     </div>
                     <div class="bg-white p-6 rounded-lg shadow-sm border border-slate-200">
                         <h3 class="font-bold text-xl mb-3"><span class="bg-amber-500 text-white rounded-full w-8 h-8 flex items-center justify-center inline-flex mr-3">3</span>Train & Search</h3>
-                        <p class="mb-4">Run the batch training script to build the initial knowledge base. Then, start the server and use the client to find images.</p>
-                        <code class="block bg-slate-800 text-white p-4 rounded-md text-sm whitespace-pre-wrap"># (Optional but Recommended)
-node src/train.js
+                        <p class="mb-4">Run the bootstrap command to build the initial knowledge base. Then, start the server and use the client to find images.</p>
+                        <code class="block bg-slate-800 text-white p-4 rounded-md text-sm whitespace-pre-wrap"># (Optional but recommended)
+node src/insert.js bootstrap 75
 
 # Start the server
 node src/index.js server
 
 # In another terminal, run the client
-node src/client.js path/to/image_to_find.jpg</code>
+node src/clientAPI.js path/to/image_to_find.jpg</code>
                     </div>
                 </div>
             </section>
@@ -271,8 +271,8 @@ node src/client.js path/to/image_to_find.jpg</code>
                     content: `The system learns in two primary ways: through batch analysis for broad discovery and through real-time updates for continuous refinement.
                     <div class="mt-4 space-y-4">
                         <div class="p-4 bg-slate-50 rounded-lg">
-                            <h4 class="font-semibold text-slate-800">A) Batch Training (Initial Discovery)</h4>
-                            <p class="text-slate-600">The <code>train.js</code> script operates "blindly" on the database to find foundational correlations. It finds features that are good at discriminating a target image from false positives, and updates the knowledge graph accordingly.</p>
+                            <h4 class="font-semibold text-slate-800">A) Batch Discovery (Initial Knowledge)</h4>
+                            <p class="text-slate-600">The <code>insert.js bootstrap</code> command operates "blindly" on the database to find foundational correlations. It spots feature pairs that discriminate a target image from its lookalikes and updates the knowledge graph accordingly.</p>
                         </div>
                         <div class="p-4 bg-slate-50 rounded-lg">
                             <h4 class="font-semibold text-slate-800">B) Real-Time Learning (Continuous Refinement)</h4>

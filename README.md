@@ -45,9 +45,9 @@ Complementing the graph is the new `feature_group_stats` table. It records real-
 
 The system learns in two primary ways: through batch analysis for broad discovery and through real-time updates for continuous refinement.
 
-**A) Batch Training (Initial Discovery)**
+**A) Batch Discovery (Initial Knowledge)**
 
-The `train.js` script works without any human-provided labels. It operates "blindly" on the populated feature database to discover foundational correlations:
+The `bootstrap` mode of `insert.js` operates "blindly" on the populated feature database to discover foundational correlations:
 
 1.  It picks a random image from the dataset to act as a "query."
     
@@ -65,7 +65,7 @@ This process, repeated thousands of times, builds a rich knowledge graph of whic
 
 The system is designed to learn continuously from new data and user interactions, independently of the batch training process.
 
-*   **Learning on Ingestion:** When a new image is added via `featureExtractor.js`, its features immediately become part of the dataset, enriching the pool of potential discriminators for future learning cycles.
+*   **Learning on Ingestion:** When a new image is added via `insert.js add`, its features immediately become part of the dataset, enriching the pool of potential discriminators for future learning cycles.
     
 *   **Learning on Search:** After a successful search, the `index.js` server reinforces the "winning" query path by increasing the `hit_count` of all the feature nodes that led to the correct match. This makes the most effective search paths even stronger over time.
 
@@ -98,7 +98,7 @@ The project is divided into several standalone scripts that interact via the cen
     
 *   `src/featureExtractor.js`: The "farmer." Reads an image, applies the augmentation sweep, calculates grid gradients plus quadtree features, and populates the database. It can also be used as a module to generate specific vectors (including augmented variants) on demand.
     
-*   `src/train.js`: The "chef." Performs batch analysis on the data in the `feature_vectors` table to discover foundational correlations, updates `knowledge_nodes`, and maintains the statistical summaries in `feature_group_stats`.
+*   `src/insert.js`: The "conductor." Adds or removes images, optionally triggers targeted correlation discovery, and exposes a `bootstrap` mode for the initial learning pass over a dataset.
     
 *   `src/index.js`: The main application engine. Contains the core search logic, performs real-time learning, and can be run as a standalone CLI tool or as an Express web server.
     
@@ -137,19 +137,23 @@ Initialize the database schema by running the setup script once.
 
 ### Step 3: Populate with Data
 
-Create a folder (e.g., `training_dataset`) and fill it with the images you want the system to learn. Run the feature extractor for each image.
+Create a folder (e.g., `training_dataset`) and fill it with the images you want the system to learn. Use the insertion tool to ingest each image (it calls the extractor internally).
 
     # Repeat for every image in your dataset
-    node src/featureExtractor.js path/to/training_dataset/image1.jpg
-    node src/featureExtractor.js path/to/training_dataset/image2.png
+    node src/insert.js add path/to/training_dataset/image1.jpg --discover=15
+    node src/insert.js add path/to/training_dataset/image2.png
     
-The extractor will automatically generate augmented mirrors/blurred variants and build the quadtree hierarchy before persisting the vectors, so one pass per source image is still all that's required.
+The extractor automatically generates augmented mirrors/blurred/jittered variants and builds the quadtree hierarchy before persisting the vectors, so one pass per source image is still all that's required. Adding `--discover=<n>` triggers a small correlation sweep focused on the newly inserted data.
 
-### Step 4: Train the System (Optional but Recommended)
+Need to prune the dataset later? Run:
 
-To bootstrap the knowledge base, run the batch training script. This is especially useful when you first add a large number of images.
+    node src/insert.js remove <image_id|original_filename>
 
-    node src/train.js
+### Step 4: Prime Correlations (Optional but Recommended)
+
+To bootstrap the knowledge base, run the insertion tool in `bootstrap` mode. This sweeps through the dataset with the lightweight discovery algorithm.
+
+    node src/insert.js bootstrap 75
     
 
 ### Step 5: Search for an Image
