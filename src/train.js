@@ -12,6 +12,7 @@ const { createDbConnection } = require('./lib/knowledge');
 const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
 const { euclideanDistance } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
+const { extendConstellationPath } = require('./lib/constellation');
 
 // --- HELPERS ---
 
@@ -105,41 +106,42 @@ async function findCandidateImages(db, probe) {
   return [...candidates];
 }
 
-async function reprobeOne(db, imagePath, imageId) {
-  const probeSpec = normalizeProbeSpec(resolveDefaultProbeSpec());
-  const vector = await generateSpecificVector(imagePath, probeSpec);
-  if (!vector) return { error: 'vector_generation_failed' };
-  const probe = {
-    ...probeSpec,
-    value: vector.value,
-    size: vector.size,
-  };
-
-  let candidates = await findCandidateImages(db, probe);
-  const initial = candidates.length;
-  if (initial === 0) return { ok: false, initial, steps: 0 };
-  if (initial === 1) return { ok: candidates[0] === imageId, initial, steps: 0 };
-
-  // simple channel rotation refinement
+async function reprobeOne(db, imagePath, imageId, options = {}) {
+  const maxSteps = options.maxSteps ?? CHANNEL_DIMENSIONS.length;
+  let constellationPath = [];
+  let remaining = null;
   let steps = 0;
-  let current = probe;
-  for (const channel of CHANNEL_DIMENSIONS) {
-    if (steps >= CHANNEL_DIMENSIONS.length) break;
+
+  while (steps < maxSteps) {
     steps += 1;
-    const nextQ = normalizeProbeSpec({
-      ...current,
-      channel,
-      descriptor: { ...current.descriptor, channel },
+    const probeSpec = normalizeProbeSpec(resolveDefaultProbeSpec());
+    const vector = await generateSpecificVector(imagePath, probeSpec);
+    if (!vector) continue;
+    const probe = {
+      ...probeSpec,
+      value: vector.value,
+      size: vector.size,
+    };
+
+    const candidates = await findCandidateImages(db, probe);
+    remaining = remaining === null
+      ? candidates
+      : candidates.filter((id) => remaining.includes(id));
+
+    constellationPath = extendConstellationPath(constellationPath, {
+      descriptorKey: probe.descriptorKey,
+      candidateCount: remaining.length,
+      rel_x: probe.rel_x,
+      rel_y: probe.rel_y,
+      size: probe.size,
     });
-    const nextVector = await generateSpecificVector(imagePath, nextQ);
-    if (!nextVector) continue;
-    const nextProbe = { ...nextQ, value: nextVector.value, size: nextVector.size };
-    const newCandidates = (await findCandidateImages(db, nextProbe)).filter((id) => candidates.includes(id));
-    candidates = newCandidates;
-    current = nextProbe;
-    if (candidates.length <= 1) break;
+
+    if (remaining.length <= 1) break;
   }
-  return { ok: candidates.length === 1 && candidates[0] === imageId, initial, steps };
+
+  const initial = constellationPath.length > 0 ? constellationPath[0].candidateCount : 0;
+  const ok = remaining && remaining.length === 1 && remaining[0] === imageId;
+  return { ok, initial, steps: constellationPath.length, path: constellationPath };
 }
 
 async function main() {
@@ -178,15 +180,22 @@ async function main() {
       let okCount = 0;
       let totalInitial = 0;
       let totalSteps = 0;
+      let totalAccuracyScore = 0;
       for (const item of sample) {
         const result = await reprobeOne(db, item.file, item.imageId);
         if (result.ok) okCount += 1;
         totalInitial += result.initial || 0;
         totalSteps += result.steps || 0;
+        if (result.path && result.path.length > 0) {
+          totalAccuracyScore += result.path[result.path.length - 1].cumulativeAccuracy ?? 0;
+        }
       }
       console.log(`   ✔️ Success rate: ${(100 * okCount / reprobeN).toFixed(1)}% (${okCount}/${reprobeN})`);
       console.log(`   ⓘ Avg initial candidates: ${(totalInitial / reprobeN).toFixed(2)}`);
       console.log(`   ⓘ Avg refinement steps: ${(totalSteps / reprobeN).toFixed(2)}`);
+      if (totalAccuracyScore > 0) {
+        console.log(`   ✨ Avg constellation accuracy: ${(totalAccuracyScore / reprobeN).toFixed(6)}`);
+      }
     } finally {
       await db.end();
     }

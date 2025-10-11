@@ -28,15 +28,15 @@ const sampleCorrelations = [
         mean_pearson: 0.18,
     },
     {
-        descriptor: { family: 'delta', channel: 'luminance', neighbor_dx: 2, neighbor_dy: 0 },
+        descriptor: { family: 'delta', channel: 'luminance', neighbor_dx: 1, neighbor_dy: -1 },
         resolution_level: 6,
-        avg_length: 0.18,
-        avg_angle: 0.48,
+        avg_length: 0.22,
+        avg_angle: -0.55,
         sample_size: 31,
-        mean_distance: 0.32,
-        std_distance: 0.08,
-        mean_cosine: 0.54,
-        mean_pearson: 0.49,
+        mean_distance: 0.29,
+        std_distance: 0.11,
+        mean_cosine: 0.47,
+        mean_pearson: 0.41,
     },
 ];
 

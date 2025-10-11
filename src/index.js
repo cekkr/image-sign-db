@@ -9,6 +9,7 @@ const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('.
 const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
 const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
 const { recordVectorUsage, saveSkipPattern } = require('./lib/storageManager');
+const { extendConstellationPath, createRandomConstellationSpec, computeAverageRadius } = require('./lib/constellation');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
@@ -68,7 +69,7 @@ function normalizeProbeSpec(spec) {
     normalized.augmentation = normalized.augmentation ?? 'original';
     normalized.rel_x = normalized.rel_x ?? normalized.dx / normalized.gridSize;
     normalized.rel_y = normalized.rel_y ?? normalized.dy / normalized.gridSize;
-    normalized.size = normalized.size ?? 1 / normalized.gridSize;
+    normalized.size = normalized.size ?? computeAverageRadius(normalized.dx, normalized.dy, normalized.gridSize);
 
     if (!normalized.descriptor) {
         const channel = normalized.channel ?? CHANNEL_DIMENSIONS[0];
@@ -77,6 +78,12 @@ function normalizeProbeSpec(spec) {
             channel,
             neighbor_dx: normalized.dx,
             neighbor_dy: normalized.dy,
+        };
+    } else {
+        normalized.descriptor = {
+            ...normalized.descriptor,
+            neighbor_dx: normalized.descriptor.neighbor_dx ?? normalized.dx,
+            neighbor_dy: normalized.descriptor.neighbor_dy ?? normalized.dy,
         };
     }
     normalized.descriptorKey = normalized.descriptorKey ?? createDescriptorKey(normalized.descriptor);
@@ -191,20 +198,34 @@ async function startSearch(probeSpec) {
     }
     const { candidates, valueTypeId, descriptorKey } = await findCandidateImages(db, probeToUse);
 
+    const initialPath = extendConstellationPath([], {
+        descriptorKey,
+        candidateCount: candidates.length,
+        rel_x: probeToUse.rel_x,
+        rel_y: probeToUse.rel_y,
+        size: probeToUse.size,
+    });
     if (candidates.length === 0) {
         await saveSkipPattern(db, probeToUse.descriptor);
         bumpSkipCache(probeToUse.descriptorKey);
-        return { status: 'NO_MATCH' };
+        return { status: 'NO_MATCH', constellationPath: initialPath };
     }
-    if (candidates.length === 1) return { status: 'MATCH_FOUND', imageId: candidates[0] };
+    if (candidates.length === 1) {
+        return {
+            status: 'MATCH_FOUND',
+            imageId: candidates[0],
+            constellationPath: initialPath,
+        };
+    }
 
     const sessionId = crypto.randomBytes(16).toString('hex');
     searchSessions.set(sessionId, {
         candidateIds: candidates,
         probeSpec: { ...probeToUse, valueTypeId, descriptorKey },
         askedDescriptorKeys: new Set([descriptorKey]),
+        constellationPath: initialPath,
     });
-    return { status: 'CANDIDATES_FOUND', sessionId, candidates };
+    return { status: 'CANDIDATES_FOUND', sessionId, candidates, constellationPath: initialPath };
 }
 
 async function refineSearch(sessionId, probeSpec) {
@@ -228,49 +249,92 @@ async function refineSearch(sessionId, probeSpec) {
         searchSessions.delete(sessionId);
         await saveSkipPattern(db, normalizedProbe.descriptor);
         bumpSkipCache(normalizedProbe.descriptorKey);
-        return { status: 'NO_MATCH' };
+        const updatedPath = extendConstellationPath(session.constellationPath, {
+            descriptorKey,
+            candidateCount: 0,
+            rel_x: normalizedProbe.rel_x,
+            rel_y: normalizedProbe.rel_y,
+            size: normalizedProbe.size,
+        });
+        session.constellationPath = updatedPath;
+        return { status: 'NO_MATCH', constellationPath: updatedPath };
     }
     if (remaining.length === 1) {
         searchSessions.delete(sessionId);
-        return { status: 'MATCH_FOUND', imageId: remaining[0] };
+        const updatedPath = extendConstellationPath(session.constellationPath, {
+            descriptorKey,
+            candidateCount: remaining.length,
+            rel_x: normalizedProbe.rel_x,
+            rel_y: normalizedProbe.rel_y,
+            size: normalizedProbe.size,
+        });
+        return { status: 'MATCH_FOUND', imageId: remaining[0], constellationPath: updatedPath };
     }
 
     session.candidateIds = remaining;
     session.askedDescriptorKeys.add(descriptorKey);
     session.probeSpec = { ...normalizedProbe, valueTypeId, descriptorKey };
+    session.constellationPath = extendConstellationPath(session.constellationPath, {
+        descriptorKey,
+        candidateCount: remaining.length,
+        rel_x: normalizedProbe.rel_x,
+        rel_y: normalizedProbe.rel_y,
+        size: normalizedProbe.size,
+    });
     searchSessions.set(sessionId, session);
 
-    return { status: 'CANDIDATES_FOUND', candidates: remaining };
+    return { status: 'CANDIDATES_FOUND', candidates: remaining, constellationPath: session.constellationPath };
 }
 
-function buildNextQuestion(session) {
-    const baseDescriptor = session.probeSpec.descriptor;
-    const template = baseDescriptor ? { ...baseDescriptor } : null;
+async function buildNextQuestion(session) {
+    if (!session) return null;
+    const baseProbe = session.probeSpec;
+    const db = await connectToDatabase();
+    const proposals = [];
 
-    for (const channel of CHANNEL_DIMENSIONS) {
-        const descriptor = template ? { ...template, channel } : {
-            family: 'delta',
+    if (baseProbe?.valueTypeId) {
+        const [rows] = await db.execute(
+            `SELECT avg_length, avg_angle, sample_size
+             FROM feature_group_stats
+             WHERE value_type = ? AND resolution_level = ?
+             ORDER BY sample_size DESC
+             LIMIT 6`,
+            [baseProbe.valueTypeId, baseProbe.gridSize]
+        );
+        for (const row of rows) {
+            const length = row.avg_length ?? 0;
+            const angle = row.avg_angle ?? 0;
+            const dx = Math.round(length * Math.cos(angle) * baseProbe.gridSize);
+            const dy = Math.round(length * Math.sin(angle) * baseProbe.gridSize);
+            if (dx === 0 && dy === 0) continue;
+            if (Math.hypot(dx, dy) > 1.5) continue;
+            proposals.push({ dx, dy });
+        }
+    }
+
+    if (proposals.length === 0) {
+        proposals.push({});
+    }
+
+    const channelOrder = [...CHANNEL_DIMENSIONS].sort(() => Math.random() - 0.5);
+    const attempts = Math.max(12, proposals.length * channelOrder.length);
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const proposal = proposals[attempt % proposals.length];
+        const channel = channelOrder[attempt % channelOrder.length];
+        const specOptions = {
+            gridSize: baseProbe.gridSize,
+            augmentation: baseProbe.augmentation,
             channel,
-            neighbor_dx: session.probeSpec.dx,
-            neighbor_dy: session.probeSpec.dy,
         };
-        const descriptorKey = createDescriptorKey(descriptor);
+        if (Number.isFinite(proposal.dx)) specOptions.dx = proposal.dx;
+        if (Number.isFinite(proposal.dy)) specOptions.dy = proposal.dy;
+        const candidateSpec = createRandomConstellationSpec(specOptions);
+        const normalized = normalizeProbeSpec(candidateSpec);
+        const descriptorKey = normalized.descriptorKey;
         if (session.askedDescriptorKeys.has(descriptorKey)) continue;
         if (getSkipCount(descriptorKey) >= SKIP_THRESHOLD) continue;
-            return {
-                gridSize: session.probeSpec.gridSize,
-                pos_x: session.probeSpec.pos_x,
-                pos_y: session.probeSpec.pos_y,
-                dx: session.probeSpec.dx,
-                dy: session.probeSpec.dy,
-                augmentation: session.probeSpec.augmentation,
-                descriptor,
-                descriptorKey,
-                rel_x: session.probeSpec.rel_x,
-                rel_y: session.probeSpec.rel_y,
-                size: session.probeSpec.size,
-            };
-        }
+        return normalized;
     }
     return null;
 }
@@ -287,7 +351,7 @@ function runServer() {
             const result = await startSearch(probeSpec);
             if (result.status === 'CANDIDATES_FOUND') {
                 const session = searchSessions.get(result.sessionId);
-                const nextQuestion = buildNextQuestion(session);
+                const nextQuestion = await buildNextQuestion(session);
                 return res.json({ ...result, nextQuestion });
             }
             return res.json(result);
@@ -306,7 +370,7 @@ function runServer() {
             }
             if (result.status === 'CANDIDATES_FOUND') {
                 const session = searchSessions.get(sessionId);
-                const nextQuestion = buildNextQuestion(session);
+                const nextQuestion = await buildNextQuestion(session);
                 return res.json({ ...result, nextQuestion });
             }
             return res.json(result);
@@ -407,6 +471,12 @@ async function runCli(imagePath) {
 
     const result = await startSearch(probe);
     console.log('Initial candidates:', result.candidates ?? []);
+    if (result.constellationPath?.length) {
+        const last = result.constellationPath[result.constellationPath.length - 1];
+        console.log(
+            `Constellation accuracy after ${result.constellationPath.length} step(s): ${(last?.cumulativeAccuracy ?? 0).toFixed(6)}`
+        );
+    }
 
     if (result.status !== 'CANDIDATES_FOUND') {
         console.log(`Status: ${result.status}`);
@@ -420,7 +490,7 @@ async function runCli(imagePath) {
 
     const sessionId = result.sessionId;
     const session = searchSessions.get(sessionId);
-    let nextQuestion = buildNextQuestion(session);
+    let nextQuestion = await buildNextQuestion(session);
     let iteration = 0;
 
     while (nextQuestion && iteration < CHANNEL_DIMENSIONS.length) {
@@ -441,6 +511,12 @@ async function runCli(imagePath) {
 
         const refinement = await refineSearch(sessionId, probeUpdate);
         console.log(`Refinement ${iteration}:`, refinement.candidates ?? []);
+        if (refinement.constellationPath?.length) {
+            const last = refinement.constellationPath[refinement.constellationPath.length - 1];
+            console.log(
+                `  ↳ Constellation accuracy: ${(last?.cumulativeAccuracy ?? 0).toFixed(6)}`
+            );
+        }
 
         if (refinement.status !== 'CANDIDATES_FOUND') {
             if (refinement.status === 'MATCH_FOUND') {
@@ -453,7 +529,7 @@ async function runCli(imagePath) {
             return;
         }
 
-        nextQuestion = buildNextQuestion(searchSessions.get(sessionId));
+        nextQuestion = await buildNextQuestion(searchSessions.get(sessionId));
     }
 
     console.log('❌ No definitive match found after probing multiple channels.');

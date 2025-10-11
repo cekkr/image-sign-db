@@ -3,6 +3,7 @@ const { GRID_SIZES, NEIGHBOR_OFFSETS, CHANNEL_DIMENSIONS } = require('./constant
 const { applyAugmentation } = require('./augmentations');
 const { getBlockRange, calculateStatsForRegion, getRawPixels } = require('./gridStats');
 const { createDescriptorKey } = require('./descriptor');
+const { computeAverageRadius } = require('./constellation');
 
 function collectBlockStats(rawPixels, meta, gridSize) {
     const cache = new Array(gridSize * gridSize);
@@ -23,7 +24,6 @@ function generateRelativeGradientFeatures(rawPixels, meta) {
         if (meta.width < gridSize || meta.height < gridSize) continue;
 
         const blockCache = collectBlockStats(rawPixels, meta, gridSize);
-        const baseSize = 1 / gridSize;
 
         for (let y = 0; y < gridSize; y++) {
             for (let x = 0; x < gridSize; x++) {
@@ -31,6 +31,7 @@ function generateRelativeGradientFeatures(rawPixels, meta) {
                 for (const offset of NEIGHBOR_OFFSETS) {
                     const targetX = x + offset.dx;
                     const targetY = y + offset.dy;
+                    if (targetX < 0 || targetY < 0) continue;
                     if (targetX >= gridSize || targetY >= gridSize) continue;
                     const neighborBlock = blockCache[targetY * gridSize + targetX];
                     if (!neighborBlock) continue;
@@ -62,7 +63,7 @@ function generateRelativeGradientFeatures(rawPixels, meta) {
                             rel_x: offset.dx / gridSize,
                             rel_y: offset.dy / gridSize,
                             value,
-                            size: baseSize,
+                            size: computeAverageRadius(offset.dx, offset.dy, gridSize),
                         });
                     }
                 }
@@ -111,6 +112,7 @@ async function generateSpecificVector(imagePath, spec) {
 
     const targetX = pos_x + dx;
     const targetY = pos_y + dy;
+    if (targetX < 0 || targetY < 0) return null;
     if (targetX >= gridSize || targetY >= gridSize) return null;
     const [targetStartX, targetEndX] = getBlockRange(gridSize, meta.width, targetX);
     const [targetStartY, targetEndY] = getBlockRange(gridSize, meta.height, targetY);
@@ -131,7 +133,7 @@ async function generateSpecificVector(imagePath, spec) {
         value: descriptor ? channelValues[descriptor.channel] : null,
         rel_x: dx / gridSize,
         rel_y: dy / gridSize,
-        size: 1 / gridSize,
+        size: computeAverageRadius(dx, dy, gridSize),
     };
 }
 

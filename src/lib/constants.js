@@ -2,10 +2,13 @@ const GRID_SIZES = Object.freeze([6, 10, 14]);
 
 const NEIGHBOR_OFFSETS = Object.freeze([
     { dx: 1, dy: 0, key: 'dx1dy0' },
+    { dx: -1, dy: 0, key: 'dx-1dy0' },
     { dx: 0, dy: 1, key: 'dx0dy1' },
+    { dx: 0, dy: -1, key: 'dx0dy-1' },
     { dx: 1, dy: 1, key: 'dx1dy1' },
-    { dx: 2, dy: 0, key: 'dx2dy0' },
-    { dx: 0, dy: 2, key: 'dx0dy2' },
+    { dx: -1, dy: 1, key: 'dx-1dy1' },
+    { dx: 1, dy: -1, key: 'dx1dy-1' },
+    { dx: -1, dy: -1, key: 'dx-1dy-1' },
 ]);
 
 const TREE_DEPTHS = Object.freeze([0, 1, 2, 3]);

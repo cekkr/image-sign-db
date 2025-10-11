@@ -7,7 +7,6 @@ const {
 
 // --- CONFIGURATION ---
 const API_BASE_URL = 'http://localhost:3000';
-const DEFAULT_PROBE_SPEC = resolveDefaultProbeSpec();
 
 // --- MAIN LOGIC ---
 
@@ -22,7 +21,7 @@ async function findImageRemotely(imagePath) {
     console.log(`🔎 Starting remote search for: ${imagePath}`);
     
     // 1. Generate the initial probe vector and start the session
-    const probeSpec = { ...DEFAULT_PROBE_SPEC };
+    const probeSpec = resolveDefaultProbeSpec();
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
     if (!probeVector) {
         console.error("Could not generate initial probe vector.");
@@ -48,6 +47,12 @@ async function findImageRemotely(imagePath) {
     let result = await response.json();
     let sessionId = result.sessionId;
     console.log(`  Initial probe found ${result.candidates?.length || 0} candidates.`);
+    if (result.constellationPath?.length) {
+        const last = result.constellationPath[result.constellationPath.length - 1];
+        console.log(
+            `  ✨ Constellation accuracy after ${result.constellationPath.length} step(s): ${(last?.cumulativeAccuracy ?? 0).toFixed(6)}`
+        );
+    }
     
     // 2. Iteratively refine the search based on server requests
     let iterations = 0;
@@ -87,6 +92,12 @@ async function findImageRemotely(imagePath) {
             sessionId = result.sessionId;
         }
         console.log(`  Refined search to ${result.candidates?.length || 0} candidates.`);
+        if (result.constellationPath?.length) {
+            const last = result.constellationPath[result.constellationPath.length - 1];
+            console.log(
+                `  ✨ Constellation accuracy after ${result.constellationPath.length} step(s): ${(last?.cumulativeAccuracy ?? 0).toFixed(6)}`
+            );
+        }
     }
 
     console.log('\n--- SEARCH COMPLETE ---');
@@ -95,6 +106,12 @@ async function findImageRemotely(imagePath) {
     } else {
         console.log(`❌ No definitive match found. Final status: ${result.status}`);
         if(result.candidates) console.log('  Ambiguous candidates:', result.candidates);
+    }
+    if (result.constellationPath?.length) {
+        const last = result.constellationPath[result.constellationPath.length - 1];
+        console.log(
+            `✨ Final constellation accuracy: ${(last?.cumulativeAccuracy ?? 0).toFixed(6)} across ${result.constellationPath.length} step(s)`
+        );
     }
 }
 
