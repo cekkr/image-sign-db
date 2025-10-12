@@ -6,10 +6,11 @@ require('dotenv').config();
 const { generateSpecificVector } = require('./featureExtractor');
 const { euclideanDistance } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
-const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
+const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
 const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
 const { recordVectorUsage, saveSkipPattern } = require('./lib/storageManager');
-const { extendConstellationPath, createRandomConstellationSpec, computeAverageRadius } = require('./lib/constellation');
+const { extendConstellationPath, createRandomConstellationSpec, descriptorToSpec } = require('./lib/constellation');
+const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 
 // --- CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
@@ -63,35 +64,46 @@ async function connectToDatabase() {
     return dbConnection;
 }
 
-function normalizeProbeSpec(spec) {
-    const normalized = { ...spec };
-    const defaultGrid = GRID_SIZES[Math.floor(GRID_SIZES.length / 2)] ?? GRID_SIZES[0] ?? 10;
-    normalized.gridSize = normalized.gridSize ?? normalized.resolution_level ?? defaultGrid;
-    normalized.dx = normalized.dx ?? 1;
-    normalized.dy = normalized.dy ?? 0;
-    normalized.pos_x = normalized.pos_x ?? 0;
-    normalized.pos_y = normalized.pos_y ?? 0;
-    normalized.augmentation = normalized.augmentation ?? 'original';
-    normalized.rel_x = normalized.rel_x ?? normalized.dx / normalized.gridSize;
-    normalized.rel_y = normalized.rel_y ?? normalized.dy / normalized.gridSize;
-    normalized.size = normalized.size ?? computeAverageRadius(normalized.dx, normalized.dy, normalized.gridSize);
+function normalizeProbeSpec(spec = {}) {
+    const resolved = resolveDefaultProbeSpec(spec.descriptor ? { ...spec, random: false } : spec);
+    if (!resolved) return null;
 
-    if (!normalized.descriptor) {
-        const channel = normalized.channel ?? CHANNEL_DIMENSIONS[0];
-        normalized.descriptor = {
-            family: 'delta',
-            channel,
-            neighbor_dx: normalized.dx,
-            neighbor_dy: normalized.dy,
-        };
-    } else {
-        normalized.descriptor = {
-            ...normalized.descriptor,
-            neighbor_dx: normalized.descriptor.neighbor_dx ?? normalized.dx,
-            neighbor_dy: normalized.descriptor.neighbor_dy ?? normalized.dy,
-        };
-    }
-    normalized.descriptorKey = normalized.descriptorKey ?? createDescriptorKey(normalized.descriptor);
+    const normalized = {
+        ...resolved,
+    };
+
+    normalized.rel_x = normalized.rel_x ?? normalized.offset_x ?? 0;
+    normalized.rel_y = normalized.rel_y ?? normalized.offset_y ?? 0;
+    normalized.size = normalized.size ?? normalized.span ?? 0;
+    normalized.anchor_u = normalized.anchor_u ?? 0.5;
+    normalized.anchor_v = normalized.anchor_v ?? 0.5;
+    normalized.sampleId = normalized.sampleId ?? normalized.sample_id ?? normalized.descriptor?.sample_id ?? 0;
+    normalized.augmentation = normalized.augmentation ?? normalized.descriptor?.augmentation ?? 'original';
+    normalized.channel = normalized.channel ?? normalized.descriptor?.channel ?? CHANNEL_DIMENSIONS[0];
+    normalized.span = normalized.size ?? normalized.span ?? 0.05;
+    normalized.offset_x = normalized.offset_x ?? normalized.rel_x;
+    normalized.offset_y = normalized.offset_y ?? normalized.rel_y;
+
+    normalized.pos_x = Math.round(normalized.anchor_u * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
+    normalized.pos_y = Math.round(normalized.anchor_v * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
+    normalized.resolution_level = Math.max(
+        0,
+        Math.min(255, Math.round(normalized.size * CONSTELLATION_CONSTANTS.SPAN_SCALE)),
+    );
+
+    normalized.descriptor = {
+        family: 'delta',
+        channel: normalized.channel,
+        augmentation: normalized.augmentation,
+        sample_id: normalized.sampleId,
+        anchor_u: Number(normalized.anchor_u.toFixed(6)),
+        anchor_v: Number(normalized.anchor_v.toFixed(6)),
+        span: Number(normalized.size.toFixed(6)),
+        offset_x: Number(normalized.offset_x.toFixed(6)),
+        offset_y: Number(normalized.offset_y.toFixed(6)),
+    };
+    normalized.descriptorKey = createDescriptorKey(normalized.descriptor);
+
     return normalized;
 }
 
@@ -121,18 +133,19 @@ async function ensureValueTypeRecord(db, descriptor) {
 
 function rowToFeature(row) {
     const descriptor = parseDescriptor(row.descriptor_json);
+    const spec = descriptorToSpec(descriptor);
+    const descriptorKey = spec?.descriptorKey ?? (descriptor ? createDescriptorKey(descriptor) : null);
     return {
         ...row,
         value_type: row.value_type,
         resolution_level: row.resolution_level,
-        pos_x: row.pos_x,
-        pos_y: row.pos_y,
         rel_x: row.rel_x,
         rel_y: row.rel_y,
         value: row.value,
         size: row.size,
         descriptor,
-        descriptorKey: descriptor ? createDescriptorKey(descriptor) : null,
+        descriptorKey,
+        spec,
     };
 }
 
@@ -148,25 +161,13 @@ async function requestInitialProbe() {
         );
         if (rows.length === 0) break;
         const feature = rowToFeature(rows[0]);
-        const descriptor = feature.descriptor ?? {
-            family: 'delta',
-            channel: CHANNEL_DIMENSIONS[0],
-            neighbor_dx: Math.round(feature.rel_x * feature.resolution_level),
-            neighbor_dy: Math.round(feature.rel_y * feature.resolution_level),
-        };
-        const probeSeed = {
-            gridSize: feature.resolution_level,
-            pos_x: feature.pos_x,
-            pos_y: feature.pos_y,
-            dx: descriptor.neighbor_dx,
-            dy: descriptor.neighbor_dy,
-            descriptor,
-            descriptorKey: createDescriptorKey(descriptor),
-            rel_x: feature.rel_x,
-            rel_y: feature.rel_y,
-            size: feature.size,
-        };
-        const normalized = normalizeProbeSpec(probeSeed);
+        const baseSpec = feature.spec ?? descriptorToSpec(feature.descriptor);
+        if (!baseSpec) continue;
+        const normalized = normalizeProbeSpec({
+            ...baseSpec,
+            descriptor: feature.descriptor ?? baseSpec.descriptor,
+            descriptorKey: feature.descriptorKey ?? baseSpec.descriptorKey,
+        });
         if (getSkipCount(normalized.descriptorKey) >= SKIP_THRESHOLD) continue;
         return { probe: normalized, feature };
     }
@@ -183,13 +184,19 @@ async function findCandidateImages(db, probe) {
          JOIN value_types vt ON vt.value_type_id = fv.value_type
          WHERE fv.value_type = ?
            AND fv.resolution_level = ?
-           AND ABS(fv.rel_x - ?) < 1e-3
-           AND ABS(fv.rel_y - ?) < 1e-3`,
+           AND fv.pos_x = ?
+           AND fv.pos_y = ?
+           AND ABS(fv.rel_x - ?) <= ?
+           AND ABS(fv.rel_y - ?) <= ?`,
         [
             valueTypeId,
-            probe.gridSize,
+            probe.resolution_level,
+            probe.pos_x,
+            probe.pos_y,
             probe.rel_x,
+            CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
             probe.rel_y,
+            CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
         ]
     );
 
@@ -201,7 +208,7 @@ async function findCandidateImages(db, probe) {
             {
                 ...probe,
                 value_type: valueTypeId,
-                resolution_level: probe.gridSize,
+                resolution_level: probe.resolution_level,
                 size: probe.size,
             },
             feature
@@ -223,14 +230,16 @@ async function startSearch(probeSpec, existingSessionId = null) {
     let probeToUse = { ...normalizedProbe };
     if (getSkipCount(probeToUse.descriptorKey) >= SKIP_THRESHOLD) {
         for (const channel of CHANNEL_DIMENSIONS) {
-            const descriptor = { ...probeToUse.descriptor, channel };
-            const descriptorKey = createDescriptorKey(descriptor);
-            if (getSkipCount(descriptorKey) >= SKIP_THRESHOLD) continue;
-            probeToUse = {
+            if (channel === probeToUse.channel) continue;
+            const candidate = normalizeProbeSpec({
                 ...probeToUse,
-                descriptor,
-                descriptorKey,
-            };
+                channel,
+                descriptor: { ...probeToUse.descriptor, channel },
+                random: false,
+            });
+            if (!candidate) continue;
+            if (getSkipCount(candidate.descriptorKey) >= SKIP_THRESHOLD) continue;
+            probeToUse = candidate;
             break;
         }
     }
@@ -330,52 +339,15 @@ async function refineSearch(sessionId, probeSpec) {
 
 async function buildNextQuestion(session) {
     if (!session || session.phase !== SESSION_PHASE.ACTIVE) return null;
-    const baseProbe = session.probeSpec;
-    const db = await connectToDatabase();
-    const proposals = [];
-
-    if (baseProbe?.valueTypeId) {
-        const [rows] = await db.execute(
-            `SELECT avg_length, avg_angle, sample_size
-             FROM feature_group_stats
-             WHERE value_type = ? AND resolution_level = ?
-             ORDER BY sample_size DESC
-             LIMIT 6`,
-            [baseProbe.valueTypeId, baseProbe.gridSize]
-        );
-        for (const row of rows) {
-            const length = row.avg_length ?? 0;
-            const angle = row.avg_angle ?? 0;
-            const dx = Math.round(length * Math.cos(angle) * baseProbe.gridSize);
-            const dy = Math.round(length * Math.sin(angle) * baseProbe.gridSize);
-            if (dx === 0 && dy === 0) continue;
-            if (Math.hypot(dx, dy) > 1.5) continue;
-            proposals.push({ dx, dy });
-        }
-    }
-
-    if (proposals.length === 0) {
-        proposals.push({});
-    }
-
-    const channelOrder = [...CHANNEL_DIMENSIONS].sort(() => Math.random() - 0.5);
-    const attempts = Math.max(12, proposals.length * channelOrder.length);
-
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-        const proposal = proposals[attempt % proposals.length];
-        const channel = channelOrder[attempt % channelOrder.length];
-        const specOptions = {
-            gridSize: baseProbe.gridSize,
-            augmentation: baseProbe.augmentation,
-            channel,
-        };
-        if (Number.isFinite(proposal.dx)) specOptions.dx = proposal.dx;
-        if (Number.isFinite(proposal.dy)) specOptions.dy = proposal.dy;
-        const candidateSpec = createRandomConstellationSpec(specOptions);
+    const maxAttempts = 64;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const candidateSpec = createRandomConstellationSpec({
+            augmentation: session.probeSpec.augmentation,
+        });
         const normalized = normalizeProbeSpec(candidateSpec);
-        const descriptorKey = normalized.descriptorKey;
-        if (session.askedDescriptorKeys.has(descriptorKey)) continue;
-        if (getSkipCount(descriptorKey) >= SKIP_THRESHOLD) continue;
+        if (!normalized) continue;
+        if (session.askedDescriptorKeys.has(normalized.descriptorKey)) continue;
+        if (getSkipCount(normalized.descriptorKey) >= SKIP_THRESHOLD) continue;
         return normalized;
     }
     return null;
@@ -573,7 +545,7 @@ async function runCli(imagePath) {
     let nextQuestion = await buildNextQuestion(session);
     let iteration = 0;
 
-    while (nextQuestion && iteration < CHANNEL_DIMENSIONS.length) {
+    while (nextQuestion && iteration < 12) {
         iteration += 1;
         console.log(
             `  [Iteration ${iteration}] Requesting descriptor ${nextQuestion.descriptorKey} (channel ${nextQuestion.descriptor?.channel ?? '?'})`
@@ -581,12 +553,10 @@ async function runCli(imagePath) {
         const nextVector = await generateSpecificVector(imagePath, nextQuestion);
         const probeUpdate = {
             ...nextQuestion,
-            rel_x: nextQuestion.dx / nextQuestion.gridSize,
-            rel_y: nextQuestion.dy / nextQuestion.gridSize,
             value: nextVector.value,
             size: nextVector.size,
-            descriptor: nextQuestion.descriptor,
-            descriptorKey: nextQuestion.descriptorKey,
+            descriptor: nextVector.descriptor ?? nextQuestion.descriptor,
+            descriptorKey: nextVector.descriptorKey ?? nextQuestion.descriptorKey,
         };
 
         const refinement = await refineSearch(sessionId, probeUpdate);

@@ -1,127 +1,112 @@
 const sharp = require('sharp');
-const { GRID_SIZES, CHANNEL_DIMENSIONS } = require('./constants');
+const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { applyAugmentation } = require('./augmentations');
-const { getBlockRange, calculateStatsForRegion, getRawPixels } = require('./gridStats');
+const { calculateStatsForRegion, getRawPixels } = require('./gridStats');
 const { createDescriptorKey } = require('./descriptor');
-const { computeAverageRadius } = require('./constellation');
+const {
+    generateBaseParameters,
+    realiseSampleOnImage,
+    getSampleId,
+    SAMPLES_PER_AUGMENTATION,
+} = require('./constellation');
 
-const DEFAULT_SAMPLING_RATIO = 0.4;
-const MIN_FEATURES_PER_GRID = 64;
-const MAX_OFFSET_FRACTION = 0.45;
+const CHANNEL_NORMALISERS = Object.freeze({
+    h: 360,
+    s: 100,
+    v: 100,
+    luminance: 255,
+    stddev: 255,
+});
 
-function shuffleInPlace(list) {
-    for (let i = list.length - 1; i > 0; i -= 1) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [list[i], list[j]] = [list[j], list[i]];
-    }
+function calculateRelativeRegionStats(rawPixels, meta, centerXRel, centerYRel, spanXRel, spanYRel) {
+    const width = meta.width;
+    const height = meta.height;
+
+    const halfWidth = Math.max(1, Math.round((spanXRel * width) / 2));
+    const halfHeight = Math.max(1, Math.round((spanYRel * height) / 2));
+    const centerX = Math.round(centerXRel * width);
+    const centerY = Math.round(centerYRel * height);
+
+    const startX = Math.max(0, centerX - halfWidth);
+    const endX = Math.min(width, centerX + halfWidth);
+    const startY = Math.max(0, centerY - halfHeight);
+    const endY = Math.min(height, centerY + halfHeight);
+
+    if (endX <= startX || endY <= startY) return null;
+    return calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
 }
 
-function collectBlockStats(rawPixels, meta, gridSize) {
-    const cache = new Array(gridSize * gridSize);
-    for (let y = 0; y < gridSize; y++) {
-        for (let x = 0; x < gridSize; x++) {
-            const [startX, endX] = getBlockRange(gridSize, meta.width, x);
-            const [startY, endY] = getBlockRange(gridSize, meta.height, y);
-            cache[y * gridSize + x] = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
-        }
-    }
-    return cache;
+function computeChannelDeltas(anchorStats, targetStats) {
+    if (!anchorStats || !targetStats) return null;
+    return {
+        h: (targetStats.h - anchorStats.h) / CHANNEL_NORMALISERS.h,
+        s: (targetStats.s - anchorStats.s) / CHANNEL_NORMALISERS.s,
+        v: (targetStats.v - anchorStats.v) / CHANNEL_NORMALISERS.v,
+        luminance: (targetStats.luminance - anchorStats.luminance) / CHANNEL_NORMALISERS.luminance,
+        stddev: (targetStats.stdDev - anchorStats.stdDev) / CHANNEL_NORMALISERS.stddev,
+    };
 }
 
-function buildOffsetCandidates(gridSize) {
-    const offsets = [];
-    const maxOffset = Math.max(1, Math.floor(gridSize * MAX_OFFSET_FRACTION));
-    for (let dx = -maxOffset; dx <= maxOffset; dx += 1) {
-        for (let dy = -maxOffset; dy <= maxOffset; dy += 1) {
-            if (dx === 0 && dy === 0) continue;
-            offsets.push({ dx, dy });
-        }
-    }
-    return offsets;
+function descriptorFromSample(baseParams, realised) {
+    return {
+        family: 'delta',
+        channel: baseParams.channel,
+        augmentation: baseParams.augmentation,
+        sample_id: baseParams.sampleId,
+        anchor_u: Number(baseParams.anchorU.toFixed(6)),
+        anchor_v: Number(baseParams.anchorV.toFixed(6)),
+        span: Number(baseParams.span.toFixed(6)),
+        offset_x: Number(realised.offsetX.toFixed(6)),
+        offset_y: Number(realised.offsetY.toFixed(6)),
+    };
 }
 
-function generateRelativeGradientFeatures(rawPixels, meta) {
-    const features = [];
+function buildFeatureFromSample(rawPixels, meta, baseParams) {
+    const realised = realiseSampleOnImage(meta, baseParams);
+    const anchorStats = calculateRelativeRegionStats(
+        rawPixels,
+        meta,
+        realised.anchorX,
+        realised.anchorY,
+        realised.spanXRel,
+        realised.spanYRel,
+    );
+    const neighbourStats = calculateRelativeRegionStats(
+        rawPixels,
+        meta,
+        realised.targetX,
+        realised.targetY,
+        realised.spanXRel,
+        realised.spanYRel,
+    );
 
-    for (const gridSize of GRID_SIZES) {
-        if (meta.width < gridSize || meta.height < gridSize) continue;
+    const deltas = computeChannelDeltas(anchorStats, neighbourStats);
+    if (!deltas) return null;
 
-        const blockCache = collectBlockStats(rawPixels, meta, gridSize);
-        const offsets = buildOffsetCandidates(gridSize);
-        const candidates = [];
+    const descriptor = descriptorFromSample(baseParams, realised);
+    const descriptorKey = createDescriptorKey(descriptor);
 
-        for (let y = 0; y < gridSize; y++) {
-            for (let x = 0; x < gridSize; x++) {
-                for (const offset of offsets) {
-                    const targetX = x + offset.dx;
-                    const targetY = y + offset.dy;
-                    if (targetX < 0 || targetY < 0) continue;
-                    if (targetX >= gridSize || targetY >= gridSize) continue;
-                    candidates.push({ pos_x: x, pos_y: y, dx: offset.dx, dy: offset.dy });
-                }
-            }
-        }
+    const anchorBucketX = Math.round(descriptor.anchor_u * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
+    const anchorBucketY = Math.round(descriptor.anchor_v * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
+    const spanBucket = Math.max(
+        0,
+        Math.min(255, Math.round(descriptor.span * CONSTELLATION_CONSTANTS.SPAN_SCALE)),
+    );
 
-        if (candidates.length === 0) continue;
-
-        shuffleInPlace(candidates);
-        const targetCount = Math.min(
-            candidates.length,
-            Math.max(
-                MIN_FEATURES_PER_GRID,
-                Math.round(candidates.length * DEFAULT_SAMPLING_RATIO),
-            ),
-        );
-
-        let picked = 0;
-        for (let idx = 0; idx < candidates.length && picked < targetCount; idx += 1) {
-            const { pos_x, pos_y, dx, dy } = candidates[idx];
-            const currentBlock = blockCache[pos_y * gridSize + pos_x];
-            const neighborBlock = blockCache[(pos_y + dy) * gridSize + (pos_x + dx)];
-            if (!currentBlock || !neighborBlock) continue;
-
-            const channelValues = {
-                h: (neighborBlock.h - currentBlock.h) / 360,
-                s: (neighborBlock.s - currentBlock.s) / 100,
-                v: (neighborBlock.v - currentBlock.v) / 100,
-                luminance: (neighborBlock.luminance - currentBlock.luminance) / 255,
-                stddev: (neighborBlock.stdDev - currentBlock.stdDev) / 255,
-            };
-
-            const channelOrder = [...CHANNEL_DIMENSIONS];
-            shuffleInPlace(channelOrder);
-
-            for (const channel of channelOrder) {
-                const descriptor = {
-                    family: 'delta',
-                    channel,
-                    neighbor_dx: dx,
-                    neighbor_dy: dy,
-                };
-                const descriptorKey = createDescriptorKey(descriptor);
-                const value = channelValues[channel];
-
-                features.push({
-                    descriptor,
-                    descriptorKey,
-                    channel,
-                    resolution_level: gridSize,
-                    pos_x,
-                    pos_y,
-                    rel_x: dx / gridSize,
-                    rel_y: dy / gridSize,
-                    value,
-                    size: computeAverageRadius(dx, dy, gridSize),
-                });
-
-                picked += 1;
-                if (picked >= targetCount) break;
-                if (Math.random() < 0.55) break;
-            }
-        }
-    }
-
-    return features;
+    return {
+        descriptor,
+        descriptorKey,
+        channel: descriptor.channel,
+        sampleId: baseParams.sampleId,
+        augmentation: descriptor.augmentation,
+        resolution_level: spanBucket,
+        pos_x: anchorBucketX,
+        pos_y: anchorBucketY,
+        rel_x: descriptor.offset_x,
+        rel_y: descriptor.offset_y,
+        value: deltas[descriptor.channel],
+        size: descriptor.span,
+    };
 }
 
 async function generateAllFeaturesForAugmentation(originalImage, imagePath, augmentationName) {
@@ -129,7 +114,16 @@ async function generateAllFeaturesForAugmentation(originalImage, imagePath, augm
     const augmentedImage = applyAugmentation(originalImage, augmentationName, baseMeta, imagePath);
     const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
 
-    const gradientFeatures = generateRelativeGradientFeatures(rawPixels, meta);
+    const gradientFeatures = [];
+
+    for (let ordinal = 0; ordinal < SAMPLES_PER_AUGMENTATION; ordinal += 1) {
+        const sampleId = getSampleId(augmentationName, ordinal);
+        const baseParams = generateBaseParameters(sampleId);
+        const feature = buildFeatureFromSample(rawPixels, meta, baseParams);
+        if (feature) {
+            gradientFeatures.push(feature);
+        }
+    }
 
     return {
         gradientFeatures,
@@ -139,56 +133,72 @@ async function generateAllFeaturesForAugmentation(originalImage, imagePath, augm
 
 async function generateSpecificVector(imagePath, spec) {
     const {
-        gridSize,
-        pos_x,
-        pos_y,
-        dx,
-        dy,
         augmentation = 'original',
         descriptor,
-        descriptorKey,
+        channel: specChannel,
+        anchor_u,
+        anchor_v,
+        span,
+        offset_x,
+        offset_y,
+        sampleId,
     } = spec;
 
-    if (pos_x >= gridSize || pos_y >= gridSize) return null;
+    const channel = specChannel ?? descriptor?.channel;
+    if (!channel) return null;
 
     const originalImage = sharp(imagePath);
     const baseMeta = await originalImage.metadata();
     const augmentedImage = applyAugmentation(originalImage, augmentation, baseMeta, imagePath);
     const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
 
-    const [startX, endX] = getBlockRange(gridSize, meta.width, pos_x);
-    const [startY, endY] = getBlockRange(gridSize, meta.height, pos_y);
-    const currentStats = calculateStatsForRegion(rawPixels, meta, startX, startY, endX, endY);
-
-    const targetX = pos_x + dx;
-    const targetY = pos_y + dy;
-    if (targetX < 0 || targetY < 0) return null;
-    if (targetX >= gridSize || targetY >= gridSize) return null;
-    const [targetStartX, targetEndX] = getBlockRange(gridSize, meta.width, targetX);
-    const [targetStartY, targetEndY] = getBlockRange(gridSize, meta.height, targetY);
-    const targetStats = calculateStatsForRegion(rawPixels, meta, targetStartX, targetStartY, targetEndX, targetEndY);
-
-    const channelValues = {
-        h: (targetStats.h - currentStats.h) / 360,
-        s: (targetStats.s - currentStats.s) / 100,
-        v: (targetStats.v - currentStats.v) / 100,
-        luminance: (targetStats.luminance - currentStats.luminance) / 255,
-        stddev: (targetStats.stdDev - currentStats.stdDev) / 255,
+    const baseParams = {
+        ...generateBaseParameters(Number.isFinite(sampleId) ? sampleId : 0),
+        augmentation,
+        channel,
+        anchorU: anchor_u ?? descriptor?.anchor_u ?? 0.5,
+        anchorV: anchor_v ?? descriptor?.anchor_v ?? 0.5,
+        span: span ?? descriptor?.span ?? CONSTELLATION_CONSTANTS.MIN_RELATIVE_SPAN,
+        offsetX: offset_x ?? descriptor?.offset_x ?? 0,
+        offsetY: offset_y ?? descriptor?.offset_y ?? 0,
+        sampleId: sampleId ?? descriptor?.sample_id ?? 0,
     };
 
+    const realised = realiseSampleOnImage(meta, baseParams);
+    const anchorStats = calculateRelativeRegionStats(
+        rawPixels,
+        meta,
+        realised.anchorX,
+        realised.anchorY,
+        realised.spanXRel,
+        realised.spanYRel,
+    );
+    const neighbourStats = calculateRelativeRegionStats(
+        rawPixels,
+        meta,
+        realised.targetX,
+        realised.targetY,
+        realised.spanXRel,
+        realised.spanYRel,
+    );
+    const deltas = computeChannelDeltas(anchorStats, neighbourStats);
+    if (!deltas) return null;
+
+    const normalizedDescriptor = descriptorFromSample(baseParams, realised);
+    const descriptorKey = createDescriptorKey(normalizedDescriptor);
+
     return {
-        descriptor,
-        descriptorKey: descriptorKey ?? (descriptor ? createDescriptorKey(descriptor) : null),
-        channelValues,
-        value: descriptor ? channelValues[descriptor.channel] : null,
-        rel_x: dx / gridSize,
-        rel_y: dy / gridSize,
-        size: computeAverageRadius(dx, dy, gridSize),
+        descriptor: normalizedDescriptor,
+        descriptorKey,
+        channelValues: deltas,
+        value: deltas[channel],
+        rel_x: normalizedDescriptor.offset_x,
+        rel_y: normalizedDescriptor.offset_y,
+        size: normalizedDescriptor.span,
     };
 }
 
 module.exports = {
-    generateRelativeGradientFeatures,
     generateAllFeaturesForAugmentation,
     generateSpecificVector,
 };

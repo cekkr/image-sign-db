@@ -33,7 +33,9 @@ async function findImageRemotely(imagePath) {
     }
     let sessionId = result.sessionId;
     const probeSpec = result.probeSpec;
-    console.log(`  Server selected descriptor ${probeSpec.descriptorKey} (grid ${probeSpec.gridSize})`);
+    console.log(
+        `  Server selected descriptor ${probeSpec.descriptorKey} (channel: ${probeSpec.descriptor?.channel ?? '?'}, span=${(probeSpec.span ?? probeSpec.size ?? 0).toFixed(4)}, offset=[${(probeSpec.offset_x ?? probeSpec.rel_x ?? 0).toFixed(4)}, ${(probeSpec.offset_y ?? probeSpec.rel_y ?? 0).toFixed(4)}])`
+    );
 
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
     if (!probeVector) {
@@ -45,6 +47,8 @@ async function findImageRemotely(imagePath) {
         ...probeSpec,
         value: probeVector.value,
         size: probeVector.size,
+        descriptor: probeVector.descriptor ?? probeSpec.descriptor,
+        descriptorKey: probeVector.descriptorKey ?? probeSpec.descriptorKey,
     };
 
     response = await fetch(`${API_BASE_URL}/search/start`, {
@@ -70,7 +74,9 @@ async function findImageRemotely(imagePath) {
         const nextQuestion = result.nextQuestion;
         if (!nextQuestion) break;
 
-        console.log(`  [Iteration ${iterations}] Server requests descriptor ${nextQuestion.descriptorKey} (channel: ${nextQuestion.descriptor?.channel ?? '?'}) at grid ${nextQuestion.gridSize} [${nextQuestion.pos_x}, ${nextQuestion.pos_y}] Δ(${nextQuestion.dx},${nextQuestion.dy})`);
+        console.log(
+            `  [Iteration ${iterations}] Server requests descriptor ${nextQuestion.descriptorKey} (channel: ${nextQuestion.descriptor?.channel ?? '?'}, span=${(nextQuestion.span ?? nextQuestion.size ?? 0).toFixed(4)}, offset=[${(nextQuestion.offset_x ?? nextQuestion.rel_x ?? 0).toFixed(4)}, ${(nextQuestion.offset_y ?? nextQuestion.rel_y ?? 0).toFixed(4)}])`
+        );
 
         const nextVector = await generateSpecificVector(imagePath, nextQuestion);
         if (!nextVector) {
@@ -80,12 +86,10 @@ async function findImageRemotely(imagePath) {
 
         const probeUpdate = {
             ...nextQuestion,
-            rel_x: nextQuestion.dx / nextQuestion.gridSize,
-            rel_y: nextQuestion.dy / nextQuestion.gridSize,
             value: nextVector.value,
             size: nextVector.size,
-            descriptor: nextQuestion.descriptor,
-            descriptorKey: nextQuestion.descriptorKey,
+            descriptor: nextVector.descriptor ?? nextQuestion.descriptor,
+            descriptorKey: nextVector.descriptorKey ?? nextQuestion.descriptorKey,
         };
 
         response = await fetch(`${API_BASE_URL}/search/refine`, {

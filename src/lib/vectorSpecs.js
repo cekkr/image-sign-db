@@ -1,60 +1,57 @@
-const { CHANNEL_DIMENSIONS } = require('./constants');
 const { createDescriptorKey } = require('./descriptor');
-const { createRandomConstellationSpec, computeAverageRadius } = require('./constellation');
+const { createRandomConstellationSpec, descriptorToSpec } = require('./constellation');
 
 function resolveDefaultProbeSpec(override = {}) {
     if (override.random === false) {
-        const channel = override.channel ?? CHANNEL_DIMENSIONS[0];
-        const dx = override.dx ?? 1;
-        const dy = override.dy ?? 0;
-        const gridSize = override.gridSize ?? 10;
-        const descriptor = override.descriptor ?? {
+        if (override.descriptor) {
+            const resolved = descriptorToSpec(override.descriptor);
+            if (!resolved) return null;
+            return {
+                ...resolved,
+                descriptorKey: resolved.descriptorKey,
+                augmentation: override.augmentation ?? resolved.augmentation,
+                channel: override.channel ?? resolved.channel,
+                rel_x: override.rel_x ?? resolved.offset_x ?? 0,
+                rel_y: override.rel_y ?? resolved.offset_y ?? 0,
+                size: override.size ?? resolved.span ?? 0,
+            };
+        }
+
+        const descriptor = {
             family: 'delta',
-            channel,
-            neighbor_dx: dx,
-            neighbor_dy: dy,
+            channel: override.channel ?? 'h',
+            augmentation: override.augmentation ?? 'original',
+            sample_id: override.sampleId ?? 0,
+            anchor_u: override.anchor_u ?? 0.5,
+            anchor_v: override.anchor_v ?? 0.5,
+            span: override.span ?? 0.05,
+            offset_x: override.offset_x ?? 0,
+            offset_y: override.offset_y ?? 0,
         };
         const descriptorKey = createDescriptorKey(descriptor);
         return {
-            gridSize,
-            pos_x: override.pos_x ?? 0,
-            pos_y: override.pos_y ?? 0,
-            dx,
-            dy,
-            augmentation: override.augmentation ?? 'original',
             descriptor,
             descriptorKey,
-            rel_x: override.rel_x ?? dx / gridSize,
-            rel_y: override.rel_y ?? dy / gridSize,
-            size: override.size ?? 1 / gridSize,
+            sampleId: descriptor.sample_id,
+            augmentation: descriptor.augmentation,
+            channel: descriptor.channel,
+            anchor_u: descriptor.anchor_u,
+            anchor_v: descriptor.anchor_v,
+            span: descriptor.span,
+            offset_x: descriptor.offset_x,
+            offset_y: descriptor.offset_y,
+            rel_x: descriptor.offset_x,
+            rel_y: descriptor.offset_y,
+            size: descriptor.span,
         };
     }
 
     const base = createRandomConstellationSpec(override);
-    const gridSize = override.gridSize ?? base.gridSize;
-    const dx = override.dx ?? base.dx;
-    const dy = override.dy ?? base.dy;
-
-    const descriptor = override.descriptor ?? {
-        family: 'delta',
-        channel: override.channel ?? base.descriptor?.channel ?? CHANNEL_DIMENSIONS[0],
-        neighbor_dx: dx,
-        neighbor_dy: dy,
-    };
-    const descriptorKey = createDescriptorKey(descriptor);
-
     return {
-        gridSize,
-        pos_x: override.pos_x ?? base.pos_x,
-        pos_y: override.pos_y ?? base.pos_y,
-        dx,
-        dy,
-        augmentation: override.augmentation ?? 'original',
-        descriptor,
-        descriptorKey,
-        rel_x: override.rel_x ?? dx / gridSize,
-        rel_y: override.rel_y ?? dy / gridSize,
-        size: override.size ?? computeAverageRadius(dx, dy, gridSize),
+        ...base,
+        rel_x: base.offset_x,
+        rel_y: base.offset_y,
+        size: base.span,
     };
 }
 

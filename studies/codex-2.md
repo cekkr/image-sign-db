@@ -14,3 +14,18 @@ Next Steps
 
 Re-ingest or re-train a small dataset (node src/train.js …) to populate the DB with the new stochastic vectors and review the per-image probe logs.
 Smoke-test the updated handshake (node src/index.js server + node src/clientAPI.js …) to confirm existing tooling integrates with the request/measure flow.
+
+# Request
+
+The grid concept is a huge error in the concept: if you use the "constellation" concept, where every vector has a definition relative size (0-1.0-1.5...) and a constelattion (from grouping to groups group) has relative values, giving fixed grids values etc it's a BIG conceptual error, more over seen the concept of "randomly selected vectors generated". You have to fix EVERYTHING that point to an absolute definition of dimensions e reference point
+
+
+Replaced the fixed grid catalog with a deterministic constellation library that hashes every augmentation/sample into a relative span/offset descriptor (src/lib/constants.js:7-14, src/lib/constellation.js:1-204). These descriptors now carry anchor_u/anchor_v, span, offset_x/y, and sample_id, giving every vector a stable, resolution-free identity.
+
+Rebuilt feature extraction around those descriptors: each augmentation walks the shared constellation, realises anchors on the current image, and writes bucketed anchor/span/meta values into MySQL (src/lib/vectorGenerators.js:1-204, src/featureExtractor.js:11-160). The extractor logs per-augmentation counts so you can monitor sampling balance.
+
+Refactored search, training, and correlation flows to consume the new relative probes. Probe normalisation now derives everything from the descriptor hash, candidate lookups join on span/anchor buckets with offset tolerances, and next questions fall back to fresh constellation samples (src/index.js:67-353, src/train.js:43-246, src/lib/knowledge.js:1-268). CLI/client logging and payloads were adjusted to print span/offset rather than grid deltas (src/clientAPI.js:20-124).
+
+Documentation and seed data now describe the constellation logic and hashed span buckets so new users understand the random-but-deterministic sampling scheme (README.md:13-32, src/testCorrelations.js:7-39).
+
+Tests were limited to requiring the updated modules (node -e "require(...)) to catch syntax issues. Please re-ingest or retrain your dataset so the database is populated with the new descriptors (existing rows won’t match), and rerun any custom correlation seeds if you depend on them.

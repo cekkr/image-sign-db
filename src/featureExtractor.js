@@ -6,11 +6,9 @@ const mysql = require('mysql2/promise');
 require('dotenv').config();
 
 // --- INTERNAL MODULES ---
-const { GRID_SIZES } = require('./lib/constants');
 const { AUGMENTATION_ORDER } = require('./lib/augmentations');
 const { generateAllFeaturesForAugmentation, generateSpecificVector } = require('./lib/vectorGenerators');
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
-const { createRandomConstellationSpec } = require('./lib/constellation');
 const { createDescriptorKey, serializeDescriptor } = require('./lib/descriptor');
 
 // --- FEATURE EXTRACTION HELPERS ---
@@ -157,8 +155,6 @@ module.exports = {
     extractAndStoreFeatures,
     generateSpecificVector,
     resolveDefaultProbeSpec,
-    createRandomConstellationSpec,
-    GRID_SIZES,
     AUGMENTATION_ORDER,
 };
 

@@ -1,26 +1,22 @@
-const GRID_SIZES = Object.freeze([6, 10, 14]);
-
-const NEIGHBOR_OFFSETS = Object.freeze([
-    { dx: 1, dy: 0, key: 'dx1dy0' },
-    { dx: -1, dy: 0, key: 'dx-1dy0' },
-    { dx: 0, dy: 1, key: 'dx0dy1' },
-    { dx: 0, dy: -1, key: 'dx0dy-1' },
-    { dx: 1, dy: 1, key: 'dx1dy1' },
-    { dx: -1, dy: 1, key: 'dx-1dy1' },
-    { dx: 1, dy: -1, key: 'dx1dy-1' },
-    { dx: -1, dy: -1, key: 'dx-1dy-1' },
-]);
-
 const TREE_DEPTHS = Object.freeze([0, 1, 2, 3]);
 
 const STOCHASTIC_AUGMENTATIONS = Object.freeze(['random_combo_0', 'random_combo_1', 'random_combo_2']);
 
 const CHANNEL_DIMENSIONS = Object.freeze(['h', 's', 'v', 'luminance', 'stddev']);
 
+const CONSTELLATION_CONSTANTS = Object.freeze({
+    SAMPLES_PER_AUGMENTATION: 10000,
+    MIN_RELATIVE_SPAN: 0.02,
+    MAX_RELATIVE_SPAN: 0.45,
+    MAX_OFFSET_MAGNITUDE: 1.5,
+    ANCHOR_SCALE: 10000,
+    SPAN_SCALE: 255,
+    OFFSET_TOLERANCE: 1e-3,
+});
+
 module.exports = {
-    GRID_SIZES,
-    NEIGHBOR_OFFSETS,
     TREE_DEPTHS,
     STOCHASTIC_AUGMENTATIONS,
     CHANNEL_DIMENSIONS,
+    CONSTELLATION_CONSTANTS,
 };

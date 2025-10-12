@@ -18,16 +18,16 @@ Instead of treating an image as a flat, 2D grid of pixels, we model it as a 4D d
     
 *   **Dimension 3 (Channels):** The color space, primarily using **HSV (Hue, Saturation, Value)**, which is highly robust against lighting, filter, and contrast distortions.
     
-*   **Dimension 4 (Scale / Span):** A bundle of relative grids (6×6, 10×10, 14×14, …) and neighbor offsets that describe _how far_ a pattern moves as a percentage of the image instead of locking onto a fixed downsampled resolution.
+*   **Dimension 4 (Span / Offset):** A deterministic constellation library of relative spans and offset multipliers that describe _how far_ a pattern moves as a percentage of the image’s minimum side. Every vector knows both its footprint (`span`) and how far to travel from its anchor (`offset_x`, `offset_y`).
     
 
-The system doesn't store static color values. Instead, it populates the database with thousands of tiny **"relative vector changes"**—for each grid density it records the HSV/luminance delta between a block and several neighbours, together with the normalized offset that separates them. Because those offsets live in `[0,1]` space they remain comparable even if the source image is cropped, upscaled, mirrored, or re-filtered. The collection of these relative gradients plus the hierarchical quadtree descriptors forms the image's unique signature.
+The system doesn't store static color values. Instead, it samples a deterministic **constellation** of anchor pairs: for each span it records the HSV/luminance delta between an anchor patch and a displaced neighbour, together with the anchor's relative coordinates and offset multipliers. Because every value lives in `[0,1]` space the same descriptor applies regardless of crop, scale, mirroring, or filtering. The collection of these relative gradients plus the hierarchical quadtree descriptors forms the image's unique signature.
 
 In the latest revision the extractor also:
 
 *   Runs a configurable **augmentation sweep** (horizontal/vertical mirroring, Gaussian blur, and three deterministic "random combo" crops/rotations/color jitters derived from the filename) so the database learns how an image behaves under common edits without ever persisting the transformed pixels.
 *   Builds a **deterministic quadtree** on top of every image. Each node contributes both its HSV/luminance signature (`hsv_tree_mean`) and how that node diverges from its parent (`hsv_tree_delta`). This gives the search engine a true coarse‑to‑fine "tree dividing" map that can express global context and local anomalies simultaneously.
-*   Persists every measurement as a relative row (`value_type` id, resolution, grid index, displacement, value, size). Vector semantics live in hashed descriptor blobs (`value_types.descriptor_hash`/`descriptor_json`), keeping the database agnostic while the JavaScript layer can evolve descriptors freely.
+*   Persists every measurement as a relative row (`value_type` id, span bucket, anchor bucket, offset, value, size). Vector semantics live in hashed descriptor blobs (`value_types.descriptor_hash`/`descriptor_json`), keeping the database agnostic while the JavaScript layer can evolve descriptors freely.
 *   Draws **stochastic constellation samples** instead of exhaustively harvesting every neighbour. For each augmentation the extractor picks a pseudo-random subset of anchor cells, offsets, and channels (bounded by relative distance constraints). Every ingest therefore explores a different constellation while descriptors remain comparable through their hashed definitions.
 
 ### 2\. Hierarchical Knowledge Graph via MySQL

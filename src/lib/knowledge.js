@@ -1,6 +1,7 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
+const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { parseDescriptor } = require('./descriptor');
 const { recordVectorUsage } = require('./storageManager');
 
@@ -53,12 +54,14 @@ async function updateNodeStats(dbConnection, nodeId, outcome, amount = 1) {
 }
 
 function deriveVectorGeometry(baseFeature, relatedFeature) {
-    const baseScale = baseFeature.resolution_level || 1;
-    const relatedScale = relatedFeature.resolution_level || 1;
-    const baseX = (baseFeature.pos_x + 0.5) / baseScale;
-    const baseY = (baseFeature.pos_y + 0.5) / baseScale;
-    const relatedX = (relatedFeature.pos_x + 0.5) / relatedScale;
-    const relatedY = (relatedFeature.pos_y + 0.5) / relatedScale;
+    const baseDescriptor = baseFeature.descriptor ?? parseDescriptor(baseFeature.descriptor_json) ?? {};
+    const relatedDescriptor = relatedFeature.descriptor ?? parseDescriptor(relatedFeature.descriptor_json) ?? {};
+
+    const baseX = Number(baseDescriptor.anchor_u ?? (baseFeature.pos_x / CONSTELLATION_CONSTANTS.ANCHOR_SCALE) ?? 0);
+    const baseY = Number(baseDescriptor.anchor_v ?? (baseFeature.pos_y / CONSTELLATION_CONSTANTS.ANCHOR_SCALE) ?? 0);
+    const relatedX = Number(relatedDescriptor.anchor_u ?? (relatedFeature.pos_x / CONSTELLATION_CONSTANTS.ANCHOR_SCALE) ?? 0);
+    const relatedY = Number(relatedDescriptor.anchor_v ?? (relatedFeature.pos_y / CONSTELLATION_CONSTANTS.ANCHOR_SCALE) ?? 0);
+
     const dx = relatedX - baseX;
     const dy = relatedY - baseY;
     const length = Math.sqrt(dx * dx + dy * dy);
@@ -174,14 +177,20 @@ async function discoverCorrelations({
                  JOIN value_types vt ON vt.value_type_id = fv.value_type
                  WHERE fv.value_type = ?
                    AND fv.resolution_level = ?
-                   AND ABS(fv.rel_x - ?) < 1e-3
-                   AND ABS(fv.rel_y - ?) < 1e-3
+                   AND fv.pos_x = ?
+                   AND fv.pos_y = ?
+                   AND ABS(fv.rel_x - ?) <= ?
+                   AND ABS(fv.rel_y - ?) <= ?
                    AND fv.image_id != ?`,
                 [
                     startFeature.value_type,
                     startFeature.resolution_level,
+                    startFeature.pos_x,
+                    startFeature.pos_y,
                     startFeature.rel_x,
+                    CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
                     startFeature.rel_y,
+                    CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
                     targetImageId,
                 ]
             );
@@ -240,8 +249,8 @@ async function discoverCorrelations({
                        AND fv.resolution_level = ?
                        AND fv.pos_x = ?
                        AND fv.pos_y = ?
-                       AND ABS(fv.rel_x - ?) < 1e-6
-                       AND ABS(fv.rel_y - ?) < 1e-6
+                       AND ABS(fv.rel_x - ?) <= ?
+                       AND ABS(fv.rel_y - ?) <= ?
                        AND fv.image_id IN ${placeholders}`
 
                 const [candidateRows] = await dbConnection.execute(
@@ -252,7 +261,9 @@ async function discoverCorrelations({
                         candidate.pos_x,
                         candidate.pos_y,
                         candidate.rel_x,
+                        CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
                         candidate.rel_y,
+                        CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
                         //_candidateImageIds,
                     ]
                 );
