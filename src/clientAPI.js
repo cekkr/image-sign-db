@@ -2,7 +2,6 @@
 const fs = require('fs/promises');
 const {
     generateSpecificVector,
-    resolveDefaultProbeSpec,
 } = require('./featureExtractor.js');
 
 // --- CONFIGURATION ---
@@ -19,33 +18,43 @@ async function findImageRemotely(imagePath) {
     }
 
     console.log(`🔎 Starting remote search for: ${imagePath}`);
+    // 1. Request the initial probe from the server
+    let response = await fetch(`${API_BASE_URL}/search/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ requestProbe: true })
+    });
     
-    // 1. Generate the initial probe vector and start the session
-    const probeSpec = resolveDefaultProbeSpec();
+    let result = await response.json();
+    if (result.status !== 'REQUEST_PROBE' || !result.probeSpec) {
+        console.error('❌ Server did not return an initial probe.');
+        console.error(result);
+        return;
+    }
+    let sessionId = result.sessionId;
+    const probeSpec = result.probeSpec;
+    console.log(`  Server selected descriptor ${probeSpec.descriptorKey} (grid ${probeSpec.gridSize})`);
+
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
     if (!probeVector) {
-        console.error("Could not generate initial probe vector.");
+        console.error("Could not generate initial probe vector from server request.");
         return;
     }
 
     const probe = {
         ...probeSpec,
-        rel_x: probeSpec.dx / probeSpec.gridSize,
-        rel_y: probeSpec.dy / probeSpec.gridSize,
         value: probeVector.value,
         size: probeVector.size,
-        descriptor: probeSpec.descriptor,
-        descriptorKey: probeSpec.descriptorKey,
     };
 
-    let response = await fetch(`${API_BASE_URL}/search/start`, {
+    response = await fetch(`${API_BASE_URL}/search/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(probe)
+        body: JSON.stringify({ sessionId, probe })
     });
     
-    let result = await response.json();
-    let sessionId = result.sessionId;
+    result = await response.json();
+    sessionId = result.sessionId ?? sessionId;
     console.log(`  Initial probe found ${result.candidates?.length || 0} candidates.`);
     if (result.constellationPath?.length) {
         const last = result.constellationPath[result.constellationPath.length - 1];

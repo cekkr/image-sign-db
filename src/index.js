@@ -3,7 +3,7 @@ const mysql = require('mysql2/promise');
 const express = require('express');
 const crypto = require('crypto');
 require('dotenv').config();
-const { generateSpecificVector, resolveDefaultProbeSpec } = require('./featureExtractor');
+const { generateSpecificVector } = require('./featureExtractor');
 const { euclideanDistance } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
 const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
@@ -20,7 +20,12 @@ const SKIP_THRESHOLD = 3;
 let dbConnection;
 const descriptorCache = new Map(); // descriptorKey -> { id, descriptor }
 const skipCache = new Map(); // descriptorKey -> skip count
-const searchSessions = new Map(); // sessionId -> { candidateIds, askedDescriptorKeys, probeSpec }
+const searchSessions = new Map(); // sessionId -> { phase, candidateIds, askedDescriptorKeys, probeSpec, constellationPath }
+
+const SESSION_PHASE = Object.freeze({
+    AWAITING_INITIAL_PROBE: 'AWAITING_INITIAL_PROBE',
+    ACTIVE: 'ACTIVE',
+});
 
 function bumpSkipCache(descriptorKey, amount = 1) {
     const next = (skipCache.get(descriptorKey) || 0) + amount;
@@ -131,6 +136,43 @@ function rowToFeature(row) {
     };
 }
 
+async function requestInitialProbe() {
+    const db = await connectToDatabase();
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const [rows] = await db.execute(
+            `SELECT fv.vector_id, fv.image_id, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, fv.rel_x, fv.rel_y, fv.value, fv.size, vt.descriptor_json
+             FROM feature_vectors fv
+             JOIN value_types vt ON vt.value_type_id = fv.value_type
+             ORDER BY RAND()
+             LIMIT 1`
+        );
+        if (rows.length === 0) break;
+        const feature = rowToFeature(rows[0]);
+        const descriptor = feature.descriptor ?? {
+            family: 'delta',
+            channel: CHANNEL_DIMENSIONS[0],
+            neighbor_dx: Math.round(feature.rel_x * feature.resolution_level),
+            neighbor_dy: Math.round(feature.rel_y * feature.resolution_level),
+        };
+        const probeSeed = {
+            gridSize: feature.resolution_level,
+            pos_x: feature.pos_x,
+            pos_y: feature.pos_y,
+            dx: descriptor.neighbor_dx,
+            dy: descriptor.neighbor_dy,
+            descriptor,
+            descriptorKey: createDescriptorKey(descriptor),
+            rel_x: feature.rel_x,
+            rel_y: feature.rel_y,
+            size: feature.size,
+        };
+        const normalized = normalizeProbeSpec(probeSeed);
+        if (getSkipCount(normalized.descriptorKey) >= SKIP_THRESHOLD) continue;
+        return { probe: normalized, feature };
+    }
+    return null;
+}
+
 async function findCandidateImages(db, probe) {
     const valueTypeRecord = await ensureValueTypeRecord(db, probe.descriptor);
     const valueTypeId = valueTypeRecord.id;
@@ -141,15 +183,11 @@ async function findCandidateImages(db, probe) {
          JOIN value_types vt ON vt.value_type_id = fv.value_type
          WHERE fv.value_type = ?
            AND fv.resolution_level = ?
-           AND fv.pos_x = ?
-           AND fv.pos_y = ?
-           AND ABS(fv.rel_x - ?) < 1e-6
-           AND ABS(fv.rel_y - ?) < 1e-6`,
+           AND ABS(fv.rel_x - ?) < 1e-3
+           AND ABS(fv.rel_y - ?) < 1e-3`,
         [
             valueTypeId,
             probe.gridSize,
-            probe.pos_x,
-            probe.pos_y,
             probe.rel_x,
             probe.rel_y,
         ]
@@ -179,7 +217,7 @@ async function findCandidateImages(db, probe) {
     return { candidates: [...candidates], valueTypeId, descriptorKey: valueTypeRecord.descriptorKey };
 }
 
-async function startSearch(probeSpec) {
+async function startSearch(probeSpec, existingSessionId = null) {
     const normalizedProbe = normalizeProbeSpec(probeSpec);
     const db = await connectToDatabase();
     let probeToUse = { ...normalizedProbe };
@@ -208,9 +246,11 @@ async function startSearch(probeSpec) {
     if (candidates.length === 0) {
         await saveSkipPattern(db, probeToUse.descriptor);
         bumpSkipCache(probeToUse.descriptorKey);
+        if (existingSessionId) searchSessions.delete(existingSessionId);
         return { status: 'NO_MATCH', constellationPath: initialPath };
     }
     if (candidates.length === 1) {
+        if (existingSessionId) searchSessions.delete(existingSessionId);
         return {
             status: 'MATCH_FOUND',
             imageId: candidates[0],
@@ -218,11 +258,13 @@ async function startSearch(probeSpec) {
         };
     }
 
-    const sessionId = crypto.randomBytes(16).toString('hex');
+    const sessionId = existingSessionId ?? crypto.randomBytes(16).toString('hex');
+    const askedKeys = new Set([descriptorKey]);
     searchSessions.set(sessionId, {
+        phase: SESSION_PHASE.ACTIVE,
         candidateIds: candidates,
         probeSpec: { ...probeToUse, valueTypeId, descriptorKey },
-        askedDescriptorKeys: new Set([descriptorKey]),
+        askedDescriptorKeys: askedKeys,
         constellationPath: initialPath,
     });
     return { status: 'CANDIDATES_FOUND', sessionId, candidates, constellationPath: initialPath };
@@ -230,7 +272,7 @@ async function startSearch(probeSpec) {
 
 async function refineSearch(sessionId, probeSpec) {
     const session = searchSessions.get(sessionId);
-    if (!session) {
+    if (!session || session.phase !== SESSION_PHASE.ACTIVE) {
         return { error: 'Session not found or expired.' };
     }
 
@@ -287,7 +329,7 @@ async function refineSearch(sessionId, probeSpec) {
 }
 
 async function buildNextQuestion(session) {
-    if (!session) return null;
+    if (!session || session.phase !== SESSION_PHASE.ACTIVE) return null;
     const baseProbe = session.probeSpec;
     const db = await connectToDatabase();
     const proposals = [];
@@ -347,11 +389,46 @@ function runServer() {
 
     app.post('/search/start', async (req, res) => {
         try {
-            const probeSpec = normalizeProbeSpec(req.body);
-            const result = await startSearch(probeSpec);
+            const { requestProbe, sessionId, probe } = req.body || {};
+
+            if (requestProbe) {
+                const initial = await requestInitialProbe();
+                if (!initial) {
+                    return res.json({ status: 'NO_PROBE_AVAILABLE' });
+                }
+                const newSessionId = crypto.randomBytes(16).toString('hex');
+                searchSessions.set(newSessionId, {
+                    phase: SESSION_PHASE.AWAITING_INITIAL_PROBE,
+                    pendingProbe: initial.probe,
+                    askedDescriptorKeys: new Set([initial.probe.descriptorKey]),
+                    constellationPath: [],
+                    candidateIds: [],
+                    probeSpec: initial.probe,
+                });
+                return res.json({
+                    status: 'REQUEST_PROBE',
+                    sessionId: newSessionId,
+                    probeSpec: initial.probe,
+                });
+            }
+
+            if (!probe || typeof probe.value !== 'number') {
+                return res.status(400).json({ error: 'Probe payload missing.' });
+            }
+
+            const normalizedProbe = normalizeProbeSpec(probe);
+            const pendingSession = sessionId ? searchSessions.get(sessionId) : null;
+            if (pendingSession && pendingSession.phase === SESSION_PHASE.AWAITING_INITIAL_PROBE) {
+                if (pendingSession.pendingProbe?.descriptorKey !== normalizedProbe.descriptorKey) {
+                    return res.status(400).json({ error: 'Probe descriptor mismatch for session.' });
+                }
+                searchSessions.delete(sessionId);
+            }
+
+            const result = await startSearch(normalizedProbe, sessionId);
             if (result.status === 'CANDIDATES_FOUND') {
-                const session = searchSessions.get(result.sessionId);
-                const nextQuestion = await buildNextQuestion(session);
+                const activeSession = searchSessions.get(result.sessionId);
+                const nextQuestion = await buildNextQuestion(activeSession);
                 return res.json({ ...result, nextQuestion });
             }
             return res.json(result);
@@ -452,7 +529,12 @@ function runServer() {
 // --- CLI MODE ---
 
 async function runCli(imagePath) {
-    const probeSpec = normalizeProbeSpec(resolveDefaultProbeSpec());
+    const initial = await requestInitialProbe();
+    if (!initial) {
+        console.error('Unable to select a probe descriptor from the database.');
+        return;
+    }
+    const probeSpec = initial.probe;
     const vector = await generateSpecificVector(imagePath, probeSpec);
     if (!vector) {
         console.error('Unable to generate probe vector.');
@@ -461,8 +543,6 @@ async function runCli(imagePath) {
 
     const probe = {
         ...probeSpec,
-        rel_x: probeSpec.dx / probeSpec.gridSize,
-        rel_y: probeSpec.dy / probeSpec.gridSize,
         value: vector.value,
         size: vector.size,
         descriptor: probeSpec.descriptor,

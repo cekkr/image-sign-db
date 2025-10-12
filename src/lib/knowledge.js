@@ -174,16 +174,12 @@ async function discoverCorrelations({
                  JOIN value_types vt ON vt.value_type_id = fv.value_type
                  WHERE fv.value_type = ?
                    AND fv.resolution_level = ?
-                   AND fv.pos_x = ?
-                   AND fv.pos_y = ?
-                   AND ABS(fv.rel_x - ?) < 1e-6
-                   AND ABS(fv.rel_y - ?) < 1e-6
+                   AND ABS(fv.rel_x - ?) < 1e-3
+                   AND ABS(fv.rel_y - ?) < 1e-3
                    AND fv.image_id != ?`,
                 [
                     startFeature.value_type,
                     startFeature.resolution_level,
-                    startFeature.pos_x,
-                    startFeature.pos_y,
                     startFeature.rel_x,
                     startFeature.rel_y,
                     targetImageId,

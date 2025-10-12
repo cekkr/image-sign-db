@@ -141,6 +141,11 @@ async function extractFeatures(imagePath, augmentations = AUGMENTATION_ORDER) {
 async function extractAndStoreFeatures(imagePath, options = {}) {
     const augmentations = options.augmentations ?? AUGMENTATION_ORDER;
     const { batches, totalFeatures } = await extractFeatures(imagePath, augmentations);
+    for (const batch of batches) {
+        console.log(
+            `     ↳ Augmentation '${batch.augmentation}' yielded ${batch.allFeatures.length} vectors`
+        );
+    }
     const { imageId, featureCount } = await storeFeatures(imagePath, batches);
     return { imageId, featureCount, totalFeatures };
 }

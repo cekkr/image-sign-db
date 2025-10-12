@@ -7,7 +7,7 @@ require('dotenv').config();
 
 // --- INTERNAL MODULES ---
 const { ingestImage, bootstrapCorrelations } = require('./insert');
-const { generateSpecificVector, resolveDefaultProbeSpec } = require('./featureExtractor');
+const { generateSpecificVector } = require('./featureExtractor');
 const { createDbConnection } = require('./lib/knowledge');
 const { CHANNEL_DIMENSIONS, GRID_SIZES } = require('./lib/constants');
 const { euclideanDistance } = require('./lib/correlationMetrics');
@@ -88,11 +88,9 @@ async function findCandidateImages(db, probe) {
      JOIN value_types vt ON vt.value_type_id = fv.value_type
      WHERE fv.value_type = ?
        AND fv.resolution_level = ?
-       AND fv.pos_x = ?
-       AND fv.pos_y = ?
-       AND ABS(fv.rel_x - ?) < 1e-6
-       AND ABS(fv.rel_y - ?) < 1e-6`,
-    [valueTypeId, probe.gridSize, probe.pos_x, probe.pos_y, probe.rel_x, probe.rel_y]
+       AND ABS(fv.rel_x - ?) < 1e-3
+       AND ABS(fv.rel_y - ?) < 1e-3`,
+    [valueTypeId, probe.gridSize, probe.rel_x, probe.rel_y]
   );
 
   const candidates = new Set();
@@ -106,15 +104,53 @@ async function findCandidateImages(db, probe) {
   return [...candidates];
 }
 
+async function sampleRandomProbeSpec(db) {
+  const [rows] = await db.execute(
+    `SELECT fv.vector_id, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, fv.rel_x, fv.rel_y, fv.size, vt.descriptor_json
+     FROM feature_vectors fv
+     JOIN value_types vt ON vt.value_type_id = fv.value_type
+     ORDER BY RAND()
+     LIMIT 1`
+  );
+  if (rows.length === 0) return null;
+  const row = rows[0];
+  const descriptor = parseDescriptor(row.descriptor_json) ?? {
+    family: 'delta',
+    channel: CHANNEL_DIMENSIONS[0],
+    neighbor_dx: Math.round(row.rel_x * row.resolution_level),
+    neighbor_dy: Math.round(row.rel_y * row.resolution_level),
+  };
+  return normalizeProbeSpec({
+    gridSize: row.resolution_level,
+    pos_x: row.pos_x,
+    pos_y: row.pos_y,
+    dx: descriptor.neighbor_dx,
+    dy: descriptor.neighbor_dy,
+    descriptor,
+    descriptorKey: createDescriptorKey(descriptor),
+    rel_x: row.rel_x,
+    rel_y: row.rel_y,
+    size: row.size,
+  });
+}
+
 async function reprobeOne(db, imagePath, imageId, options = {}) {
   const maxSteps = options.maxSteps ?? CHANNEL_DIMENSIONS.length;
   let constellationPath = [];
   let remaining = null;
   let steps = 0;
+  const usedKeys = new Set();
 
   while (steps < maxSteps) {
     steps += 1;
-    const probeSpec = normalizeProbeSpec(resolveDefaultProbeSpec());
+    const probeSpec = await sampleRandomProbeSpec(db);
+    if (!probeSpec) break;
+    const dedupeKey = `${probeSpec.descriptorKey}:${probeSpec.gridSize}:${probeSpec.pos_x}:${probeSpec.pos_y}`;
+    if (usedKeys.has(dedupeKey)) {
+      steps -= 1;
+      continue;
+    }
+    usedKeys.add(dedupeKey);
     const vector = await generateSpecificVector(imagePath, probeSpec);
     if (!vector) continue;
     const probe = {
@@ -140,8 +176,9 @@ async function reprobeOne(db, imagePath, imageId, options = {}) {
   }
 
   const initial = constellationPath.length > 0 ? constellationPath[0].candidateCount : 0;
-  const ok = remaining && remaining.length === 1 && remaining[0] === imageId;
-  return { ok, initial, steps: constellationPath.length, path: constellationPath };
+  const remainingCount = Array.isArray(remaining) ? remaining.length : 0;
+  const ok = remaining && remainingCount === 1 && remaining[0] === imageId;
+  return { ok, initial, steps: constellationPath.length, path: constellationPath, remainingCount };
 }
 
 async function main() {
@@ -183,6 +220,17 @@ async function main() {
       let totalAccuracyScore = 0;
       for (const item of sample) {
         const result = await reprobeOne(db, item.file, item.imageId);
+        const imageLabel = path.basename(item.file);
+        const statusLabel = result.ok ? 'hit' : 'miss';
+        console.log(
+          `   • ${imageLabel}: ${statusLabel} after ${result.steps} step(s) (candidates ${result.initial} → ${result.remainingCount})`
+        );
+        if (!result.ok && result.path && result.path.length > 0) {
+          const lastStep = result.path[result.path.length - 1];
+          console.log(
+            `     ↳ last probe ${lastStep.descriptorKey} accuracy ${(lastStep.accuracyScore ?? 0).toFixed(6)} (cumulative ${(lastStep.cumulativeAccuracy ?? 0).toFixed(6)})`
+          );
+        }
         if (result.ok) okCount += 1;
         totalInitial += result.initial || 0;
         totalSteps += result.steps || 0;

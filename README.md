@@ -28,6 +28,7 @@ In the latest revision the extractor also:
 *   Runs a configurable **augmentation sweep** (horizontal/vertical mirroring, Gaussian blur, and three deterministic "random combo" crops/rotations/color jitters derived from the filename) so the database learns how an image behaves under common edits without ever persisting the transformed pixels.
 *   Builds a **deterministic quadtree** on top of every image. Each node contributes both its HSV/luminance signature (`hsv_tree_mean`) and how that node diverges from its parent (`hsv_tree_delta`). This gives the search engine a true coarse‑to‑fine "tree dividing" map that can express global context and local anomalies simultaneously.
 *   Persists every measurement as a relative row (`value_type` id, resolution, grid index, displacement, value, size). Vector semantics live in hashed descriptor blobs (`value_types.descriptor_hash`/`descriptor_json`), keeping the database agnostic while the JavaScript layer can evolve descriptors freely.
+*   Draws **stochastic constellation samples** instead of exhaustively harvesting every neighbour. For each augmentation the extractor picks a pseudo-random subset of anchor cells, offsets, and channels (bounded by relative distance constraints). Every ingest therefore explores a different constellation while descriptors remain comparable through their hashed definitions.
 
 ### 2\. Hierarchical Knowledge Graph via MySQL
 
@@ -158,6 +159,9 @@ Create a folder (e.g., `training_dataset`) and fill it with the images you want 
     
 The extractor automatically generates augmented mirrors/blurred/jittered variants and builds the quadtree hierarchy before persisting the vectors, so one pass per source image is still all that's required. Adding `--discover=<n>` triggers a small correlation sweep focused on the newly inserted data. After each ingestion the storage manager checks `system_settings.max_db_size_gb` and prunes the coldest vectors if the database exceeds the configured footprint.
 
+Every ingest now prints how many constellation vectors each augmentation produced so you can spot skewed samples early.
+When you enable `--reprobe`, the trainer now streams per-image hit/miss summaries together with the last probe accuracy so you can monitor how well the freshly inserted vectors anchor the search.
+
 Need to prune the dataset later? Run:
 
     node src/insert.js remove <image_id|original_filename>
@@ -178,9 +182,9 @@ You can find a match for a new image in two ways. The system will continue to le
 1.  **Start the Server:**
     
         node src/index.js server
-        
     
-2.  **Run the Client:** In a separate terminal, use the client script to find a match for a new image.
+    
+2.  **Run the Client:** In a separate terminal, use the client script to find a match for a new image. The client now asks the server for the first constellation vector before measuring anything, so the server stays in charge of the interrogation path.
     
     node src/clientAPI.js path/to/your/image_to_find.jpg
 
@@ -195,5 +199,13 @@ You can find a match for a new image in two ways. The system will continue to le
 Use the `index.js` script directly to perform a search without starting a server.
 
     node src/index.js find path/to/your/image_to_find.jpg
-    
-The CLI mirrors the server behaviour and will surface any correlation metrics it relied upon for each follow-up vector request.
+
+The CLI mirrors the server behaviour and will surface any correlation metrics it relied upon for each follow-up vector request. Under the hood it also requests a probe descriptor from the database rather than inventing a deterministic starting point, so CLI searches exercise the same stochastic constellation logic as the network client.
+
+### Raw API Handshake
+
+If you are wiring a custom client, call:
+
+1. `POST /search/start { "requestProbe": true }` → receive `{ status: "REQUEST_PROBE", sessionId, probeSpec }`.
+2. Measure that probe on your image and send `POST /search/start { sessionId, probe: { …, value } }`.
+3. For subsequent steps continue with `POST /search/refine` as before, passing each requested descriptor and measured value.
