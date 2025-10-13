@@ -3,12 +3,14 @@
 // --- LIBRARIES ---
 const fs = require('fs/promises');
 const path = require('path');
+const os = require('os');
+const { Worker } = require('worker_threads');
 require('dotenv').config();
 
 // --- INTERNAL MODULES ---
-const { ingestImage, bootstrapCorrelations } = require('./insert');
+const { bootstrapCorrelations } = require('./insert');
 const { generateSpecificVector } = require('./featureExtractor');
-const { createDbConnection } = require('./lib/knowledge');
+const { createDbConnection, discoverCorrelations } = require('./lib/knowledge');
 const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
 const { euclideanDistance } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
@@ -32,7 +34,7 @@ async function* walkDir(dir, exts) {
 
 function parseArgs(argv) {
   const args = argv.slice(2);
-  const options = { discover: 0, bootstrap: 0, reprobe: 0, shuffle: true };
+  const options = { discover: 3, bootstrap: 0, reprobe: 0, shuffle: true, threads: undefined };
   const positional = [];
   for (const token of args) {
     if (token.startsWith('--')) {
@@ -42,11 +44,324 @@ function parseArgs(argv) {
       if (key === 'discover' || key === 'bootstrap' || key === 'reprobe') options[key] = Number(val) || 0;
       else if (key === 'shuffle') options.shuffle = val !== 'false';
       else if (key === 'pattern') options.pattern = String(val);
+      else if (key === 'threads') options.threads = Number(val) || 0;
     } else {
       positional.push(token);
     }
   }
   return { dir: positional[0], options };
+}
+
+const WORKER_SCRIPT = path.resolve(__dirname, 'workers/ingestWorker.js');
+const RESOURCE_SAMPLE_INTERVAL_MS = 2500;
+
+function sampleResources() {
+  const cpuInfo = typeof os.cpus === 'function' ? os.cpus() : [];
+  const cpuCount = Math.max(1, Array.isArray(cpuInfo) ? cpuInfo.length : 1);
+  const load = os.loadavg ? os.loadavg()[0] : 0;
+  const normalizedLoad = cpuCount ? load / cpuCount : 0;
+  const totalMem = os.totalmem() || 1;
+  const freeMem = os.freemem();
+  const freeMemRatio = Math.max(0, Math.min(1, freeMem / totalMem));
+  const rss = process.memoryUsage().rss;
+  return { cpuCount, normalizedLoad, freeMemRatio, rss };
+}
+
+function computeDesiredWorkerCount(currentWorkers, resources, limits, pendingCount) {
+  if (pendingCount <= 0) return 0;
+  const { cpuCount, normalizedLoad, freeMemRatio } = resources;
+  const safeMax = Math.max(limits.min, Math.min(limits.max, Math.max(1, cpuCount - 1)));
+  let target = Math.min(safeMax, Math.max(limits.min, Math.round(cpuCount * 0.75)));
+
+  if (normalizedLoad > 1.1) target = Math.max(limits.min, target - 2);
+  else if (normalizedLoad > 0.9) target = Math.max(limits.min, target - 1);
+
+  if (freeMemRatio < 0.1) target = Math.max(limits.min, target - 2);
+  else if (freeMemRatio < 0.18) target = Math.max(limits.min, target - 1);
+
+  if (normalizedLoad < 0.35 && freeMemRatio > 0.25 && target < safeMax) target += 1;
+  if (normalizedLoad < 0.22 && freeMemRatio > 0.4 && target < safeMax) target += 1;
+
+  target = Math.min(target, pendingCount);
+  return Math.max(limits.min, target);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class OnlineCorrelationRunner {
+  constructor({ maxBatchSize = 6, similarityThreshold = 0.2 } = {}) {
+    this.maxBatchSize = Math.max(1, maxBatchSize);
+    this.similarityThreshold = similarityThreshold;
+    this.pendingIterations = 0;
+    this.running = false;
+    this.history = [];
+    this.warnedInsufficient = false;
+  }
+
+  enqueue(iterations) {
+    if (!iterations || iterations <= 0) return;
+    this.pendingIterations += iterations;
+    void this.process();
+  }
+
+  async process() {
+    if (this.running || this.pendingIterations <= 0) return;
+    this.running = true;
+    try {
+      while (this.pendingIterations > 0) {
+        const batchIterations = Math.min(this.pendingIterations, this.maxBatchSize);
+        this.pendingIterations -= batchIterations;
+        const batchMetrics = [];
+
+        try {
+          await discoverCorrelations({
+            iterations: batchIterations,
+            similarityThreshold: this.similarityThreshold,
+            onIterationStart: (iteration, total) => {
+              if (iteration === 1) {
+                console.log(`\n🔎 Running ${batchIterations} online correlation iteration(s)...`);
+              }
+            },
+            onDiscriminatorSelected: ({ metrics, ambiguousCandidates }) => {
+              if (!metrics) return;
+              batchMetrics.push({
+                score: metrics.score ?? 0,
+                affinity: metrics.affinity ?? 0,
+                spread: metrics.spread ?? 0,
+                meanDistance: metrics.meanDistance ?? 0,
+                stdDistance: metrics.stdDistance ?? 0,
+                sampleSize: metrics.sampleSize ?? 0,
+                candidates: ambiguousCandidates ?? 0,
+              });
+            },
+          });
+          this.warnedInsufficient = false;
+        } catch (error) {
+          if (error && /requires at least two images/i.test(error.message)) {
+            if (!this.warnedInsufficient) {
+              console.log('   ⏳ Waiting for a larger image set before running correlations...');
+              this.warnedInsufficient = true;
+            }
+            break;
+          } else {
+            console.warn(`⚠️  Online correlation failed: ${error.message}`);
+          }
+        }
+
+        if (batchMetrics.length > 0) {
+          this.history.push(...batchMetrics);
+          this.logBatchSummary(batchMetrics);
+        }
+
+        if (this.pendingIterations <= 0) break;
+      }
+    } finally {
+      this.running = false;
+      if (this.pendingIterations > 0) {
+        setImmediate(() => void this.process());
+      }
+    }
+  }
+
+  logBatchSummary(batchMetrics) {
+    const total = batchMetrics.reduce(
+      (acc, metric) => {
+        acc.score += metric.score;
+        acc.affinity += metric.affinity;
+        acc.spread += metric.spread;
+        acc.meanDistance += metric.meanDistance;
+        acc.stdDistance += metric.stdDistance;
+        acc.sampleSize += metric.sampleSize;
+        acc.candidates += metric.candidates;
+        return acc;
+      },
+      {
+        score: 0,
+        affinity: 0,
+        spread: 0,
+        meanDistance: 0,
+        stdDistance: 0,
+        sampleSize: 0,
+        candidates: 0,
+      }
+    );
+
+    const count = batchMetrics.length;
+    const avg = {
+      score: total.score / count,
+      affinity: total.affinity / count,
+      spread: total.spread / count,
+      meanDistance: total.meanDistance / count,
+      stdDistance: total.stdDistance / count,
+      sampleSize: total.sampleSize / count,
+      candidates: total.candidates / count,
+    };
+
+    console.log(
+      `   ↳ Avg score ${avg.score.toFixed(4)} | spread ${avg.spread.toFixed(4)} | affinity ${avg.affinity.toFixed(4)} | sample ${avg.sampleSize.toFixed(1)} | candidates ${avg.candidates.toFixed(1)}`
+    );
+  }
+
+  async drain() {
+    while (this.running || this.pendingIterations > 0) {
+      await sleep(150);
+    }
+  }
+}
+
+async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThreads } = {}, correlationRunner) {
+  if (!files || files.length === 0) return { ingested: [], failures: [] };
+
+  const pending = [...files];
+  const ingested = [];
+  const failures = [];
+  const workers = new Set();
+
+  let processedCount = 0;
+  let activeWorkers = 0;
+  let closed = false;
+  let resolveFn;
+
+  const resultPromise = new Promise((resolve) => {
+    resolveFn = resolve;
+  });
+
+  const cpuInfo = typeof os.cpus === 'function' ? os.cpus() : [];
+  const cpuCount = Math.max(1, Array.isArray(cpuInfo) ? cpuInfo.length : 1);
+  const limits = {
+    min: 1,
+    max: maxThreads && maxThreads > 0 ? Math.max(1, Math.min(maxThreads, 32)) : Math.max(1, Math.min(cpuCount, 8)),
+  };
+
+  function assignWork(info) {
+    if (closed || info.busy || pending.length === 0) return;
+    const file = pending.shift();
+    if (!file) return;
+
+    info.busy = true;
+    info.currentFile = file;
+    activeWorkers += 1;
+    info.worker.postMessage({
+      type: 'ingest',
+      payload: { file, discoverIterations: 0 },
+    });
+  }
+
+  async function terminateWorker(info) {
+    if (!workers.has(info)) return;
+    workers.delete(info);
+    try {
+      await info.worker.terminate();
+    } catch {
+      // best effort
+    }
+  }
+
+  function maybeComplete() {
+    if (closed) return;
+    if (pending.length === 0 && activeWorkers === 0) {
+      closed = true;
+      clearInterval(monitor);
+      Promise.all([...workers].map((info) => info.worker.terminate().catch(() => {})))
+        .then(() => resolveFn({ ingested, failures }))
+        .catch((error) => resolveFn({ ingested, failures, error }));
+    }
+  }
+
+  function handleMessage(info, message) {
+    if (!message || typeof message.type !== 'string') return;
+    if (message.type === 'result') {
+      activeWorkers = Math.max(0, activeWorkers - 1);
+      info.busy = false;
+      delete info.currentFile;
+      processedCount += 1;
+      ingested.push(message.payload);
+      if (correlationRunner && iterationsPerIngest > 0) {
+        correlationRunner.enqueue(iterationsPerIngest);
+      }
+      if (processedCount % 10 === 0 || processedCount === files.length) {
+        console.log(
+          `   ↳ Progress: ${processedCount}/${files.length} image(s) ingested (workers ${workers.size}, queue ${pending.length})`
+        );
+      }
+      assignWork(info);
+      maybeComplete();
+    } else if (message.type === 'error') {
+      activeWorkers = Math.max(0, activeWorkers - 1);
+      info.busy = false;
+      const failedFile = message.payload?.file ?? info.currentFile;
+      delete info.currentFile;
+      failures.push(message.payload ?? { message: 'Unknown worker error' });
+      console.warn(
+        `⚠️  Worker failed to ingest ${failedFile ?? 'unknown file'}: ${message.payload?.message ?? 'error'}`
+      );
+      assignWork(info);
+      maybeComplete();
+    }
+  }
+
+  function handleWorkerError(info, error) {
+    activeWorkers = Math.max(0, activeWorkers - 1);
+    info.busy = false;
+    const failedFile = info.currentFile;
+    delete info.currentFile;
+    failures.push({ file: failedFile, message: error?.message ?? 'Worker crashed' });
+    console.warn(`⚠️  Worker ${info.id} crashed: ${error?.message ?? 'unknown error'}`);
+    terminateWorker(info).finally(() => {
+      maybeComplete();
+    });
+  }
+
+  let nextWorkerId = 1;
+
+  function spawnWorker() {
+    const worker = new Worker(WORKER_SCRIPT);
+    const info = { id: nextWorkerId++, worker, busy: false };
+    workers.add(info);
+
+    worker.on('message', (message) => handleMessage(info, message));
+    worker.on('error', (error) => handleWorkerError(info, error));
+    worker.on('exit', (code) => {
+      workers.delete(info);
+      if (!closed && code !== 0) {
+        console.warn(`⚠️  Worker ${info.id} exited with code ${code}`);
+      }
+      maybeComplete();
+    });
+
+    assignWork(info);
+  }
+
+  function rebalance() {
+    if (closed) return;
+    const resources = sampleResources();
+    const target = computeDesiredWorkerCount(workers.size, resources, limits, pending.length);
+    if (target > workers.size) {
+      const toCreate = Math.min(target - workers.size, pending.length);
+      for (let i = 0; i < toCreate; i += 1) {
+        spawnWorker();
+      }
+    } else if (target < workers.size) {
+      const idleWorkers = [...workers].filter((info) => !info.busy);
+      const toRemove = Math.min(workers.size - target, idleWorkers.length);
+      for (let i = 0; i < toRemove; i += 1) {
+        void terminateWorker(idleWorkers[i]);
+      }
+    }
+
+    for (const info of workers) {
+      assignWork(info);
+    }
+
+    maybeComplete();
+  }
+
+  const monitor = setInterval(rebalance, RESOURCE_SAMPLE_INTERVAL_MS);
+  rebalance();
+
+  return resultPromise;
 }
 
 function normalizeProbeSpec(spec = {}) {
@@ -210,7 +525,7 @@ async function reprobeOne(db, imagePath, imageId, options = {}) {
 async function main() {
   const { dir, options } = parseArgs(process.argv);
   if (!dir) {
-    console.error('Usage: node src/train.js <dataset_dir> [--discover=25] [--bootstrap=100] [--reprobe=50] [--shuffle=true]');
+    console.error('Usage: node src/train.js <dataset_dir> [--discover=3] [--bootstrap=100] [--reprobe=50] [--threads=4] [--shuffle=true]');
     process.exit(1);
   }
 
@@ -220,13 +535,52 @@ async function main() {
   if (options.shuffle) files.sort(() => Math.random() - 0.5);
   console.log(`📚 Found ${files.length} file(s) to ingest.`);
 
-  const ingested = [];
-  for (const file of files) {
-    try {
-      const { imageId, featureCount } = await ingestImage(file, options.discover || 0);
-      ingested.push({ file, imageId, featureCount });
-    } catch (err) {
-      console.warn(`⚠️  Failed ingest: ${file} -> ${err.message}`);
+  const correlationIterations = Math.max(0, options.discover || 0);
+  const correlationRunner = correlationIterations > 0
+    ? new OnlineCorrelationRunner({
+        maxBatchSize: Math.max(1, Math.min(12, correlationIterations * 2)),
+      })
+    : null;
+
+  const maxThreads = options.threads && options.threads > 0 ? options.threads : undefined;
+  if (maxThreads) {
+    console.log(`⚙️  Using up to ${maxThreads} worker thread(s) for ingestion.`);
+  } else {
+    console.log('⚙️  Using adaptive worker pool for ingestion (auto threads).');
+  }
+
+  const { ingested, failures } = await ingestFilesConcurrently(
+    files,
+    { iterationsPerIngest: correlationIterations, maxThreads },
+    correlationRunner
+  );
+
+  if (failures && failures.length > 0) {
+    console.warn(`⚠️  ${failures.length} file(s) failed during ingestion.`);
+    for (const failure of failures) {
+      console.warn(`   ↳ ${failure.file ?? 'unknown'} :: ${failure.message ?? 'unknown error'}`);
+    }
+  }
+
+  if (correlationRunner) {
+    await correlationRunner.drain();
+    if (correlationRunner.history.length > 0) {
+      const totals = correlationRunner.history.reduce(
+        (acc, metric) => {
+          acc.score += metric.score;
+          acc.affinity += metric.affinity;
+          acc.spread += metric.spread;
+          acc.sampleSize += metric.sampleSize;
+          acc.count += 1;
+          return acc;
+        },
+        { score: 0, affinity: 0, spread: 0, sampleSize: 0, count: 0 }
+      );
+      if (totals.count > 0) {
+        console.log(
+          `\n🧪 Online correlation results across ${totals.count} discriminator(s): avg score ${(totals.score / totals.count).toFixed(4)}, affinity ${(totals.affinity / totals.count).toFixed(4)}, spread ${(totals.spread / totals.count).toFixed(4)}, sample size ${(totals.sampleSize / totals.count).toFixed(1)}`
+        );
+      }
     }
   }
 

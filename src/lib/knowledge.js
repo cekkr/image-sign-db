@@ -210,6 +210,9 @@ async function discoverCorrelations({
 
             if (candidateImageIds.size === 0) continue;
 
+            const candidateImageList = Array.from(candidateImageIds);
+            if (candidateImageList.length === 0) continue;
+
             let bestDiscriminator = null;
             let bestMetrics = null;
             let bestScore = -Infinity;
@@ -222,39 +225,23 @@ async function discoverCorrelations({
                 [targetImageId]
             );
 
+            const candidatePlaceholders = candidateImageList.map(() => '?').join(', ');
+            const candidateQuery = `SELECT fv.*, vt.descriptor_json
+                 FROM feature_vectors fv
+                 JOIN value_types vt ON vt.value_type_id = fv.value_type
+                 WHERE fv.value_type = ?
+                   AND fv.resolution_level = ?
+                   AND fv.pos_x = ?
+                   AND fv.pos_y = ?
+                   AND ABS(fv.rel_x - ?) <= ?
+                   AND ABS(fv.rel_y - ?) <= ?
+                   AND fv.image_id IN (${candidatePlaceholders})`;
+
             for (const row of targetRows) {
                 const candidate = hydrateFeatureRow(row);
 
-                let placeholders = ""
-                let _candidateImageIds = []
-                for(let i=0; i < candidateImageIds.size; i++){ // the old way
-                    if(i > 0) placeholders += ", "
-
-                    if(false){
-                        placeholders += "?"
-                        _candidateImageIds.push(candidateImageIds[i])                
-                    }
-                    else {
-                        placeholders += "'"+candidateImageIds[i]+"'"
-                    }
-                }
-
-                if(candidateImageIds.size > 1 || true) 
-                    placeholders = "("+placeholders+")";
-
-                let query = `SELECT fv.*, vt.descriptor_json
-                     FROM feature_vectors fv
-                     JOIN value_types vt ON vt.value_type_id = fv.value_type
-                     WHERE fv.value_type = ?
-                       AND fv.resolution_level = ?
-                       AND fv.pos_x = ?
-                       AND fv.pos_y = ?
-                       AND ABS(fv.rel_x - ?) <= ?
-                       AND ABS(fv.rel_y - ?) <= ?
-                       AND fv.image_id IN ${placeholders}`
-
                 const [candidateRows] = await dbConnection.execute(
-                    query,
+                    candidateQuery,
                     [
                         candidate.value_type,
                         candidate.resolution_level,
@@ -264,7 +251,7 @@ async function discoverCorrelations({
                         CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
                         candidate.rel_y,
                         CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
-                        //_candidateImageIds,
+                        ...candidateImageList,
                     ]
                 );
 
@@ -280,13 +267,18 @@ async function discoverCorrelations({
             }
 
             if (!bestDiscriminator) continue;
-            await recordVectorUsage(dbConnection, [bestDiscriminator.vector_id], 2, bestMetrics?.score ?? 0);
+
+            const metricsWithScore = bestMetrics
+                ? { ...bestMetrics, score: bestScore }
+                : null;
+
+            await recordVectorUsage(dbConnection, [bestDiscriminator.vector_id], 2, metricsWithScore?.score ?? 0);
 
             onDiscriminatorSelected?.({
                 iterationNumber,
                 startFeature,
                 discriminatorFeature: bestDiscriminator,
-                metrics: bestMetrics,
+                metrics: metricsWithScore,
                 ambiguousCandidates: candidateImageIds.size,
             });
 
@@ -312,8 +304,8 @@ async function discoverCorrelations({
             );
             await updateNodeStats(dbConnection, groupNodeId, 'hit', increment);
 
-            if (bestMetrics && bestMetrics.sampleSize > 0) {
-                await upsertFeatureGroupStats(dbConnection, startFeature, bestDiscriminator, bestMetrics);
+            if (metricsWithScore && metricsWithScore.sampleSize > 0) {
+                await upsertFeatureGroupStats(dbConnection, startFeature, bestDiscriminator, metricsWithScore);
             }
         }
     } finally {
