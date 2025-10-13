@@ -3,6 +3,7 @@ const mysql = require('mysql2/promise');
 const express = require('express');
 const crypto = require('crypto');
 require('dotenv').config();
+const settings = require('./settings');
 const { generateSpecificVector } = require('./featureExtractor');
 const { euclideanDistance } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
@@ -13,9 +14,10 @@ const { extendConstellationPath, createRandomConstellationSpec, descriptorToSpec
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 
 // --- CONFIGURATION ---
-const PORT = process.env.PORT || 3000;
-const VALUE_THRESHOLD = 0.08;
-const SKIP_THRESHOLD = 3;
+const SERVER_PORT = settings.server.port;
+const VALUE_THRESHOLD = settings.search.valueThreshold;
+const SKIP_THRESHOLD = settings.search.skipThreshold;
+const MAX_CLI_ITERATIONS = settings.search.maxCliIterations;
 
 // --- DATABASE / CACHE ---
 let dbConnection;
@@ -493,8 +495,8 @@ function runServer() {
         }
     });
 
-    app.listen(PORT, () => {
-        console.log(`🚀 Server listening on http://localhost:${PORT}`);
+    app.listen(SERVER_PORT, () => {
+        console.log(`🚀 Server listening on http://localhost:${SERVER_PORT}`);
     });
 }
 
@@ -545,7 +547,7 @@ async function runCli(imagePath) {
     let nextQuestion = await buildNextQuestion(session);
     let iteration = 0;
 
-    while (nextQuestion && iteration < 12) {
+    while (nextQuestion && iteration < MAX_CLI_ITERATIONS) {
         iteration += 1;
         console.log(
             `  [Iteration ${iteration}] Requesting descriptor ${nextQuestion.descriptorKey} (channel ${nextQuestion.descriptor?.channel ?? '?'})`

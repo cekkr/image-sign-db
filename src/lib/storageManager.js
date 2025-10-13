@@ -1,4 +1,5 @@
 const { createDescriptorKey, serializeDescriptor } = require('./descriptor');
+const settings = require('../settings');
 
 async function loadSetting(db, key, defaultValue = null) {
     const [rows] = await db.execute(
@@ -91,8 +92,9 @@ async function pruneLowValueVectors(db, schemaName, targetGb) {
 }
 
 async function ensureStorageCapacity(db, schemaName) {
-    const maxGbRaw = await loadSetting(db, 'max_db_size_gb', 4);
-    const maxGb = Number(maxGbRaw) || 4;
+    const defaultLimit = settings.database.defaultMaxSizeGb;
+    const maxGbRaw = await loadSetting(db, 'max_db_size_gb', defaultLimit);
+    const maxGb = Number(maxGbRaw) || defaultLimit;
     let currentGb = await currentDatabaseSizeGb(db, schemaName);
     if (currentGb <= maxGb) return;
     await pruneLowValueVectors(db, schemaName, maxGb);

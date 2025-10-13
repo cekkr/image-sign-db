@@ -3,9 +3,11 @@ const fs = require('fs/promises');
 const {
     generateSpecificVector,
 } = require('./featureExtractor.js');
+const settings = require('./settings');
 
 // --- CONFIGURATION ---
-const API_BASE_URL = 'http://localhost:3000';
+const API_BASE_URL = settings.client.apiBaseUrl;
+const MAX_REMOTE_ITERATIONS = settings.client.maxIterations;
 
 // --- MAIN LOGIC ---
 
@@ -69,7 +71,7 @@ async function findImageRemotely(imagePath) {
     
     // 2. Iteratively refine the search based on server requests
     let iterations = 0;
-    while (result.status === 'CANDIDATES_FOUND' && result.nextQuestion && iterations < 10) {
+    while (result.status === 'CANDIDATES_FOUND' && result.nextQuestion && iterations < MAX_REMOTE_ITERATIONS) {
         iterations++;
         const nextQuestion = result.nextQuestion;
         if (!nextQuestion) break;

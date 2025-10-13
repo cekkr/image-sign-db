@@ -10,6 +10,7 @@ require('dotenv').config();
 // --- INTERNAL MODULES ---
 const { bootstrapCorrelations } = require('./insert');
 const { generateSpecificVector } = require('./featureExtractor');
+const settings = require('./settings');
 const { createDbConnection, discoverCorrelations } = require('./lib/knowledge');
 const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
 const { euclideanDistance } = require('./lib/correlationMetrics');
@@ -18,6 +19,17 @@ const { extendConstellationPath, descriptorToSpec } = require('./lib/constellati
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 
 // --- HELPERS ---
+
+const VALUE_THRESHOLD = settings.search.valueThreshold;
+const TRAINING_DEFAULT_OPTIONS = {
+  discover: settings.training.defaults.discover,
+  bootstrap: settings.training.defaults.bootstrap,
+  reprobe: settings.training.defaults.reprobe,
+  shuffle: settings.training.defaults.shuffle,
+  threads: settings.training.defaults.threads,
+};
+const WORKER_SCRIPT = path.resolve(__dirname, 'workers/ingestWorker.js');
+const RESOURCE_SAMPLE_INTERVAL_MS = settings.training.resourceSampleIntervalMs;
 
 async function* walkDir(dir, exts) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -34,7 +46,7 @@ async function* walkDir(dir, exts) {
 
 function parseArgs(argv) {
   const args = argv.slice(2);
-  const options = { discover: 3, bootstrap: 0, reprobe: 0, shuffle: true, threads: undefined };
+  const options = { ...TRAINING_DEFAULT_OPTIONS };
   const positional = [];
   for (const token of args) {
     if (token.startsWith('--')) {
@@ -51,9 +63,6 @@ function parseArgs(argv) {
   }
   return { dir: positional[0], options };
 }
-
-const WORKER_SCRIPT = path.resolve(__dirname, 'workers/ingestWorker.js');
-const RESOURCE_SAMPLE_INTERVAL_MS = 2500;
 
 function sampleResources() {
   const cpuInfo = typeof os.cpus === 'function' ? os.cpus() : [];
@@ -91,7 +100,7 @@ function sleep(ms) {
 }
 
 class OnlineCorrelationRunner {
-  constructor({ maxBatchSize = 6, similarityThreshold = 0.2 } = {}) {
+  constructor({ maxBatchSize = settings.correlation.onlineRunnerMaxBatchSize, similarityThreshold = settings.correlation.similarityThreshold } = {}) {
     this.maxBatchSize = Math.max(1, maxBatchSize);
     this.similarityThreshold = similarityThreshold;
     this.pendingIterations = 0;
@@ -448,7 +457,7 @@ async function findCandidateImages(db, probe) {
       { ...probe, value_type: valueTypeId, resolution_level: probe.resolution_level, size: probe.size },
       { value: row.value, rel_x: row.rel_x, rel_y: row.rel_y, size: row.size }
     );
-    if (distance <= 0.08) candidates.add(row.image_id);
+    if (distance <= VALUE_THRESHOLD) candidates.add(row.image_id);
   }
   return [...candidates];
 }
@@ -538,7 +547,13 @@ async function main() {
   const correlationIterations = Math.max(0, options.discover || 0);
   const correlationRunner = correlationIterations > 0
     ? new OnlineCorrelationRunner({
-        maxBatchSize: Math.max(1, Math.min(12, correlationIterations * 2)),
+        maxBatchSize: Math.max(
+          1,
+          Math.min(
+            Math.max(1, settings.correlation.onlineRunnerMaxBatchSizeCap),
+            correlationIterations * 2
+          )
+        ),
       })
     : null;
 

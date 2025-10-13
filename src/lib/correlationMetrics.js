@@ -1,6 +1,8 @@
-const MAX_CANDIDATE_SAMPLE = 256;
-const MIN_AFFINITY = 0.05;
-const MIN_SPREAD = 0.002;
+const settings = require('../settings');
+
+const MAX_CANDIDATE_SAMPLE = Math.max(1, settings.correlation.maxCandidateSample);
+const MIN_AFFINITY = Math.max(0, settings.correlation.minAffinity);
+const MIN_SPREAD = Math.max(0, settings.correlation.minSpread);
 
 function buildFeatureVector(feature) {
     return [

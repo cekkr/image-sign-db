@@ -7,10 +7,11 @@ require('dotenv').config();
 
 // --- INTERNAL MODULES ---
 const { extractAndStoreFeatures } = require('./featureExtractor');
+const settings = require('./settings');
 const { discoverCorrelations, createDbConnection } = require('./lib/knowledge');
 const { ensureStorageCapacity } = require('./lib/storageManager');
 
-const DB_SCHEMA = process.env.DB_NAME || 'image_hypercube_db';
+const DB_SCHEMA = settings.database.schema;
 
 // --- HELPERS ---
 
@@ -66,7 +67,7 @@ async function runCorrelationDiscovery(iterations) {
     if (!iterations || iterations <= 0) return;
     await discoverCorrelations({
         iterations,
-        similarityThreshold: 0.2,
+        similarityThreshold: settings.correlation.similarityThreshold,
         onIterationStart(iteration, total) {
             if (iteration === 1) {
                 console.log(`\n🔁 Starting correlation sweep for ${total} iteration(s)`);
@@ -152,7 +153,7 @@ async function bootstrapCorrelations(iterations) {
 }
 
 async function handleBootstrapCommand(positional, options) {
-    const iterations = positional[0] ?? options.iterations ?? '75';
+    const iterations = positional[0] ?? options.iterations ?? settings.training.bootstrapCommandDefaultIterations;
     await bootstrapCorrelations(iterations);
 }
 
