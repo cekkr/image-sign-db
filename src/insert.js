@@ -79,7 +79,7 @@ async function runCorrelationDiscovery(iterations) {
             console.log(
                 `  [${iterationNumber}] Learned correlation ${startChannel} (res=${startFeature.resolution_level}) ` +
                 `→ ${discChannel} (res=${discriminatorFeature.resolution_level}) ` +
-                `(spread=${metrics.spread.toFixed(4)}, affinity=${metrics.affinity.toFixed(4)}, candidates=${ambiguousCandidates})`
+                `(cohesion=${Number(metrics?.cohesion ?? 0).toFixed(4)}, affinity=${Number(metrics?.affinity ?? 0).toFixed(4)}, candidates=${ambiguousCandidates})`
             );
         },
     });

@@ -42,6 +42,15 @@ The "brain" of the system is the `knowledge_nodes` table in MySQL. This table is
     
 Complementing the graph is the `feature_group_stats` table. It aggregates relative statistics per channel and resolution (average vector length, angle, separation metrics) so discovery sweeps can be summarised without duplicating individual links. The search API can consult these stats or pick alternative channels on the fly.
 
+### Patterns vs. Constellations
+
+The codebase historically mixed the terms “pattern” and “constellation.” This release makes the relationship explicit:
+
+- A **pattern** is a reusable relationship between feature vectors that proved discriminative. Patterns persist inside MySQL in the `knowledge_nodes` (positive associations) and `skip_patterns` (anti-patterns) tables. Group nodes store the relative angle, distance, and value offsets between two cooperating vectors.
+- A **constellation** is the runtime traversal of those patterns: a sequence of descriptor probes that the trainer or the HTTP API plays back to isolate a single image. Constellation steps are tracked in-process, but every probe is backed by a persisted pattern row.
+- The `feature_group_stats` table summarises the collective behaviour of every pattern family (mean distance, cosine, Pearson metrics). During ingestion or correlation discovery we update these aggregates so future searches can choose the most stable descriptors first.
+- Newly-added elastic matching reports the **affinity** (directional agreement) and **cohesion** (distance stability) of every pattern, which is why the logs now highlight those two metrics together whenever a constellation step is evaluated.
+
 ### 3½. Adaptive Caching & Pruning
 
 To keep the system responsive over time the database tracks lightweight metadata outside the core feature store:
@@ -164,6 +173,7 @@ The extractor automatically generates augmented mirrors/blurred/jittered variant
 
 Every ingest now prints how many constellation vectors each augmentation produced so you can spot skewed samples early.
 When you enable `--reprobe`, the trainer now streams per-image hit/miss summaries together with the last probe accuracy so you can monitor how well the freshly inserted vectors anchor the search.
+The trainer also performs an automatic self-evaluation during the first few ingests (configurable via `TRAINING_SELF_EVAL_*` env variables). It replays the same elastic matching logic used in evaluation mode and prints the best match, the self-rank, and whether the similarity threshold had to relax, so you get immediate feedback without running `--evaluate`.
 
 Need to prune the dataset later? Run:
 

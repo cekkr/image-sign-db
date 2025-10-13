@@ -5,7 +5,7 @@ const crypto = require('crypto');
 require('dotenv').config();
 const settings = require('./settings');
 const { generateSpecificVector } = require('./featureExtractor');
-const { euclideanDistance } = require('./lib/correlationMetrics');
+const { collectElasticMatches } = require('./lib/elasticMatcher');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
 const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
 const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
@@ -202,28 +202,34 @@ async function findCandidateImages(db, probe) {
         ]
     );
 
-    const candidates = new Set();
-    const matchingVectorIds = [];
-    for (const row of rows) {
-        const feature = rowToFeature(row);
-        const distance = euclideanDistance(
-            {
-                ...probe,
-                value_type: valueTypeId,
-                resolution_level: probe.resolution_level,
-                size: probe.size,
-            },
-            feature
-        );
-        if (distance <= VALUE_THRESHOLD) {
-            candidates.add(row.image_id);
-            matchingVectorIds.push(row.vector_id);
-        }
-    }
+    const targetFeature = {
+        value_type: valueTypeId,
+        resolution_level: probe.resolution_level,
+        value: probe.value ?? 0,
+        rel_x: probe.rel_x,
+        rel_y: probe.rel_y,
+        size: probe.size,
+    };
+    const selection = collectElasticMatches(rows, targetFeature, {
+        baseThreshold: VALUE_THRESHOLD,
+        minUniqueImages: 1,
+        maxEntries: rows.length,
+    });
+
+    const matchingVectorIds = selection.selectedEntries
+        .map((entry) => entry.vectorId)
+        .filter((vectorId) => Number.isFinite(vectorId) && vectorId > 0);
     if (matchingVectorIds.length > 0) {
         await recordVectorUsage(db, matchingVectorIds, 1, 0);
     }
-    return { candidates: [...candidates], valueTypeId, descriptorKey: valueTypeRecord.descriptorKey };
+
+    return {
+        candidates: [...selection.grouped.keys()],
+        valueTypeId,
+        descriptorKey: valueTypeRecord.descriptorKey,
+        relaxations: selection.relaxations,
+        thresholdUsed: selection.thresholdUsed,
+    };
 }
 
 async function startSearch(probeSpec, existingSessionId = null) {

@@ -18,6 +18,7 @@ const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('.
 const { extendConstellationPath, descriptorToSpec } = require('./lib/constellation');
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 const { createSeededRandom } = require('./lib/augmentations');
+const { collectElasticMatches } = require('./lib/elasticMatcher');
 
 let cliProgress;
 try {
@@ -188,7 +189,9 @@ class OnlineCorrelationRunner {
               batchMetrics.push({
                 score: metrics.score ?? 0,
                 affinity: metrics.affinity ?? 0,
-                spread: metrics.spread ?? 0,
+                cohesion: metrics.cohesion ?? 0,
+                density: metrics.density ?? 0,
+                stability: metrics.stability ?? 0,
                 meanDistance: metrics.meanDistance ?? 0,
                 stdDistance: metrics.stdDistance ?? 0,
                 sampleSize: metrics.sampleSize ?? 0,
@@ -229,7 +232,9 @@ class OnlineCorrelationRunner {
       (acc, metric) => {
         acc.score += metric.score;
         acc.affinity += metric.affinity;
-        acc.spread += metric.spread;
+        acc.cohesion += metric.cohesion;
+        acc.density += metric.density ?? 0;
+        acc.stability += metric.stability ?? 0;
         acc.meanDistance += metric.meanDistance;
         acc.stdDistance += metric.stdDistance;
         acc.sampleSize += metric.sampleSize;
@@ -239,7 +244,9 @@ class OnlineCorrelationRunner {
       {
         score: 0,
         affinity: 0,
-        spread: 0,
+        cohesion: 0,
+        density: 0,
+        stability: 0,
         meanDistance: 0,
         stdDistance: 0,
         sampleSize: 0,
@@ -251,7 +258,9 @@ class OnlineCorrelationRunner {
     const avg = {
       score: total.score / count,
       affinity: total.affinity / count,
-      spread: total.spread / count,
+      cohesion: total.cohesion / count,
+      density: total.density / count,
+      stability: total.stability / count,
       meanDistance: total.meanDistance / count,
       stdDistance: total.stdDistance / count,
       sampleSize: total.sampleSize / count,
@@ -259,7 +268,7 @@ class OnlineCorrelationRunner {
     };
 
     console.log(
-      `   ↳ Avg score ${avg.score.toFixed(4)} | spread ${avg.spread.toFixed(4)} | affinity ${avg.affinity.toFixed(4)} | sample ${avg.sampleSize.toFixed(1)} | candidates ${avg.candidates.toFixed(1)}`
+      `   ↳ Avg score ${avg.score.toFixed(4)} | cohesion ${avg.cohesion.toFixed(4)} | affinity ${avg.affinity.toFixed(4)} | sample ${avg.sampleSize.toFixed(1)} | candidates ${avg.candidates.toFixed(1)}`
     );
   }
 
@@ -270,7 +279,11 @@ class OnlineCorrelationRunner {
   }
 }
 
-async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThreads } = {}, correlationRunner) {
+async function ingestFilesConcurrently(
+  files,
+  { iterationsPerIngest = 0, maxThreads, onImageIngested } = {},
+  correlationRunner
+) {
   if (!files || files.length === 0) return { ingested: [], failures: [] };
 
   const pending = [...files];
@@ -363,6 +376,11 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
       delete info.currentFile;
       processedCount += 1;
       ingested.push(message.payload);
+      if (typeof onImageIngested === 'function') {
+        Promise.resolve(onImageIngested(message.payload)).catch((error) => {
+          console.warn(`⚠️  onImageIngested callback failed: ${error?.message ?? error}`);
+        });
+      }
       if (correlationRunner && iterationsPerIngest > 0) {
         correlationRunner.enqueue(iterationsPerIngest);
       }
@@ -543,15 +561,20 @@ async function findCandidateImages(db, probe) {
     ]
   );
 
-  const candidates = new Set();
-  for (const row of rows) {
-    const distance = euclideanDistance(
-      { ...probe, value_type: valueTypeId, resolution_level: probe.resolution_level, size: probe.size },
-      { value: row.value, rel_x: row.rel_x, rel_y: row.rel_y, size: row.size }
-    );
-    if (distance <= VALUE_THRESHOLD) candidates.add(row.image_id);
-  }
-  return [...candidates];
+  const targetFeature = {
+    value_type: valueTypeId,
+    resolution_level: probe.resolution_level,
+    value: probe.value ?? 0,
+    rel_x: probe.rel_x,
+    rel_y: probe.rel_y,
+    size: probe.size,
+  };
+  const { grouped } = collectElasticMatches(rows, targetFeature, {
+    baseThreshold: VALUE_THRESHOLD,
+    minUniqueImages: 1,
+    maxEntries: rows.length,
+  });
+  return [...grouped.keys()];
 }
 
 async function sampleRandomProbeSpec(db) {
@@ -790,40 +813,22 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, { top
     ]
   );
 
-  const grouped = new Map();
-  for (const row of rows) {
-    const candidateFeature = {
-      value_type: Number(row.value_type),
-      resolution_level: Number(row.resolution_level),
-      value: Number(row.value),
-      rel_x: Number(row.rel_x),
-      rel_y: Number(row.rel_y),
-      size: Number(row.size),
-    };
-    if (!Number.isFinite(candidateFeature.value)) continue;
-    const distance = euclideanDistance(targetFeature, candidateFeature);
-    if (!Number.isFinite(distance) || distance > VALUE_THRESHOLD) continue;
-
-    const candidateId = Number(row.image_id);
-    if (!grouped.has(candidateId)) {
-      grouped.set(candidateId, {
-        imageId: candidateId,
-        filename: row.original_filename,
-        features: [],
-      });
-    }
-    grouped.get(candidateId).features.push(candidateFeature);
-  }
+  const selection = collectElasticMatches(rows, targetFeature, {
+    baseThreshold: VALUE_THRESHOLD,
+    minUniqueImages: Math.max(1, Math.min(top, rows.length || 0)),
+    maxEntries: Math.max(32, top * 12),
+  });
 
   const scored = [];
-  for (const group of grouped.values()) {
+  for (const group of selection.grouped.values()) {
     const evaluation = scoreCandidateFeature(targetFeature, group.features);
     if (!evaluation) continue;
     scored.push({
       imageId: group.imageId,
-      filename: group.filename,
+      filename: group.label,
       score: Number(evaluation.score) || 0,
       metrics: evaluation.metrics ?? {},
+      distances: group.distances ?? [],
     });
   }
 
@@ -836,8 +841,14 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, { top
       filename: entry.filename,
       score: entry.score,
       affinity: Number(entry.metrics?.affinity) || 0,
-      spread: Number(entry.metrics?.spread) || 0,
+      cohesion: Number(entry.metrics?.cohesion) || 0,
+      density: Number(entry.metrics?.density) || 0,
+      stability: Number(entry.metrics?.stability) || 0,
       sampleSize: Number(entry.metrics?.sampleSize ?? entry.metrics?.originalCandidateCount ?? 0) || 0,
+      distanceMean:
+        entry.distances && entry.distances.length > 0
+          ? entry.distances.reduce((acc, val) => acc + val, 0) / entry.distances.length
+          : null,
     });
     if (matches.length >= top) break;
   }
@@ -850,8 +861,14 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, { top
         filename: selfEntry.filename,
         score: selfEntry.score,
         affinity: Number(selfEntry.metrics?.affinity) || 0,
-        spread: Number(selfEntry.metrics?.spread) || 0,
+        cohesion: Number(selfEntry.metrics?.cohesion) || 0,
+        density: Number(selfEntry.metrics?.density) || 0,
+        stability: Number(selfEntry.metrics?.stability) || 0,
         sampleSize: Number(selfEntry.metrics?.sampleSize ?? selfEntry.metrics?.originalCandidateCount ?? 0) || 0,
+        distanceMean:
+          selfEntry.distances && selfEntry.distances.length > 0
+            ? selfEntry.distances.reduce((acc, val) => acc + val, 0) / selfEntry.distances.length
+            : null,
       });
     }
   }
@@ -862,7 +879,149 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, { top
     spec,
     matches,
     totalMatches: scored.length,
+    relaxations: selection.relaxations,
+    thresholdUsed: selection.thresholdUsed,
   };
+}
+
+class TrainingSelfEvaluator {
+  constructor(config = {}) {
+    this.enabled = Boolean(config.enabled);
+    this.maxSamples = Math.max(0, Number(config.maxSamples ?? 0));
+    if (this.maxSamples <= 0) this.enabled = false;
+    this.runsPerFilter = Math.max(1, Number(config.runsPerFilter ?? 1));
+    this.topMatches = Math.max(1, Number(config.topMatches ?? 1));
+    const filterList = Array.isArray(config.filters) && config.filters.length > 0
+      ? config.filters
+      : ['original'];
+    this.filterConfigs = resolveEvaluationFilters(filterList);
+    if (this.filterConfigs.length === 0) {
+      this.filterConfigs = resolveEvaluationFilters(['original']);
+    }
+    this.queue = [];
+    this.running = false;
+    this.completed = 0;
+    this.db = null;
+  }
+
+  async ensureDb() {
+    if (!this.db) {
+      this.db = await createDbConnection();
+    }
+  }
+
+  enqueue(payload) {
+    if (!this.enabled) return;
+    if (this.completed >= this.maxSamples) return;
+    if (!payload || !payload.file || !payload.imageId) return;
+    this.queue.push({ file: payload.file, imageId: payload.imageId });
+    if (!this.running) {
+      void this.process();
+    }
+  }
+
+  async process() {
+    if (this.running || !this.enabled) return;
+    this.running = true;
+    try {
+      await this.ensureDb();
+      while (this.queue.length > 0 && this.completed < this.maxSamples) {
+        const item = this.queue.shift();
+        if (!item) continue;
+        await this.evaluateOne(item);
+        this.completed += 1;
+      }
+    } catch (error) {
+      console.warn(`⚠️  Self-evaluation pipeline failed: ${error?.message ?? error}`);
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async evaluateOne({ file, imageId }) {
+    if (!this.db) return;
+    const baseName = path.basename(file);
+    console.log(`   ↗ Self-evaluating ${baseName} (image_id=${imageId})`);
+    const usedSpecKeys = new Set();
+    for (const filter of this.filterConfigs) {
+      for (let runIndex = 0; runIndex < this.runsPerFilter; runIndex += 1) {
+        let summary;
+        try {
+          summary = await evaluateFilterRun(this.db, file, imageId, filter, runIndex, {
+            top: this.topMatches,
+            usedSpecKeys,
+          });
+        } catch (error) {
+          console.warn(
+            `      ↳ [self] ${filter.label} run ${runIndex + 1}: failed (${error?.message ?? 'unknown error'})`
+          );
+          continue;
+        }
+        this.logSummary(filter, runIndex, summary, imageId);
+      }
+    }
+  }
+
+  logSummary(filter, runIndex, summary, imageId) {
+    const runLabel = this.runsPerFilter > 1 ? `run ${runIndex + 1}` : 'run';
+    if (!summary || summary.status === 'ERROR') {
+      console.warn(
+        `      ↳ [self] ${filter.label} ${runLabel}: error (${summary?.error?.message ?? 'unknown'})`
+      );
+      return;
+    }
+    if (summary.status === 'NO_PROBE') {
+      console.log(`      ↳ [self] ${filter.label} ${runLabel}: unable to create probe.`);
+      return;
+    }
+    if (summary.status === 'NO_VECTOR') {
+      console.log(`      ↳ [self] ${filter.label} ${runLabel}: descriptor yielded no vector.`);
+      return;
+    }
+    if (!summary.matches || summary.matches.length === 0) {
+      const note =
+        summary.relaxations && summary.relaxations > 0
+          ? `relaxed ${summary.relaxations}× → ${Number(summary.thresholdUsed ?? VALUE_THRESHOLD).toFixed(4)}`
+          : 'no matches';
+      console.log(`      ↳ [self] ${filter.label} ${runLabel}: ${note}.`);
+      return;
+    }
+
+    const best = summary.matches[0];
+    const bestLabel = best
+      ? `${best.filename || `image#${best.imageId}`} (score ${best.score.toFixed(4)})`
+      : '—';
+    const selfRank =
+      summary.matches.findIndex((entry) => entry.imageId === imageId) + 1;
+    const selfNote =
+      selfRank > 0 ? `self rank ${selfRank}` : 'self missing';
+    const relaxNote =
+      summary.relaxations && summary.relaxations > 0
+        ? `relaxed ${summary.relaxations}× → ${Number(summary.thresholdUsed ?? VALUE_THRESHOLD).toFixed(4)}`
+        : 'threshold stable';
+
+    console.log(
+      `      ↳ [self] ${filter.label} ${runLabel}: best ${bestLabel}; ${selfNote}; ${relaxNote}`
+    );
+  }
+
+  async drain() {
+    if (!this.enabled) return;
+    while (this.running || this.queue.length > 0) {
+      await sleep(120);
+    }
+  }
+
+  async dispose() {
+    if (this.db) {
+      try {
+        await this.db.end();
+      } catch {
+        // ignore close errors
+      }
+      this.db = null;
+    }
+  }
 }
 
 async function evaluateDataset(dir, options) {
@@ -939,24 +1098,33 @@ async function evaluateDataset(dir, options) {
 
           totalRuns += 1;
           const descriptorKey = result.spec?.descriptorKey ?? '(unknown)';
+          const relaxedNote =
+            result.relaxations && result.relaxations > 0
+              ? ` after relaxing threshold ${result.relaxations}× → ${Number(result.thresholdUsed ?? VALUE_THRESHOLD).toFixed(4)}`
+              : '';
+
           if (!result.matches || result.matches.length === 0) {
             console.log(
-              `      ↳ ${runLabel}: descriptor ${descriptorKey} produced no matches within threshold.`
+              `      ↳ ${runLabel}: descriptor ${descriptorKey} produced no matches${relaxedNote || ' within threshold'}.`
             );
             continue;
           }
 
           const candidatesLabel = `${result.matches.length}/${result.totalMatches}`;
           console.log(
-            `      ↳ ${runLabel}: descriptor ${descriptorKey} (matches ${candidatesLabel})`
+            `      ↳ ${runLabel}: descriptor ${descriptorKey} (matches ${candidatesLabel}${relaxedNote})`
           );
 
           result.matches.forEach((match, idx) => {
             const rank = idx + 1;
             const label = match.filename || `image#${match.imageId}`;
             const marker = match.imageId === record.imageId ? ' (self)' : '';
+            const distanceLabel =
+              match.distanceMean !== null && match.distanceMean !== undefined
+                ? ` | distance ${match.distanceMean.toFixed(4)}`
+                : '';
             console.log(
-              `         ${rank}. ${label}${marker} | score ${match.score.toFixed(4)} | affinity ${match.affinity.toFixed(4)} | spread ${match.spread.toFixed(4)} | sample ${match.sampleSize}`
+              `         ${rank}. ${label}${marker} | score ${match.score.toFixed(4)} | affinity ${match.affinity.toFixed(4)} | cohesion ${match.cohesion.toFixed(4)} | sample ${match.sampleSize}${distanceLabel}`
             );
           });
 
@@ -1030,13 +1198,32 @@ async function main() {
     console.log('⚙️  Using adaptive worker pool for ingestion (auto threads).');
   }
 
+  const selfEvalConfig = settings.training.selfEvaluation ?? {};
+  const selfEvaluator = new TrainingSelfEvaluator({
+    enabled: selfEvalConfig.enabled,
+    maxSamples: selfEvalConfig.maxSamples,
+    runsPerFilter: selfEvalConfig.runsPerFilter,
+    topMatches: selfEvalConfig.topMatches,
+    filters: selfEvalConfig.filters,
+  });
+  if (selfEvaluator.enabled) {
+    console.log(
+      `🔍 Training self-evaluation enabled (up to ${selfEvaluator.maxSamples} sample(s), top ${selfEvaluator.topMatches})`
+    );
+  }
+
   const ingestionStartedAt = Date.now();
   const { ingested, failures } = await ingestFilesConcurrently(
     files,
-    { iterationsPerIngest: correlationIterations, maxThreads },
+    {
+      iterationsPerIngest: correlationIterations,
+      maxThreads,
+      onImageIngested: (payload) => selfEvaluator.enqueue(payload),
+    },
     correlationRunner
   );
   const ingestionDurationMs = Date.now() - ingestionStartedAt;
+  await selfEvaluator.drain();
   const successCount = ingested.length;
   const failureCount = failures.length;
   const processedCount = successCount + failureCount;
@@ -1089,16 +1276,16 @@ async function main() {
         (acc, metric) => {
           acc.score += metric.score;
           acc.affinity += metric.affinity;
-          acc.spread += metric.spread;
+          acc.cohesion += metric.cohesion ?? 0;
           acc.sampleSize += metric.sampleSize;
           acc.count += 1;
           return acc;
         },
-        { score: 0, affinity: 0, spread: 0, sampleSize: 0, count: 0 }
+        { score: 0, affinity: 0, cohesion: 0, sampleSize: 0, count: 0 }
       );
       if (totals.count > 0) {
         console.log(
-          `\n🧪 Online correlation results across ${totals.count} discriminator(s): avg score ${(totals.score / totals.count).toFixed(4)}, affinity ${(totals.affinity / totals.count).toFixed(4)}, spread ${(totals.spread / totals.count).toFixed(4)}, sample size ${(totals.sampleSize / totals.count).toFixed(1)}`
+          `\n🧪 Online correlation results across ${totals.count} discriminator(s): avg score ${(totals.score / totals.count).toFixed(4)}, affinity ${(totals.affinity / totals.count).toFixed(4)}, cohesion ${(totals.cohesion / totals.count).toFixed(4)}, sample size ${(totals.sampleSize / totals.count).toFixed(1)}`
         );
       }
     }
@@ -1148,6 +1335,8 @@ async function main() {
       await db.end();
     }
   }
+
+  await selfEvaluator.dispose();
 }
 
 main().catch((err) => {

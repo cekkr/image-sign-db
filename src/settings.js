@@ -24,6 +24,16 @@ function getBoolean(envKey, fallback) {
   return fallback;
 }
 
+function getStringList(envKey, fallback = []) {
+  const raw = process.env[envKey];
+  if (raw === undefined || raw === null || raw === '') return [...fallback];
+  const list = String(raw)
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return list.length > 0 ? list : [...fallback];
+}
+
 const settings = {
   client: {
     apiBaseUrl: process.env.API_BASE_URL || 'http://localhost:3000',
@@ -44,8 +54,11 @@ const settings = {
   correlation: {
     similarityThreshold: getNumber('CORRELATION_SIMILARITY_THRESHOLD', 0.2),
     maxCandidateSample: getNumber('CORRELATION_MAX_CANDIDATE_SAMPLE', 256),
-    minAffinity: getNumber('CORRELATION_MIN_AFFINITY', 0.05),
-    minSpread: getNumber('CORRELATION_MIN_SPREAD', 0.002),
+    minAffinity: getNumber('CORRELATION_MIN_AFFINITY', 0.45),
+    minCohesion: getNumber(
+      'CORRELATION_MIN_COHESION',
+      getNumber('CORRELATION_MIN_SPREAD', 0.25)
+    ),
     onlineRunnerMaxBatchSize: getNumber('ONLINE_RUNNER_MAX_BATCH_SIZE', 6),
     onlineRunnerMaxBatchSizeCap: getNumber('ONLINE_RUNNER_MAX_BATCH_SIZE_CAP', 12),
   },
@@ -59,6 +72,13 @@ const settings = {
     },
     resourceSampleIntervalMs: getNumber('RESOURCE_SAMPLE_INTERVAL_MS', 2500),
     bootstrapCommandDefaultIterations: getNumber('BOOTSTRAP_COMMAND_DEFAULT_ITERATIONS', 75),
+    selfEvaluation: {
+      enabled: getBoolean('TRAINING_SELF_EVAL_ENABLED', true),
+      maxSamples: getNumber('TRAINING_SELF_EVAL_MAX_SAMPLES', 8),
+      runsPerFilter: getNumber('TRAINING_SELF_EVAL_RUNS', 1),
+      topMatches: getNumber('TRAINING_SELF_EVAL_TOP', 3),
+      filters: getStringList('TRAINING_SELF_EVAL_FILTERS', ['original']),
+    },
   },
 };
 

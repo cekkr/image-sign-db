@@ -1,8 +1,8 @@
 const settings = require('../settings');
 
 const MAX_CANDIDATE_SAMPLE = Math.max(1, settings.correlation.maxCandidateSample);
-const MIN_AFFINITY = Math.max(0, settings.correlation.minAffinity);
-const MIN_SPREAD = Math.max(0, settings.correlation.minSpread);
+const MIN_AFFINITY = Math.max(0, Math.min(1, settings.correlation.minAffinity));
+const MIN_COHESION = Math.max(0, Math.min(1, settings.correlation.minCohesion ?? settings.correlation.minSpread ?? 0));
 
 function buildFeatureVector(feature) {
     return [
@@ -97,12 +97,18 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
     const meanCosine = cosineValues.reduce((acc, val) => acc + val, 0) / cosineValues.length;
     const meanPearson = pearsonValues.reduce((acc, val) => acc + val, 0) / pearsonValues.length;
 
-    const affinity = Math.max(0, (1 - (meanCosine || 0)) + (1 - (meanPearson || 0)));
-    const spread = Math.max(0, (meanDistance || 0) + (stdDistance || 0));
-    if (affinity < MIN_AFFINITY || spread < MIN_SPREAD) return null;
+    const normalizedCosine = (meanCosine + 1) / 2;
+    const normalizedPearson = (meanPearson + 1) / 2;
+    const affinity = Math.max(0, Math.min(1, (normalizedCosine + normalizedPearson) / 2));
 
-    const costPenalty = Math.log1p(sampled.length);
-    const separationScore = (spread * affinity) / Math.max(costPenalty, 1);
+    const density = 1 / (1 + Math.max(meanDistance, 0));
+    const stability = 1 / (1 + Math.max(stdDistance, 0));
+    const cohesion = Math.max(0, Math.min(1, (density + stability) / 2));
+    if (affinity < MIN_AFFINITY || cohesion < MIN_COHESION) return null;
+
+    const sampleSize = sampled.length;
+    const coverage = 1 + Math.log1p(sampleSize);
+    const separationScore = affinity * cohesion * coverage;
 
     return {
         score: separationScore,
@@ -111,10 +117,12 @@ function scoreCandidateFeature(targetFeature, candidateFeatures) {
             stdDistance,
             meanCosine,
             meanPearson,
-            sampleSize: sampled.length,
+            sampleSize,
             originalCandidateCount: candidateFeatures.length,
             affinity,
-            spread,
+            cohesion,
+            density,
+            stability,
         },
     };
 }
@@ -126,5 +134,5 @@ module.exports = {
     scoreCandidateFeature,
     MAX_CANDIDATE_SAMPLE,
     MIN_AFFINITY,
-    MIN_SPREAD,
+    MIN_COHESION,
 };

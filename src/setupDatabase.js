@@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS skip_patterns (
     descriptor_json JSON,
     skip_count BIGINT DEFAULT 0,
     last_used TIMESTAMP NULL
-) ENGINE=InnoDB;`;
+) ENGINE=InnoDB COMMENT='Negative patterns to avoid reusing weak descriptors';`;
 
 const createSystemSettingsTableSQL = `
 CREATE TABLE IF NOT EXISTS system_settings (
@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS knowledge_nodes (
     FOREIGN KEY (vector_1_id) REFERENCES feature_vectors(vector_id) ON DELETE CASCADE,
     FOREIGN KEY (vector_2_id) REFERENCES feature_vectors(vector_id) ON DELETE SET NULL,
     UNIQUE KEY uq_vector_relation (node_type, vector_1_id, vector_2_id, vector_length, vector_angle)
-) ENGINE=InnoDB;`;
+) ENGINE=InnoDB COMMENT='Constellation (pattern) nodes that record cooperative feature geometry';`;
 
 const createFeatureGroupStatsTableSQL = `
 CREATE TABLE IF NOT EXISTS feature_group_stats (
@@ -101,7 +101,7 @@ CREATE TABLE IF NOT EXISTS feature_group_stats (
         value_type,
         resolution_level
     )
-) ENGINE=InnoDB;`;
+) ENGINE=InnoDB COMMENT='Aggregate constellation metrics per descriptor and resolution';`;
 
 // --- MAIN EXECUTION LOGIC ---
 async function setupDatabase() {

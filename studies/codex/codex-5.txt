@@ -10,3 +10,55 @@ Tests not run (no automated suite provided). Suggested next steps:
 
 Run the above --evaluate command against a trained dataset to validate outputs.
 Review affinity summaries to decide if additional filters or tuning are needed.
+
+# Affinity elasticity
+
+Improved the similarity scoring, added elastic candidate selection, and wired training-time self-evaluation so the pipeline immediately surfaces how well each image can be rediscovered.
+
+Reworked descriptor scoring to use affinity/cohesion with dynamic coverage so perfect matches no longer get filtered out and thresholds are configurable (src/lib/correlationMetrics.js:3, src/settings.js:55).
+Introduced an elastic matcher and applied it across ingestion, evaluation, and the HTTP search path to relax thresholds on demand, capture distance stats, and log when the system has to stretch (src/lib/elasticMatcher.js:20, src/train.js:540, src/index.js:179, src/train.js:1101).
+Added a queued self-evaluator that replays the evaluation probes for the first few ingests, reporting best match, self rank, and relaxed thresholds alongside training output (src/train.js:887, src/train.js:1201, src/train.js:1339).
+Clarified “pattern vs. constellation” both in docs and via table comments so the schema now distinguishes positive patterns, constellations, and skip lists (README.md:45, README.md:176, src/setupDatabase.js:35).
+Tests: node --check src/train.js; node --check src/index.js; node --check src/lib/elasticMatcher.js
+
+Next steps:
+
+Run a short node src/train.js <dataset> ingest and watch the new self-evaluation logs to confirm the original image ranks near the top.
+Follow up with --evaluate to verify the reported affinity/cohesion stats align with your expectations on a larger sample.
+8 files changed
++440
+-86
+
+
+README.md
++10
+-0
+
+index.js
++26
+-20
+
+insert.js
++1
+-1
+
+correlationMetrics.js
++18
+-10
+
+elasticMatcher.js
++121
+-0
+
+settings.js
++22
+-2
+
+setupDatabase.js
++3
+-3
+
+train.js
++239
+-50
+
