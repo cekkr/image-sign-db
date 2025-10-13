@@ -52,35 +52,40 @@ async function ensureValueTypeId(dbConnection, descriptor, cache) {
     const descriptorKey = createDescriptorKey(descriptor);
     if (cache.has(descriptorKey)) return cache.get(descriptorKey);
 
-    async function selectExisting() {
-        const [rows] = await dbConnection.execute(
-            'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
-            [descriptorKey]
-        );
-        if (rows.length > 0) {
-            cache.set(descriptorKey, rows[0].value_type_id);
-            return rows[0].value_type_id;
-        }
-        return null;
-    }
-
-    const existingId = await selectExisting();
-    if (existingId) return existingId;
+    const payload = serializeDescriptor(descriptor);
+    const insertSql = `
+        INSERT INTO value_types (descriptor_hash, descriptor_json)
+        VALUES (?, ?)
+        ON DUPLICATE KEY UPDATE
+            descriptor_json = VALUES(descriptor_json),
+            value_type_id = LAST_INSERT_ID(value_type_id)
+    `;
 
     try {
-        const [result] = await dbConnection.execute(
-            'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
-            [descriptorKey, serializeDescriptor(descriptor)]
-        );
-        cache.set(descriptorKey, result.insertId);
-        return result.insertId;
+        const [result] = await dbConnection.execute(insertSql, [descriptorKey, payload]);
+        const resolvedId = Number(result.insertId);
+        if (Number.isFinite(resolvedId) && resolvedId > 0) {
+            cache.set(descriptorKey, resolvedId);
+            return resolvedId;
+        }
     } catch (error) {
-        if (error?.code === 'ER_DUP_ENTRY') {
-            const duplicateId = await selectExisting();
-            if (duplicateId) return duplicateId;
+        if (error?.code !== 'ER_LOCK_DEADLOCK' && error?.code !== 'ER_LOCK_WAIT_TIMEOUT') {
+            console.warn(`⚠️  Failed to upsert value type ${descriptorKey}: ${error?.message ?? error}`);
         }
         throw error;
     }
+
+    const [rows] = await dbConnection.execute(
+        'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
+        [descriptorKey]
+    );
+    if (rows.length > 0) {
+        const existingId = rows[0].value_type_id;
+        cache.set(descriptorKey, existingId);
+        return existingId;
+    }
+
+    throw new Error(`Unable to resolve value type for descriptor hash ${descriptorKey}`);
 }
 
 async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTypeCache) {
@@ -164,7 +169,8 @@ async function storeFeatures(imagePath, featureBatches) {
                 }
             }
             if (RETRYABLE_TRANSACTION_ERRORS.has(error?.code) && attempt < MAX_TRANSACTION_RETRIES) {
-                const delay = TRANSACTION_RETRY_BASE_MS * attempt;
+                const jitter = Math.floor(Math.random() * TRANSACTION_RETRY_BASE_MS);
+                const delay = TRANSACTION_RETRY_BASE_MS * attempt + jitter;
                 console.warn(
                     `   ↻ Retrying ingestion for ${path.basename(imagePath)} after ${error.code} (attempt ${attempt}/${MAX_TRANSACTION_RETRIES})`
                 );

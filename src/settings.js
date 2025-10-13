@@ -34,52 +34,77 @@ function getStringList(envKey, fallback = []) {
   return list.length > 0 ? list : [...fallback];
 }
 
-const settings = {
-  client: {
-    apiBaseUrl: process.env.API_BASE_URL || 'http://localhost:3000',
-    maxIterations: getNumber('CLIENT_MAX_ITERATIONS', 10),
+const clientSettings = {
+  apiBaseUrl: process.env.API_BASE_URL || 'http://localhost:3000',
+  maxIterations: getNumber('CLIENT_MAX_ITERATIONS', 10),
+};
+
+const serverSettings = {
+  port: getNumber('PORT', 3000),
+};
+
+const searchSettings = {
+  valueThreshold: getNumber('VALUE_THRESHOLD', 0.08),
+  skipThreshold: getNumber('SKIP_THRESHOLD', 3),
+  maxCliIterations: getNumber('CLI_MAX_ITERATIONS', 12),
+};
+
+const databaseSettings = {
+  schema: process.env.DB_NAME || 'image_hypercube_db',
+  defaultMaxSizeGb: getNumber('DEFAULT_MAX_DB_SIZE_GB', 10),
+};
+
+const correlationSettings = {
+  similarityThreshold: getNumber('CORRELATION_SIMILARITY_THRESHOLD', 0.2),
+  maxCandidateSample: getNumber('CORRELATION_MAX_CANDIDATE_SAMPLE', 256),
+  minAffinity: getNumber('CORRELATION_MIN_AFFINITY', 0.45),
+  minCohesion: getNumber(
+    'CORRELATION_MIN_COHESION',
+    getNumber('CORRELATION_MIN_SPREAD', 0.25)
+  ),
+  onlineRunnerMaxBatchSize: getNumber('ONLINE_RUNNER_MAX_BATCH_SIZE', 6),
+  onlineRunnerMaxBatchSizeCap: getNumber('ONLINE_RUNNER_MAX_BATCH_SIZE_CAP', 12),
+};
+
+const trainingSettings = {
+  defaults: {
+    discover: getNumber('DEFAULT_DISCOVER_ITERATIONS', 3),
+    bootstrap: getNumber('DEFAULT_BOOTSTRAP_ITERATIONS', 0),
+    reprobe: getNumber('DEFAULT_REPROBE_COUNT', 0),
+    shuffle: getBoolean('DEFAULT_SHUFFLE', true),
+    threads: getOptionalNumber('DEFAULT_THREADS'),
   },
-  server: {
-    port: getNumber('PORT', 3000),
+  resourceSampleIntervalMs: getNumber('RESOURCE_SAMPLE_INTERVAL_MS', 2500),
+  bootstrapCommandDefaultIterations: getNumber('BOOTSTRAP_COMMAND_DEFAULT_ITERATIONS', 75),
+  selfEvaluation: {
+    enabled: getBoolean('TRAINING_SELF_EVAL_ENABLED', true),
+    maxSamples: getNumber('TRAINING_SELF_EVAL_MAX_SAMPLES', 8),
+    runsPerFilter: getNumber('TRAINING_SELF_EVAL_RUNS', 1),
+    topMatches: getNumber('TRAINING_SELF_EVAL_TOP', 3),
+    filters: getStringList('TRAINING_SELF_EVAL_FILTERS', ['original']),
   },
-  search: {
-    valueThreshold: getNumber('VALUE_THRESHOLD', 0.08),
-    skipThreshold: getNumber('SKIP_THRESHOLD', 3),
-    maxCliIterations: getNumber('CLI_MAX_ITERATIONS', 12),
-  },
-  database: {
-    schema: process.env.DB_NAME || 'image_hypercube_db',
-    defaultMaxSizeGb: getNumber('DEFAULT_MAX_DB_SIZE_GB', 10),
-  },
-  correlation: {
-    similarityThreshold: getNumber('CORRELATION_SIMILARITY_THRESHOLD', 0.2),
-    maxCandidateSample: getNumber('CORRELATION_MAX_CANDIDATE_SAMPLE', 256),
-    minAffinity: getNumber('CORRELATION_MIN_AFFINITY', 0.45),
-    minCohesion: getNumber(
-      'CORRELATION_MIN_COHESION',
-      getNumber('CORRELATION_MIN_SPREAD', 0.25)
+  realTimePruning: {
+    enabled: getBoolean('TRAINING_REALTIME_PRUNING_ENABLED', true),
+    intervalMs: getNumber('TRAINING_REALTIME_PRUNING_INTERVAL_MS', 60000),
+    minIngests: getNumber('TRAINING_REALTIME_PRUNING_MIN_INGESTS', 24),
+    batchSize: getNumber('TRAINING_REALTIME_PRUNING_BATCH_SIZE', 24),
+    vectorBatchSize: getNumber('TRAINING_REALTIME_PRUNING_VECTOR_BATCH', 400),
+    minSkipCount: getNumber(
+      'TRAINING_REALTIME_PRUNING_MIN_SKIP',
+      Math.max(searchSettings.skipThreshold, 4)
     ),
-    onlineRunnerMaxBatchSize: getNumber('ONLINE_RUNNER_MAX_BATCH_SIZE', 6),
-    onlineRunnerMaxBatchSizeCap: getNumber('ONLINE_RUNNER_MAX_BATCH_SIZE_CAP', 12),
+    minGroupAgeMinutes: getNumber('TRAINING_REALTIME_PRUNING_MIN_GROUP_AGE_MINUTES', 45),
+    maxGroupHitCount: getNumber('TRAINING_REALTIME_PRUNING_MAX_GROUP_HIT_COUNT', 1),
   },
-  training: {
-    defaults: {
-      discover: getNumber('DEFAULT_DISCOVER_ITERATIONS', 3),
-      bootstrap: getNumber('DEFAULT_BOOTSTRAP_ITERATIONS', 0),
-      reprobe: getNumber('DEFAULT_REPROBE_COUNT', 0),
-      shuffle: getBoolean('DEFAULT_SHUFFLE', true),
-      threads: getOptionalNumber('DEFAULT_THREADS'),
-    },
-    resourceSampleIntervalMs: getNumber('RESOURCE_SAMPLE_INTERVAL_MS', 2500),
-    bootstrapCommandDefaultIterations: getNumber('BOOTSTRAP_COMMAND_DEFAULT_ITERATIONS', 75),
-    selfEvaluation: {
-      enabled: getBoolean('TRAINING_SELF_EVAL_ENABLED', true),
-      maxSamples: getNumber('TRAINING_SELF_EVAL_MAX_SAMPLES', 8),
-      runsPerFilter: getNumber('TRAINING_SELF_EVAL_RUNS', 1),
-      topMatches: getNumber('TRAINING_SELF_EVAL_TOP', 3),
-      filters: getStringList('TRAINING_SELF_EVAL_FILTERS', ['original']),
-    },
-  },
+};
+
+const settings = {
+  client: clientSettings,
+  server: serverSettings,
+  search: searchSettings,
+  database: databaseSettings,
+  correlation: correlationSettings,
+  training: trainingSettings,
 };
 
 module.exports = settings;

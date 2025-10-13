@@ -23,6 +23,7 @@ const {
   ensureValueTypeRecord,
   evaluateFilterRun,
 } = require('./evaluate');
+const RealTimePruner = require('./lib/realTimePruner');
 
 let cliProgress;
 try {
@@ -914,131 +915,152 @@ async function main() {
     );
   }
 
-  const ingestionStartedAt = Date.now();
-  const { ingested, failures } = await ingestFilesConcurrently(
-    files,
-    {
-      iterationsPerIngest: correlationIterations,
-      maxThreads,
-      onImageIngested: (payload) => selfEvaluator.enqueue(payload),
-    },
-    correlationRunner
-  );
-  const ingestionDurationMs = Date.now() - ingestionStartedAt;
-  await selfEvaluator.drain();
-  const successCount = ingested.length;
-  const failureCount = failures.length;
-  const processedCount = successCount + failureCount;
-  const totalFeatures = ingested.reduce((acc, item) => acc + (item?.featureCount ?? 0), 0);
-  const avgFeatures = successCount > 0 ? totalFeatures / successCount : 0;
-  const recentExamples = ingested.slice(-3).map((entry) => {
-    const imageLabel = path.basename(entry.file ?? '');
-    return `${imageLabel || '(unknown)'}#${entry.imageId ?? '?'}`;
-  });
-  const failureReasons = failureCount
-    ? [...failures.reduce((acc, failure) => {
-        const reason = failure?.message ?? 'unknown error';
-        acc.set(reason, (acc.get(reason) ?? 0) + 1);
-        return acc;
-      }, new Map())]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 3)
-    : [];
+  const prunerConfig = {
+    ...(settings.training.realTimePruning || {}),
+    skipThresholdOverride: settings.search.skipThreshold,
+  };
+  const realTimePruner = new RealTimePruner(prunerConfig);
 
-  console.log('\n📊 Ingestion summary:');
-  console.log(
-    `   • Processed ${processedCount}/${files.length} file(s) in ${(ingestionDurationMs / 1000).toFixed(1)}s`
-  );
-  console.log(`   • Stored ${successCount} image(s); ${failureCount} failure(s)`);
-  if (successCount > 0) {
-    console.log(`   • Total feature vectors: ${totalFeatures}`);
-    console.log(`   • Avg vectors per image: ${avgFeatures.toFixed(1)}`);
-    if (recentExamples.length > 0) {
-      console.log(`   • Recent ingests: ${recentExamples.join(', ')}`);
-    }
-  }
-  if (failureReasons.length > 0) {
-    console.log('   • Failure highlights:');
-    for (const [reason, count] of failureReasons) {
-      console.log(`       - ${reason} (${count})`);
-    }
-  }
+  let ingested = [];
+  let failures = [];
+  let ingestionDurationMs = 0;
 
-  if (failures && failures.length > 0) {
-    console.warn(`⚠️  ${failures.length} file(s) failed during ingestion.`);
-    for (const failure of failures) {
-      console.warn(`   ↳ ${failure.file ?? 'unknown'} :: ${failure.message ?? 'unknown error'}`);
-    }
-  }
-
-  if (correlationRunner) {
-    await correlationRunner.drain();
-    if (correlationRunner.history.length > 0) {
-      const totals = correlationRunner.history.reduce(
-        (acc, metric) => {
-          acc.score += metric.score;
-          acc.affinity += metric.affinity;
-          acc.cohesion += metric.cohesion ?? 0;
-          acc.sampleSize += metric.sampleSize;
-          acc.count += 1;
-          return acc;
+  try {
+    const ingestionStartedAt = Date.now();
+    const ingestionResult = await ingestFilesConcurrently(
+      files,
+      {
+        iterationsPerIngest: correlationIterations,
+        maxThreads,
+        onImageIngested: (payload) => {
+          selfEvaluator.enqueue(payload);
+          realTimePruner.onImageIngested(payload);
         },
-        { score: 0, affinity: 0, cohesion: 0, sampleSize: 0, count: 0 }
-      );
-      if (totals.count > 0) {
-        console.log(
-          `\n🧪 Online correlation results across ${totals.count} discriminator(s): avg score ${(totals.score / totals.count).toFixed(4)}, affinity ${(totals.affinity / totals.count).toFixed(4)}, cohesion ${(totals.cohesion / totals.count).toFixed(4)}, sample size ${(totals.sampleSize / totals.count).toFixed(1)}`
-        );
+      },
+      correlationRunner
+    );
+    ingested = ingestionResult?.ingested ?? [];
+    failures = ingestionResult?.failures ?? [];
+    ingestionDurationMs = Date.now() - ingestionStartedAt;
+
+    await selfEvaluator.drain();
+    await realTimePruner.flush();
+
+    const successCount = ingested.length;
+    const failureCount = failures.length;
+    const processedCount = successCount + failureCount;
+    const totalFeatures = ingested.reduce((acc, item) => acc + (item?.featureCount ?? 0), 0);
+    const avgFeatures = successCount > 0 ? totalFeatures / successCount : 0;
+    const recentExamples = ingested.slice(-3).map((entry) => {
+      const imageLabel = path.basename(entry.file ?? '');
+      return `${imageLabel || '(unknown)'}#${entry.imageId ?? '?'}`;
+    });
+    const failureReasons = failureCount
+      ? [...failures.reduce((acc, failure) => {
+          const reason = failure?.message ?? 'unknown error';
+          acc.set(reason, (acc.get(reason) ?? 0) + 1);
+          return acc;
+        }, new Map())]
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 3)
+      : [];
+
+    console.log('\n📊 Ingestion summary:');
+    console.log(
+      `   • Processed ${processedCount}/${files.length} file(s) in ${(ingestionDurationMs / 1000).toFixed(1)}s`
+    );
+    console.log(`   • Stored ${successCount} image(s); ${failureCount} failure(s)`);
+    if (successCount > 0) {
+      console.log(`   • Total feature vectors: ${totalFeatures}`);
+      console.log(`   • Avg vectors per image: ${avgFeatures.toFixed(1)}`);
+      if (recentExamples.length > 0) {
+        console.log(`   • Recent ingests: ${recentExamples.join(', ')}`);
       }
     }
-  }
+    if (failureReasons.length > 0) {
+      console.log('   • Failure highlights:');
+      for (const [reason, count] of failureReasons) {
+        console.log(`       - ${reason} (${count})`);
+      }
+    }
 
-  if (options.bootstrap && options.bootstrap > 0) {
-    await bootstrapCorrelations(options.bootstrap);
-  }
+    if (failures && failures.length > 0) {
+      console.warn(`⚠️  ${failures.length} file(s) failed during ingestion.`);
+      for (const failure of failures) {
+        console.warn(`   ↳ ${failure.file ?? 'unknown'} :: ${failure.message ?? 'unknown error'}`);
+      }
+    }
 
-  const reprobeN = Math.min(options.reprobe || 0, ingested.length);
-  if (reprobeN > 0) {
-    console.log(`\n🧪 Re-probing ${reprobeN} random image(s) to measure retrieval efficiency...`);
-    const sample = [...ingested].sort(() => Math.random() - 0.5).slice(0, reprobeN);
-    const db = await createDbConnection();
-    try {
-      let okCount = 0;
-      let totalInitial = 0;
-      let totalSteps = 0;
-      let totalAccuracyScore = 0;
-      for (const item of sample) {
-        const result = await reprobeOne(db, item.file, item.imageId);
-        const imageLabel = path.basename(item.file);
-        const statusLabel = result.ok ? 'hit' : 'miss';
-        console.log(
-          `   • ${imageLabel}: ${statusLabel} after ${result.steps} step(s) (candidates ${result.initial} → ${result.remainingCount})`
+    if (correlationRunner) {
+      await correlationRunner.drain();
+      if (correlationRunner.history.length > 0) {
+        const totals = correlationRunner.history.reduce(
+          (acc, metric) => {
+            acc.score += metric.score;
+            acc.affinity += metric.affinity;
+            acc.cohesion += metric.cohesion ?? 0;
+            acc.sampleSize += metric.sampleSize;
+            acc.count += 1;
+            return acc;
+          },
+          { score: 0, affinity: 0, cohesion: 0, sampleSize: 0, count: 0 }
         );
-        if (!result.ok && result.path && result.path.length > 0) {
-          const lastStep = result.path[result.path.length - 1];
+        if (totals.count > 0) {
           console.log(
-            `     ↳ last probe ${lastStep.descriptorKey} accuracy ${(lastStep.accuracyScore ?? 0).toFixed(6)} (cumulative ${(lastStep.cumulativeAccuracy ?? 0).toFixed(6)})`
+            `\n🧪 Online correlation results across ${totals.count} discriminator(s): avg score ${(totals.score / totals.count).toFixed(4)}, affinity ${(totals.affinity / totals.count).toFixed(4)}, cohesion ${(totals.cohesion / totals.count).toFixed(4)}, sample size ${(totals.sampleSize / totals.count).toFixed(1)}`
           );
         }
-        if (result.ok) okCount += 1;
-        totalInitial += result.initial || 0;
-        totalSteps += result.steps || 0;
-        if (result.path && result.path.length > 0) {
-          totalAccuracyScore += result.path[result.path.length - 1].cumulativeAccuracy ?? 0;
-        }
       }
-      console.log(`   ✔️ Success rate: ${(100 * okCount / reprobeN).toFixed(1)}% (${okCount}/${reprobeN})`);
-      console.log(`   ⓘ Avg initial candidates: ${(totalInitial / reprobeN).toFixed(2)}`);
-      console.log(`   ⓘ Avg refinement steps: ${(totalSteps / reprobeN).toFixed(2)}`);
-      if (totalAccuracyScore > 0) {
-        console.log(`   ✨ Avg constellation accuracy: ${(totalAccuracyScore / reprobeN).toFixed(6)}`);
-      }
-    } finally {
-      await db.end();
     }
-  }
 
-  await selfEvaluator.dispose();
+    if (options.bootstrap && options.bootstrap > 0) {
+      await bootstrapCorrelations(options.bootstrap);
+    }
+
+    const reprobeN = Math.min(options.reprobe || 0, ingested.length);
+    if (reprobeN > 0) {
+      console.log(`\n🧪 Re-probing ${reprobeN} random image(s) to measure retrieval efficiency...`);
+      const sample = [...ingested].sort(() => Math.random() - 0.5).slice(0, reprobeN);
+      const db = await createDbConnection();
+      try {
+        let okCount = 0;
+        let totalInitial = 0;
+        let totalSteps = 0;
+        let totalAccuracyScore = 0;
+        for (const item of sample) {
+          const result = await reprobeOne(db, item.file, item.imageId);
+          const imageLabel = path.basename(item.file);
+          const statusLabel = result.ok ? 'hit' : 'miss';
+          console.log(
+            `   • ${imageLabel}: ${statusLabel} after ${result.steps} step(s) (candidates ${result.initial} → ${result.remainingCount})`
+          );
+          if (!result.ok && result.path && result.path.length > 0) {
+            const lastStep = result.path[result.path.length - 1];
+            console.log(
+              `     ↳ last probe ${lastStep.descriptorKey} accuracy ${(lastStep.accuracyScore ?? 0).toFixed(6)} (cumulative ${(lastStep.cumulativeAccuracy ?? 0).toFixed(6)})`
+            );
+          }
+          if (result.ok) okCount += 1;
+          totalInitial += result.initial || 0;
+          totalSteps += result.steps || 0;
+          if (result.path && result.path.length > 0) {
+            totalAccuracyScore += result.path[result.path.length - 1].cumulativeAccuracy ?? 0;
+          }
+        }
+        console.log(`   ✔️ Success rate: ${(100 * okCount / reprobeN).toFixed(1)}% (${okCount}/${reprobeN})`);
+        console.log(`   ⓘ Avg initial candidates: ${(totalInitial / reprobeN).toFixed(2)}`);
+        console.log(`   ⓘ Avg refinement steps: ${(totalSteps / reprobeN).toFixed(2)}`);
+        if (totalAccuracyScore > 0) {
+          console.log(`   ✨ Avg constellation accuracy: ${(totalAccuracyScore / reprobeN).toFixed(6)}`);
+        }
+      } finally {
+        await db.end();
+      }
+    }
+  } finally {
+    await realTimePruner.dispose();
+    await selfEvaluator.dispose();
+  }
 }
 
 main().catch((err) => {
