@@ -18,6 +18,14 @@ const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('.
 const { extendConstellationPath, descriptorToSpec } = require('./lib/constellation');
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 
+let cliProgress;
+try {
+  // Optional dependency for richer progress reporting.
+  cliProgress = require('cli-progress');
+} catch {
+  cliProgress = null;
+}
+
 // --- HELPERS ---
 
 const VALUE_THRESHOLD = settings.search.valueThreshold;
@@ -233,6 +241,27 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
   let closed = false;
   let resolveFn;
 
+  const progressBar =
+    cliProgress && process.stdout.isTTY && files.length > 0
+      ? new cliProgress.SingleBar(
+          {
+            format: '   ↻ ingesting {value}/{total} | active {active} | queue {pending} | workers {workers} | eta {eta_formatted}',
+            hideCursor: true,
+            etaBuffer: 20,
+          },
+          cliProgress.Presets.shades_classic
+        )
+      : null;
+
+  function updateProgress() {
+    if (!progressBar) return;
+    progressBar.update(processedCount, {
+      active: activeWorkers,
+      pending: pending.length,
+      workers: workers.size,
+    });
+  }
+
   const resultPromise = new Promise((resolve) => {
     resolveFn = resolve;
   });
@@ -256,6 +285,7 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
       type: 'ingest',
       payload: { file, discoverIterations: 0 },
     });
+    updateProgress();
   }
 
   async function terminateWorker(info) {
@@ -273,6 +303,10 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
     if (pending.length === 0 && activeWorkers === 0) {
       closed = true;
       clearInterval(monitor);
+      if (progressBar) {
+        updateProgress();
+        progressBar.stop();
+      }
       Promise.all([...workers].map((info) => info.worker.terminate().catch(() => {})))
         .then(() => resolveFn({ ingested, failures }))
         .catch((error) => resolveFn({ ingested, failures, error }));
@@ -290,23 +324,29 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
       if (correlationRunner && iterationsPerIngest > 0) {
         correlationRunner.enqueue(iterationsPerIngest);
       }
-      if (processedCount % 10 === 0 || processedCount === files.length) {
+      if (
+        !progressBar &&
+        (processedCount % 10 === 0 || processedCount === files.length)
+      ) {
         console.log(
           `   ↳ Progress: ${processedCount}/${files.length} image(s) ingested (workers ${workers.size}, queue ${pending.length})`
         );
       }
       assignWork(info);
+      updateProgress();
       maybeComplete();
     } else if (message.type === 'error') {
       activeWorkers = Math.max(0, activeWorkers - 1);
       info.busy = false;
       const failedFile = message.payload?.file ?? info.currentFile;
       delete info.currentFile;
+      processedCount += 1;
       failures.push(message.payload ?? { message: 'Unknown worker error' });
       console.warn(
         `⚠️  Worker failed to ingest ${failedFile ?? 'unknown file'}: ${message.payload?.message ?? 'error'}`
       );
       assignWork(info);
+      updateProgress();
       maybeComplete();
     }
   }
@@ -316,9 +356,11 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
     info.busy = false;
     const failedFile = info.currentFile;
     delete info.currentFile;
+    processedCount += 1;
     failures.push({ file: failedFile, message: error?.message ?? 'Worker crashed' });
     console.warn(`⚠️  Worker ${info.id} crashed: ${error?.message ?? 'unknown error'}`);
     terminateWorker(info).finally(() => {
+      updateProgress();
       maybeComplete();
     });
   }
@@ -364,10 +406,18 @@ async function ingestFilesConcurrently(files, { iterationsPerIngest = 0, maxThre
       assignWork(info);
     }
 
+    updateProgress();
     maybeComplete();
   }
 
   const monitor = setInterval(rebalance, RESOURCE_SAMPLE_INTERVAL_MS);
+  if (progressBar) {
+    progressBar.start(files.length, 0, {
+      active: activeWorkers,
+      pending: pending.length,
+      workers: workers.size,
+    });
+  }
   rebalance();
 
   return resultPromise;
@@ -564,11 +614,50 @@ async function main() {
     console.log('⚙️  Using adaptive worker pool for ingestion (auto threads).');
   }
 
+  const ingestionStartedAt = Date.now();
   const { ingested, failures } = await ingestFilesConcurrently(
     files,
     { iterationsPerIngest: correlationIterations, maxThreads },
     correlationRunner
   );
+  const ingestionDurationMs = Date.now() - ingestionStartedAt;
+  const successCount = ingested.length;
+  const failureCount = failures.length;
+  const processedCount = successCount + failureCount;
+  const totalFeatures = ingested.reduce((acc, item) => acc + (item?.featureCount ?? 0), 0);
+  const avgFeatures = successCount > 0 ? totalFeatures / successCount : 0;
+  const recentExamples = ingested.slice(-3).map((entry) => {
+    const imageLabel = path.basename(entry.file ?? '');
+    return `${imageLabel || '(unknown)'}#${entry.imageId ?? '?'}`;
+  });
+  const failureReasons = failureCount
+    ? [...failures.reduce((acc, failure) => {
+        const reason = failure?.message ?? 'unknown error';
+        acc.set(reason, (acc.get(reason) ?? 0) + 1);
+        return acc;
+      }, new Map())]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3)
+    : [];
+
+  console.log('\n📊 Ingestion summary:');
+  console.log(
+    `   • Processed ${processedCount}/${files.length} file(s) in ${(ingestionDurationMs / 1000).toFixed(1)}s`
+  );
+  console.log(`   • Stored ${successCount} image(s); ${failureCount} failure(s)`);
+  if (successCount > 0) {
+    console.log(`   • Total feature vectors: ${totalFeatures}`);
+    console.log(`   • Avg vectors per image: ${avgFeatures.toFixed(1)}`);
+    if (recentExamples.length > 0) {
+      console.log(`   • Recent ingests: ${recentExamples.join(', ')}`);
+    }
+  }
+  if (failureReasons.length > 0) {
+    console.log('   • Failure highlights:');
+    for (const [reason, count] of failureReasons) {
+      console.log(`       - ${reason} (${count})`);
+    }
+  }
 
   if (failures && failures.length > 0) {
     console.warn(`⚠️  ${failures.length} file(s) failed during ingestion.`);

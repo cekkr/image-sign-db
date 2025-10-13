@@ -11,6 +11,22 @@ const { generateAllFeaturesForAugmentation, generateSpecificVector } = require('
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
 const { createDescriptorKey, serializeDescriptor } = require('./lib/descriptor');
 
+const MAX_TRANSACTION_RETRIES = parseRetryEnv(process.env.DB_TRANSACTION_MAX_RETRIES, 3);
+const TRANSACTION_RETRY_BASE_MS = parseRetryEnv(process.env.DB_TRANSACTION_RETRY_BASE_MS, 75);
+const RETRYABLE_TRANSACTION_ERRORS = new Set(['ER_LOCK_DEADLOCK', 'ER_LOCK_WAIT_TIMEOUT']);
+
+function parseRetryEnv(rawValue, fallback) {
+    const parsed = Number.parseInt(rawValue ?? '', 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    return fallback;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
+
 // --- FEATURE EXTRACTION HELPERS ---
 
 async function collectFeaturesForAugmentations(originalImage, imagePath, augmentations = AUGMENTATION_ORDER) {
@@ -35,20 +51,36 @@ async function collectFeaturesForAugmentations(originalImage, imagePath, augment
 async function ensureValueTypeId(dbConnection, descriptor, cache) {
     const descriptorKey = createDescriptorKey(descriptor);
     if (cache.has(descriptorKey)) return cache.get(descriptorKey);
-    const [rows] = await dbConnection.execute(
-        'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
-        [descriptorKey]
-    );
-    if (rows.length > 0) {
-        cache.set(descriptorKey, rows[0].value_type_id);
-        return rows[0].value_type_id;
+
+    async function selectExisting() {
+        const [rows] = await dbConnection.execute(
+            'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
+            [descriptorKey]
+        );
+        if (rows.length > 0) {
+            cache.set(descriptorKey, rows[0].value_type_id);
+            return rows[0].value_type_id;
+        }
+        return null;
     }
-    const [result] = await dbConnection.execute(
-        'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
-        [descriptorKey, serializeDescriptor(descriptor)]
-    );
-    cache.set(descriptorKey, result.insertId);
-    return result.insertId;
+
+    const existingId = await selectExisting();
+    if (existingId) return existingId;
+
+    try {
+        const [result] = await dbConnection.execute(
+            'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
+            [descriptorKey, serializeDescriptor(descriptor)]
+        );
+        cache.set(descriptorKey, result.insertId);
+        return result.insertId;
+    } catch (error) {
+        if (error?.code === 'ER_DUP_ENTRY') {
+            const duplicateId = await selectExisting();
+            if (duplicateId) return duplicateId;
+        }
+        throw error;
+    }
 }
 
 async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTypeCache) {
@@ -93,37 +125,65 @@ async function persistFeatureBatch(dbConnection, imageId, featureBatch, valueTyp
 }
 
 async function storeFeatures(imagePath, featureBatches) {
-    let connection;
-    try {
-        connection = await mysql.createConnection({
-            host: process.env.DB_HOST,
-            user: process.env.DB_USER,
-            password: process.env.DB_PASSWORD,
-            database: process.env.DB_NAME,
-        });
+    let attempt = 0;
+    let lastError;
+    const featureCount = featureBatches.reduce((acc, batch) => acc + batch.allFeatures.length, 0);
 
-        await connection.beginTransaction();
-        const [imageResult] = await connection.execute(
-            'INSERT INTO images (original_filename) VALUES (?)',
-            [path.basename(imagePath)]
-        );
-        const imageId = imageResult.insertId;
+    while (attempt < MAX_TRANSACTION_RETRIES) {
+        attempt += 1;
+        let connection;
+        try {
+            connection = await mysql.createConnection({
+                host: process.env.DB_HOST,
+                user: process.env.DB_USER,
+                password: process.env.DB_PASSWORD,
+                database: process.env.DB_NAME,
+            });
 
-        const valueTypeCache = new Map();
-        for (const batch of featureBatches) {
-            await persistFeatureBatch(connection, imageId, batch, valueTypeCache);
-        }
+            await connection.beginTransaction();
+            const [imageResult] = await connection.execute(
+                'INSERT INTO images (original_filename) VALUES (?)',
+                [path.basename(imagePath)]
+            );
+            const imageId = imageResult.insertId;
 
-        await connection.commit();
-        return { imageId, featureCount: featureBatches.reduce((acc, batch) => acc + batch.allFeatures.length, 0) };
-    } catch (error) {
-        if (connection) await connection.rollback();
-        throw error;
-    } finally {
-        if (connection) {
-            await connection.end();
+            const valueTypeCache = new Map();
+            for (const batch of featureBatches) {
+                await persistFeatureBatch(connection, imageId, batch, valueTypeCache);
+            }
+
+            await connection.commit();
+            return { imageId, featureCount };
+        } catch (error) {
+            lastError = error;
+            if (connection) {
+                try {
+                    await connection.rollback();
+                } catch {
+                    // rollback best effort
+                }
+            }
+            if (RETRYABLE_TRANSACTION_ERRORS.has(error?.code) && attempt < MAX_TRANSACTION_RETRIES) {
+                const delay = TRANSACTION_RETRY_BASE_MS * attempt;
+                console.warn(
+                    `   ↻ Retrying ingestion for ${path.basename(imagePath)} after ${error.code} (attempt ${attempt}/${MAX_TRANSACTION_RETRIES})`
+                );
+                await sleep(delay);
+                continue;
+            }
+            throw error;
+        } finally {
+            if (connection) {
+                try {
+                    await connection.end();
+                } catch {
+                    // ignore end errors
+                }
+            }
         }
     }
+
+    throw lastError;
 }
 
 async function extractFeatures(imagePath, augmentations = AUGMENTATION_ORDER) {
