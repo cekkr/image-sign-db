@@ -2,6 +2,8 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 
+const settings = require("./settings.js")
+
 // --- SQL DEFINITIONS ---
 const dbName = process.env.DB_NAME || 'image_hypercube_db';
 
@@ -152,7 +154,7 @@ async function setupDatabase() {
         await connection.query(createSystemSettingsTableSQL);
         console.log("    ✅ Table 'system_settings' is ready.");
         await connection.query(
-            `INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES ('max_db_size_gb', '4')`
+            `INSERT IGNORE INTO system_settings (setting_key, setting_value) VALUES ('max_db_size_gb', '${settings.database.defaultMaxSizeGb}')`
         );
 
         console.log("\n🎉 Database setup completed successfully with the new schema!");
