@@ -39,7 +39,7 @@ const settings = {
   },
   database: {
     schema: process.env.DB_NAME || 'image_hypercube_db',
-    defaultMaxSizeGb: getNumber('DEFAULT_MAX_DB_SIZE_GB', 4),
+    defaultMaxSizeGb: getNumber('DEFAULT_MAX_DB_SIZE_GB', 10),
   },
   correlation: {
     similarityThreshold: getNumber('CORRELATION_SIMILARITY_THRESHOLD', 0.2),
