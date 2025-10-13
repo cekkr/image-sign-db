@@ -9,14 +9,15 @@ require('dotenv').config();
 
 // --- INTERNAL MODULES ---
 const { bootstrapCorrelations } = require('./insert');
-const { generateSpecificVector } = require('./featureExtractor');
+const { generateSpecificVector, AUGMENTATION_ORDER } = require('./featureExtractor');
 const settings = require('./settings');
 const { createDbConnection, discoverCorrelations } = require('./lib/knowledge');
 const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
-const { euclideanDistance } = require('./lib/correlationMetrics');
+const { euclideanDistance, scoreCandidateFeature } = require('./lib/correlationMetrics');
 const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
 const { extendConstellationPath, descriptorToSpec } = require('./lib/constellation');
 const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
+const { createSeededRandom } = require('./lib/augmentations');
 
 let cliProgress;
 try {
@@ -36,6 +37,22 @@ const TRAINING_DEFAULT_OPTIONS = {
   shuffle: settings.training.defaults.shuffle,
   threads: settings.training.defaults.threads,
 };
+const EVALUATION_DEFAULT_OPTIONS = {
+  runs: 3,
+  top: 5,
+  filters: ['original', 'gaussian_blur', 'cropping'],
+};
+const SUPPORTED_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
+const KNOWN_AUGMENTATIONS = new Set(AUGMENTATION_ORDER);
+const EVALUATION_FILTER_ALIASES = new Map([
+  ['mirror', 'mirror_horizontal'],
+  ['mirror-h', 'mirror_horizontal'],
+  ['mirror-horizontal', 'mirror_horizontal'],
+  ['mirror_v', 'mirror_vertical'],
+  ['mirror-v', 'mirror_vertical'],
+  ['mirror-vertical', 'mirror_vertical'],
+  ['blur', 'gaussian_blur'],
+]);
 const WORKER_SCRIPT = path.resolve(__dirname, 'workers/ingestWorker.js');
 const RESOURCE_SAMPLE_INTERVAL_MS = settings.training.resourceSampleIntervalMs;
 
@@ -54,17 +71,42 @@ async function* walkDir(dir, exts) {
 
 function parseArgs(argv) {
   const args = argv.slice(2);
-  const options = { ...TRAINING_DEFAULT_OPTIONS };
+  const options = {
+    ...TRAINING_DEFAULT_OPTIONS,
+    evaluate: false,
+    evaluateRuns: EVALUATION_DEFAULT_OPTIONS.runs,
+    evaluateTop: EVALUATION_DEFAULT_OPTIONS.top,
+    evaluateFilters: [...EVALUATION_DEFAULT_OPTIONS.filters],
+  };
   const positional = [];
   for (const token of args) {
     if (token.startsWith('--')) {
       const [k, v] = token.slice(2).split('=');
       const key = k.trim();
       const val = v === undefined ? true : v;
-      if (key === 'discover' || key === 'bootstrap' || key === 'reprobe') options[key] = Number(val) || 0;
-      else if (key === 'shuffle') options.shuffle = val !== 'false';
-      else if (key === 'pattern') options.pattern = String(val);
-      else if (key === 'threads') options.threads = Number(val) || 0;
+      if (key === 'discover' || key === 'bootstrap' || key === 'reprobe') {
+        options[key] = Number(val) || 0;
+      } else if (key === 'shuffle') {
+        options.shuffle = val !== 'false';
+      } else if (key === 'pattern') {
+        options.pattern = String(val);
+      } else if (key === 'threads') {
+        options.threads = Number(val) || 0;
+      } else if (key === 'evaluate') {
+        options.evaluate = val !== 'false';
+      } else if (key === 'evaluate-runs' || key === 'evaluateRuns') {
+        const runs = Number(val);
+        if (Number.isFinite(runs) && runs > 0) options.evaluateRuns = Math.floor(runs);
+      } else if (key === 'evaluate-top' || key === 'evaluateTop') {
+        const top = Number(val);
+        if (Number.isFinite(top) && top > 0) options.evaluateTop = Math.floor(top);
+      } else if (key === 'evaluate-filters' || key === 'evaluateFilters') {
+        const filters = String(val)
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter(Boolean);
+        if (filters.length > 0) options.evaluateFilters = filters;
+      }
     } else {
       positional.push(token);
     }
@@ -581,16 +623,390 @@ async function reprobeOne(db, imagePath, imageId, options = {}) {
   return { ok, initial, steps: constellationPath.length, path: constellationPath, remainingCount };
 }
 
+function resolveEvaluationFilters(rawFilters = []) {
+  if (!Array.isArray(rawFilters)) return [];
+  const resolved = [];
+  const seen = new Set();
+  for (const raw of rawFilters) {
+    if (typeof raw !== 'string') continue;
+    const normalized = raw.trim();
+    if (!normalized) continue;
+    const lower = normalized.toLowerCase();
+    let config = null;
+    if (lower === 'cropping' || lower === 'crop' || lower === 'center_crop') {
+      config = {
+        name: 'cropping',
+        label: 'cropping',
+        augmentation: 'original',
+        transformFactory({ imagePath, runIndex }) {
+          return createCroppingTransform(imagePath, runIndex, 'cropping');
+        },
+      };
+    } else {
+      const augmentation = EVALUATION_FILTER_ALIASES.get(lower) ?? normalized;
+      if (!KNOWN_AUGMENTATIONS.has(augmentation)) continue;
+      config = {
+        name: normalized,
+        label: augmentation,
+        augmentation,
+      };
+    }
+    const dedupeKey = `${config.label}:${config.augmentation}:${Boolean(config.transformFactory)}`;
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    resolved.push(config);
+  }
+  return resolved;
+}
+
+function createCroppingTransform(imagePath, runIndex = 0, variant = 'cropping') {
+  const rng = createSeededRandom(`${variant}:${imagePath}:${runIndex}`);
+  return async (image) => {
+    const meta = await image.metadata();
+    const width = Number(meta.width) || 0;
+    const height = Number(meta.height) || 0;
+    if (!width || !height) return image;
+
+    const ratio = 0.55 + rng() * 0.9;
+    if (ratio <= 1) {
+      const cropWidth = Math.max(1, Math.round(width * ratio));
+      const cropHeight = Math.max(1, Math.round(height * ratio));
+      const maxLeft = Math.max(0, width - cropWidth);
+      const maxTop = Math.max(0, height - cropHeight);
+      const left = Math.floor(rng() * (maxLeft + 1));
+      const top = Math.floor(rng() * (maxTop + 1));
+      return image
+        .extract({ left, top, width: cropWidth, height: cropHeight })
+        .resize(width, height, { fit: 'cover' });
+    }
+
+    const scale = Math.min(ratio, 1.45);
+    const paddedWidth = Math.max(width, Math.round(width * scale));
+    const paddedHeight = Math.max(height, Math.round(height * scale));
+    const leftPad = Math.floor((paddedWidth - width) / 2);
+    const rightPad = paddedWidth - width - leftPad;
+    const topPad = Math.floor((paddedHeight - height) / 2);
+    const bottomPad = paddedHeight - height - topPad;
+
+    return image
+      .extend({
+        top: topPad,
+        bottom: bottomPad,
+        left: leftPad,
+        right: rightPad,
+        background: { r: 0, g: 0, b: 0, alpha: 0 },
+      })
+      .resize(width, height, { fit: 'cover' });
+  };
+}
+
+async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, { top, usedSpecKeys }) {
+  const dedupeSet = usedSpecKeys ?? null;
+  const attempted = new Set();
+  let spec = null;
+  let fallback = null;
+  const maxAttempts = 12;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const candidate = normalizeProbeSpec({ augmentation: filter.augmentation });
+    if (!candidate) continue;
+    const dedupeKey = `${candidate.descriptorKey}:${candidate.resolution_level}:${candidate.pos_x}:${candidate.pos_y}`;
+    if (attempted.has(dedupeKey)) continue;
+    attempted.add(dedupeKey);
+    if (!fallback) fallback = candidate;
+    if (dedupeSet && dedupeSet.has(dedupeKey)) continue;
+    spec = candidate;
+    if (dedupeSet) dedupeSet.add(dedupeKey);
+    break;
+  }
+  if (!spec && fallback) {
+    spec = fallback;
+    if (dedupeSet) {
+      const fallbackKey = `${spec.descriptorKey}:${spec.resolution_level}:${spec.pos_x}:${spec.pos_y}`;
+      dedupeSet.add(fallbackKey);
+    }
+  }
+  if (!spec) {
+    return { status: 'NO_PROBE', filter };
+  }
+
+  let imageTransform = null;
+  if (typeof filter.transformFactory === 'function') {
+    imageTransform = filter.transformFactory({
+      imagePath,
+      imageId,
+      runIndex,
+      descriptorKey: spec.descriptorKey,
+      filter,
+    });
+  }
+
+  let vector;
+  try {
+    vector = await generateSpecificVector(
+      imagePath,
+      spec,
+      imageTransform ? { imageTransform } : undefined
+    );
+  } catch (error) {
+    return { status: 'ERROR', filter, spec, error };
+  }
+
+  if (!vector) {
+    return { status: 'NO_VECTOR', filter, spec };
+  }
+
+  const valueTypeRecord = await ensureValueTypeRecord(db, spec.descriptor);
+  const targetFeature = {
+    value_type: valueTypeRecord.id,
+    resolution_level: spec.resolution_level,
+    pos_x: spec.pos_x,
+    pos_y: spec.pos_y,
+    rel_x: spec.rel_x,
+    rel_y: spec.rel_y,
+    size: spec.size,
+    value: vector.value,
+  };
+
+  const tolerance = CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE;
+  const [rows] = await db.execute(
+    `SELECT fv.image_id, fv.value, fv.rel_x, fv.rel_y, fv.size, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, img.original_filename
+     FROM feature_vectors fv
+     JOIN images img ON img.image_id = fv.image_id
+     WHERE fv.value_type = ?
+       AND fv.resolution_level = ?
+       AND fv.pos_x = ?
+       AND fv.pos_y = ?
+       AND ABS(fv.rel_x - ?) <= ?
+       AND ABS(fv.rel_y - ?) <= ?`,
+    [
+      targetFeature.value_type,
+      targetFeature.resolution_level,
+      targetFeature.pos_x,
+      targetFeature.pos_y,
+      spec.rel_x,
+      tolerance,
+      spec.rel_y,
+      tolerance,
+    ]
+  );
+
+  const grouped = new Map();
+  for (const row of rows) {
+    const candidateFeature = {
+      value_type: Number(row.value_type),
+      resolution_level: Number(row.resolution_level),
+      value: Number(row.value),
+      rel_x: Number(row.rel_x),
+      rel_y: Number(row.rel_y),
+      size: Number(row.size),
+    };
+    if (!Number.isFinite(candidateFeature.value)) continue;
+    const distance = euclideanDistance(targetFeature, candidateFeature);
+    if (!Number.isFinite(distance) || distance > VALUE_THRESHOLD) continue;
+
+    const candidateId = Number(row.image_id);
+    if (!grouped.has(candidateId)) {
+      grouped.set(candidateId, {
+        imageId: candidateId,
+        filename: row.original_filename,
+        features: [],
+      });
+    }
+    grouped.get(candidateId).features.push(candidateFeature);
+  }
+
+  const scored = [];
+  for (const group of grouped.values()) {
+    const evaluation = scoreCandidateFeature(targetFeature, group.features);
+    if (!evaluation) continue;
+    scored.push({
+      imageId: group.imageId,
+      filename: group.filename,
+      score: Number(evaluation.score) || 0,
+      metrics: evaluation.metrics ?? {},
+    });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const matches = [];
+  for (const entry of scored) {
+    matches.push({
+      imageId: entry.imageId,
+      filename: entry.filename,
+      score: entry.score,
+      affinity: Number(entry.metrics?.affinity) || 0,
+      spread: Number(entry.metrics?.spread) || 0,
+      sampleSize: Number(entry.metrics?.sampleSize ?? entry.metrics?.originalCandidateCount ?? 0) || 0,
+    });
+    if (matches.length >= top) break;
+  }
+
+  if (imageId !== undefined && imageId !== null) {
+    const selfEntry = scored.find((entry) => entry.imageId === imageId);
+    if (selfEntry && !matches.some((entry) => entry.imageId === imageId)) {
+      matches.push({
+        imageId: selfEntry.imageId,
+        filename: selfEntry.filename,
+        score: selfEntry.score,
+        affinity: Number(selfEntry.metrics?.affinity) || 0,
+        spread: Number(selfEntry.metrics?.spread) || 0,
+        sampleSize: Number(selfEntry.metrics?.sampleSize ?? selfEntry.metrics?.originalCandidateCount ?? 0) || 0,
+      });
+    }
+  }
+
+  return {
+    status: 'OK',
+    filter,
+    spec,
+    matches,
+    totalMatches: scored.length,
+  };
+}
+
+async function evaluateDataset(dir, options) {
+  const filters = resolveEvaluationFilters(options.evaluateFilters);
+  if (filters.length === 0) {
+    filters.push({
+      name: 'original',
+      label: 'original',
+      augmentation: 'original',
+    });
+  }
+  const runsPerFilter = Math.max(1, Number(options.evaluateRuns) || EVALUATION_DEFAULT_OPTIONS.runs);
+  const topCount = Math.max(1, Number(options.evaluateTop) || EVALUATION_DEFAULT_OPTIONS.top);
+
+  const files = [];
+  for await (const file of walkDir(dir, SUPPORTED_IMAGE_EXTENSIONS)) files.push(file);
+  files.sort((a, b) => a.localeCompare(b));
+
+  console.log(
+    `🧪 Evaluating ${files.length} file(s) with filters: ${filters.map((f) => f.label).join(', ')}`
+  );
+
+  const db = await createDbConnection();
+  const filenameIndex = new Map();
+  try {
+    const [imageRows] = await db.execute('SELECT image_id, original_filename FROM images');
+    for (const row of imageRows) {
+      const key = String(row.original_filename || '').toLowerCase();
+      if (!key) continue;
+      filenameIndex.set(key, {
+        imageId: Number(row.image_id),
+        originalName: row.original_filename,
+      });
+    }
+
+    let totalRuns = 0;
+    let selfTopHits = 0;
+    const selfAffinitySamples = [];
+
+    for (const file of files) {
+      const baseName = path.basename(file);
+      const record = filenameIndex.get(baseName.toLowerCase());
+      if (!record) {
+        console.warn(`⚠️  Skipping ${baseName}: not present in the trained dataset.`);
+        continue;
+      }
+
+      console.log(`\n🖼️  Image ${baseName} (id=${record.imageId})`);
+      const usedSpecKeys = new Set();
+
+      for (const filter of filters) {
+        console.log(`   • Filter '${filter.label}'`);
+        for (let runIndex = 0; runIndex < runsPerFilter; runIndex += 1) {
+          const runLabel = runsPerFilter > 1 ? `run ${runIndex + 1}` : 'run';
+          const result = await evaluateFilterRun(db, file, record.imageId, filter, runIndex, {
+            top: topCount,
+            usedSpecKeys,
+          });
+
+          if (result.status === 'ERROR') {
+            console.warn(
+              `      ↳ ${runLabel}: failed (${result.error?.message ?? 'unknown error'})`
+            );
+            continue;
+          }
+          if (result.status === 'NO_PROBE') {
+            console.log(`      ↳ ${runLabel}: unable to create probe specification.`);
+            continue;
+          }
+          if (result.status === 'NO_VECTOR') {
+            console.log(`      ↳ ${runLabel}: probe descriptor ${result.spec?.descriptorKey} yielded no vector.`);
+            continue;
+          }
+
+          totalRuns += 1;
+          const descriptorKey = result.spec?.descriptorKey ?? '(unknown)';
+          if (!result.matches || result.matches.length === 0) {
+            console.log(
+              `      ↳ ${runLabel}: descriptor ${descriptorKey} produced no matches within threshold.`
+            );
+            continue;
+          }
+
+          const candidatesLabel = `${result.matches.length}/${result.totalMatches}`;
+          console.log(
+            `      ↳ ${runLabel}: descriptor ${descriptorKey} (matches ${candidatesLabel})`
+          );
+
+          result.matches.forEach((match, idx) => {
+            const rank = idx + 1;
+            const label = match.filename || `image#${match.imageId}`;
+            const marker = match.imageId === record.imageId ? ' (self)' : '';
+            console.log(
+              `         ${rank}. ${label}${marker} | score ${match.score.toFixed(4)} | affinity ${match.affinity.toFixed(4)} | spread ${match.spread.toFixed(4)} | sample ${match.sampleSize}`
+            );
+          });
+
+          const topMatch = result.matches[0];
+          if (topMatch && topMatch.imageId === record.imageId) {
+            selfTopHits += 1;
+          }
+          const selfEntry = result.matches.find((entry) => entry.imageId === record.imageId);
+          if (selfEntry) {
+            selfAffinitySamples.push(selfEntry.affinity);
+          }
+        }
+      }
+    }
+
+    if (totalRuns > 0) {
+      const avgAffinity =
+        selfAffinitySamples.length > 0
+          ? selfAffinitySamples.reduce((acc, val) => acc + val, 0) / selfAffinitySamples.length
+          : 0;
+      console.log(
+        `\n✅ Evaluation summary: ${selfTopHits}/${totalRuns} run(s) ranked the original image first.`
+      );
+      if (selfAffinitySamples.length > 0) {
+        console.log(
+          `   • Avg self affinity across matches: ${avgAffinity.toFixed(4)} (${selfAffinitySamples.length} sample(s))`
+        );
+      }
+    } else {
+      console.log('\n⚠️  Evaluation did not yield any comparable runs.');
+    }
+  } finally {
+    await db.end();
+  }
+}
+
 async function main() {
   const { dir, options } = parseArgs(process.argv);
   if (!dir) {
-    console.error('Usage: node src/train.js <dataset_dir> [--discover=3] [--bootstrap=100] [--reprobe=50] [--threads=4] [--shuffle=true]');
+    console.error('Usage: node src/train.js <dataset_dir> [--discover=3] [--bootstrap=100] [--reprobe=50] [--threads=4] [--shuffle=true] [--evaluate]');
     process.exit(1);
   }
 
-  const allowed = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
+  if (options.evaluate) {
+    await evaluateDataset(dir, options);
+    return;
+  }
+
   const files = [];
-  for await (const file of walkDir(dir, allowed)) files.push(file);
+  for await (const file of walkDir(dir, SUPPORTED_IMAGE_EXTENSIONS)) files.push(file);
   if (options.shuffle) files.sort(() => Math.random() - 0.5);
   console.log(`📚 Found ${files.length} file(s) to ingest.`);
 

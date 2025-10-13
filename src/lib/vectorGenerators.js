@@ -131,7 +131,7 @@ async function generateAllFeaturesForAugmentation(originalImage, imagePath, augm
     };
 }
 
-async function generateSpecificVector(imagePath, spec) {
+async function generateSpecificVector(imagePath, spec, options = {}) {
     const {
         augmentation = 'original',
         descriptor,
@@ -147,9 +147,16 @@ async function generateSpecificVector(imagePath, spec) {
     const channel = specChannel ?? descriptor?.channel;
     if (!channel) return null;
 
-    const originalImage = sharp(imagePath);
-    const baseMeta = await originalImage.metadata();
-    const augmentedImage = applyAugmentation(originalImage, augmentation, baseMeta, imagePath);
+    let workingImage = sharp(imagePath);
+    if (options && typeof options.imageTransform === 'function') {
+        const transformed = await options.imageTransform(workingImage.clone());
+        if (transformed && typeof transformed.metadata === 'function') {
+            workingImage = transformed;
+        }
+    }
+
+    const baseMeta = await workingImage.metadata();
+    const augmentedImage = applyAugmentation(workingImage, augmentation, baseMeta, imagePath);
     const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
 
     const baseParams = {

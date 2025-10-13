@@ -153,6 +153,9 @@ Create a folder (e.g., `training_dataset`) and fill it with the images you want 
     # Kick off training
     node src/train.js ./path/to/dataset --discover=15 --bootstrap=75 --reprobe=50
 
+    # Training check evaluation
+    node src/train.js <dataset_dir> --evaluate --evaluate-filters=original,cropping --evaluate-runs=3 --evaluate-top=5 prints per-image match tables plus a summary; adjust filters/runs/top as needed.
+
     # Repeat for every image in your dataset
     node src/insert.js add path/to/training_dataset/image1.jpg --discover=15
     node src/insert.js add path/to/training_dataset/image2.png
