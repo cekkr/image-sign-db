@@ -122,6 +122,8 @@ The project is divided into several standalone scripts that interact via the cen
 
 *   `src/clientAPI.js`: A simple command-line client that demonstrates how to interact with the Express server's secure API and now prints the correlation metrics that guided each follow-up question.
     
+*   `src/evaluate.js`: Shared evaluation helpers (normalising probe specs, running filter passes, building cropping transforms) so that training, self-evaluation, and HTTP search reuse the same matching logic without copy/paste.
+
 *   `src/testCorrelations.js`: Utility script to seed and inspect `feature_group_stats` with synthetic sample data.
 
 *   `src/lib/storageManager.js`: Utility helpers for descriptor hashing, vector usage tracking, skip-pattern bookkeeping, and automatic pruning based on `system_settings`.

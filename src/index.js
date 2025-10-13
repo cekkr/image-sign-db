@@ -6,12 +6,12 @@ require('dotenv').config();
 const settings = require('./settings');
 const { generateSpecificVector } = require('./featureExtractor');
 const { collectElasticMatches } = require('./lib/elasticMatcher');
-const { createDescriptorKey, serializeDescriptor, parseDescriptor } = require('./lib/descriptor');
+const { createDescriptorKey, parseDescriptor } = require('./lib/descriptor');
 const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
 const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
 const { recordVectorUsage, saveSkipPattern } = require('./lib/storageManager');
 const { extendConstellationPath, createRandomConstellationSpec, descriptorToSpec } = require('./lib/constellation');
-const { resolveDefaultProbeSpec } = require('./lib/vectorSpecs');
+const { normalizeProbeSpec, ensureValueTypeRecord: ensureValueTypeRecordBase } = require('./evaluate');
 
 // --- CONFIGURATION ---
 const SERVER_PORT = settings.server.port;
@@ -66,71 +66,18 @@ async function connectToDatabase() {
     return dbConnection;
 }
 
-function normalizeProbeSpec(spec = {}) {
-    const resolved = resolveDefaultProbeSpec(spec.descriptor ? { ...spec, random: false } : spec);
-    if (!resolved) return null;
-
-    const normalized = {
-        ...resolved,
-    };
-
-    normalized.rel_x = normalized.rel_x ?? normalized.offset_x ?? 0;
-    normalized.rel_y = normalized.rel_y ?? normalized.offset_y ?? 0;
-    normalized.size = normalized.size ?? normalized.span ?? 0;
-    normalized.anchor_u = normalized.anchor_u ?? 0.5;
-    normalized.anchor_v = normalized.anchor_v ?? 0.5;
-    normalized.sampleId = normalized.sampleId ?? normalized.sample_id ?? normalized.descriptor?.sample_id ?? 0;
-    normalized.augmentation = normalized.augmentation ?? normalized.descriptor?.augmentation ?? 'original';
-    normalized.channel = normalized.channel ?? normalized.descriptor?.channel ?? CHANNEL_DIMENSIONS[0];
-    normalized.span = normalized.size ?? normalized.span ?? 0.05;
-    normalized.offset_x = normalized.offset_x ?? normalized.rel_x;
-    normalized.offset_y = normalized.offset_y ?? normalized.rel_y;
-
-    normalized.pos_x = Math.round(normalized.anchor_u * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
-    normalized.pos_y = Math.round(normalized.anchor_v * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
-    normalized.resolution_level = Math.max(
-        0,
-        Math.min(255, Math.round(normalized.size * CONSTELLATION_CONSTANTS.SPAN_SCALE)),
-    );
-
-    normalized.descriptor = {
-        family: 'delta',
-        channel: normalized.channel,
-        augmentation: normalized.augmentation,
-        sample_id: normalized.sampleId,
-        anchor_u: Number(normalized.anchor_u.toFixed(6)),
-        anchor_v: Number(normalized.anchor_v.toFixed(6)),
-        span: Number(normalized.size.toFixed(6)),
-        offset_x: Number(normalized.offset_x.toFixed(6)),
-        offset_y: Number(normalized.offset_y.toFixed(6)),
-    };
-    normalized.descriptorKey = createDescriptorKey(normalized.descriptor);
-
-    return normalized;
-}
-
 async function ensureValueTypeRecord(db, descriptor) {
     const descriptorKey = createDescriptorKey(descriptor);
     if (descriptorCache.has(descriptorKey)) return descriptorCache.get(descriptorKey);
 
-    const [rows] = await db.execute(
-        'SELECT value_type_id, descriptor_json FROM value_types WHERE descriptor_hash = ?',
-        [descriptorKey]
-    );
-    if (rows.length > 0) {
-        const parsed = parseDescriptor(rows[0].descriptor_json) || descriptor;
-        const record = { id: rows[0].value_type_id, descriptor: parsed, descriptorKey };
-        descriptorCache.set(descriptorKey, record);
-        return record;
-    }
-
-    const [result] = await db.execute(
-        'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
-        [descriptorKey, serializeDescriptor(descriptor)]
-    );
-    const record = { id: result.insertId, descriptor, descriptorKey };
-    descriptorCache.set(descriptorKey, record);
-    return record;
+    const record = await ensureValueTypeRecordBase(db, descriptor);
+    const enriched = {
+        id: record.id,
+        descriptor,
+        descriptorKey: record.descriptorKey ?? descriptorKey,
+    };
+    descriptorCache.set(enriched.descriptorKey, enriched);
+    return enriched;
 }
 
 function rowToFeature(row) {
