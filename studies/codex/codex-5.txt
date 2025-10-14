@@ -62,3 +62,13 @@ train.js
 +239
 -50
 
+# Fixed error "Out of range value for column 'value_type_id' at row 1"
+
+Updates
+
+Added a schema guard that inspects value_types, feature_vectors, and feature_group_stats and upgrades their value_type columns to MEDIUMINT UNSIGNED before ingestion begins, eliminating the recurring overflow (src/lib/schema.js:1).
+Wired that guard into the training entry point so the schema is checked once per session and any upgrades are reported up front (src/train.js:27, src/train.js:880).
+Ensured the insert.js add CLI path applies the same guard, keeping manual ingests consistent with the training workflow (src/insert.js:13, src/insert.js:123).
+Notes
+
+I couldn’t run a live verification without access to your MySQL instance; please rerun node src/train.js … (or the insert.js add command you use) so the guard can upgrade the columns and confirm the ingestion errors disappear.

@@ -10,6 +10,7 @@ const { extractAndStoreFeatures } = require('./featureExtractor');
 const settings = require('./settings');
 const { discoverCorrelations, createDbConnection } = require('./lib/knowledge');
 const { ensureStorageCapacity } = require('./lib/storageManager');
+const { ensureValueTypeCapacity } = require('./lib/schema');
 
 const DB_SCHEMA = settings.database.schema;
 
@@ -119,6 +120,7 @@ async function handleAddCommand(positional, options) {
     }
 
     const discoverIterations = Number.parseInt(options.discover ?? '0', 10);
+    await ensureValueTypeCapacity();
     await ingestImage(imagePath, discoverIterations);
 }
 

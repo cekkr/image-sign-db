@@ -24,6 +24,7 @@ const {
   evaluateFilterRun,
 } = require('./evaluate');
 const RealTimePruner = require('./lib/realTimePruner');
+const { ensureValueTypeCapacity } = require('./lib/schema');
 
 let cliProgress;
 try {
@@ -874,6 +875,16 @@ async function main() {
   if (options.evaluate) {
     await evaluateDataset(dir, options);
     return;
+  }
+
+  let upgradedColumns = [];
+  try {
+    upgradedColumns = await ensureValueTypeCapacity();
+  } catch (error) {
+    throw new Error(`Unable to prepare database schema: ${error?.message ?? error}`);
+  }
+  if (upgradedColumns.length > 0) {
+    console.log(`🔧 Upgraded schema columns: ${upgradedColumns.join(', ')}`);
   }
 
   const files = [];
