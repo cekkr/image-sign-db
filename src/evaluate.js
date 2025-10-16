@@ -142,18 +142,23 @@ function createCroppingTransform(imagePath, runIndex = 0, variant = 'cropping') 
 
 async function ensureValueTypeRecord(db, descriptor) {
   const descriptorKey = createDescriptorKey(descriptor);
-  const [rows] = await db.execute(
-    'SELECT value_type_id FROM value_types WHERE descriptor_hash = ?',
+  const [pre] = await db.execute(
+    'SELECT value_type_id FROM value_types WHERE descriptor_hash = ? LIMIT 1',
     [descriptorKey]
   );
-  if (rows.length > 0) {
-    return { id: rows[0].value_type_id, descriptorKey };
-  }
-  const [result] = await db.execute(
-    'INSERT INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
+  if (pre.length > 0) return { id: pre[0].value_type_id, descriptorKey };
+
+  // Insert with IGNORE to avoid unique conflict under concurrency; then resolve via SELECT.
+  await db.execute(
+    'INSERT IGNORE INTO value_types (descriptor_hash, descriptor_json) VALUES (?, ?)',
     [descriptorKey, serializeDescriptor(descriptor)]
   );
-  return { id: result.insertId, descriptorKey };
+  const [rows] = await db.execute(
+    'SELECT value_type_id FROM value_types WHERE descriptor_hash = ? LIMIT 1',
+    [descriptorKey]
+  );
+  if (rows.length > 0) return { id: rows[0].value_type_id, descriptorKey };
+  throw new Error('Unable to resolve value type id');
 }
 
 async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, options = {}) {
@@ -227,6 +232,19 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, optio
   };
 
   const tolerance = CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE;
+  const minAge = Number(settings?.training?.minCompletedImageAgeMinutes || 0);
+  const ageClause = minAge > 0 ? 'AND img.created_at <= (NOW() - INTERVAL ? MINUTE)' : '';
+  const params = [
+    targetFeature.value_type,
+    targetFeature.resolution_level,
+    targetFeature.pos_x,
+    targetFeature.pos_y,
+    spec.rel_x,
+    tolerance,
+    spec.rel_y,
+    tolerance,
+  ];
+  if (minAge > 0) params.push(minAge);
   const [rows] = await db.execute(
     `SELECT fv.image_id, fv.value, fv.rel_x, fv.rel_y, fv.size, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, img.original_filename
      FROM feature_vectors fv
@@ -236,17 +254,9 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, optio
        AND fv.pos_x = ?
        AND fv.pos_y = ?
        AND ABS(fv.rel_x - ?) <= ?
-       AND ABS(fv.rel_y - ?) <= ?`,
-    [
-      targetFeature.value_type,
-      targetFeature.resolution_level,
-      targetFeature.pos_x,
-      targetFeature.pos_y,
-      spec.rel_x,
-      tolerance,
-      spec.rel_y,
-      tolerance,
-    ]
+       AND ABS(fv.rel_y - ?) <= ?
+       AND img.ingestion_complete = 1 ${ageClause}`,
+    params
   );
 
   const selection = collectElasticMatches(rows, targetFeature, {

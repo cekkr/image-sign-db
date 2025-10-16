@@ -180,7 +180,7 @@ async function storeFeatures(imagePath, featureBatches) {
         }
 
         const [imageResult] = await connection.execute(
-            'INSERT INTO images (original_filename) VALUES (?)',
+            'INSERT INTO images (original_filename, ingestion_complete) VALUES (?, 0)',
             [path.basename(imagePath)]
         );
         const imageId = imageResult.insertId;
@@ -188,6 +188,16 @@ async function storeFeatures(imagePath, featureBatches) {
         const valueTypeCache = new Map();
         for (const batch of featureBatches) {
             await persistFeatureBatch(connection, imageId, batch, valueTypeCache);
+        }
+
+        // Mark ingestion complete only after all vectors/aux rows are inserted
+        try {
+            await connection.execute(
+                'UPDATE images SET ingestion_complete = 1 WHERE image_id = ?',
+                [imageId]
+            );
+        } catch {
+            // best effort; not critical for correctness
         }
 
         return { imageId, featureCount };

@@ -1,17 +1,24 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
+const settings = require('../settings');
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
 const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { parseDescriptor } = require('./descriptor');
 const { recordVectorUsage } = require('./storageManager');
 
 async function createDbConnection() {
-    return mysql.createConnection({
+    const conn = await mysql.createConnection({
         host: process.env.DB_HOST,
         user: process.env.DB_USER,
         password: process.env.DB_PASSWORD,
         database: process.env.DB_NAME,
     });
+    try {
+        await conn.query('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    } catch {
+        // best effort
+    }
+    return conn;
 }
 
 function hydrateFeatureRow(row) {
@@ -147,7 +154,14 @@ async function discoverCorrelations({
     const dbConnection = await createDbConnection();
 
     try {
-        const [images] = await dbConnection.query('SELECT image_id FROM images;');
+        const minAge = Number(settings?.training?.minCompletedImageAgeMinutes || 0);
+        const ageClause = minAge > 0 ? 'AND created_at <= (NOW() - INTERVAL ? MINUTE)' : '';
+        const params = [];
+        if (minAge > 0) params.push(minAge);
+        const [images] = await dbConnection.execute(
+            `SELECT image_id FROM images WHERE ingestion_complete = 1 ${ageClause}`,
+            params
+        );
         const imageIds = images.map((row) => row.image_id);
         if (imageIds.length < 2) {
             throw new Error('Correlation discovery requires at least two images in the database.');
@@ -175,13 +189,15 @@ async function discoverCorrelations({
                 `SELECT fv.*, vt.descriptor_json
                  FROM feature_vectors fv
                  JOIN value_types vt ON vt.value_type_id = fv.value_type
+                 JOIN images im ON im.image_id = fv.image_id
                  WHERE fv.value_type = ?
                    AND fv.resolution_level = ?
                    AND fv.pos_x = ?
                    AND fv.pos_y = ?
                    AND ABS(fv.rel_x - ?) <= ?
                    AND ABS(fv.rel_y - ?) <= ?
-                   AND fv.image_id != ?`,
+                   AND fv.image_id != ?
+                   AND im.ingestion_complete = 1` ,
                 [
                     startFeature.value_type,
                     startFeature.resolution_level,
@@ -229,12 +245,14 @@ async function discoverCorrelations({
             const candidateQuery = `SELECT fv.*, vt.descriptor_json
                  FROM feature_vectors fv
                  JOIN value_types vt ON vt.value_type_id = fv.value_type
+                 JOIN images im ON im.image_id = fv.image_id
                  WHERE fv.value_type = ?
                    AND fv.resolution_level = ?
                    AND fv.pos_x = ?
                    AND fv.pos_y = ?
                    AND ABS(fv.rel_x - ?) <= ?
                    AND ABS(fv.rel_y - ?) <= ?
+                   AND im.ingestion_complete = 1
                    AND fv.image_id IN (${candidatePlaceholders})`;
 
             for (const row of targetRows) {

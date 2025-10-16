@@ -481,26 +481,32 @@ async function ingestFilesConcurrently(
 
 async function findCandidateImages(db, probe) {
   const valueTypeId = (await ensureValueTypeRecord(db, probe.descriptor)).id;
+  const minAge = Number(settings?.training?.minCompletedImageAgeMinutes || 0);
+  const ageClause = minAge > 0 ? 'AND im.created_at <= (NOW() - INTERVAL ? MINUTE)' : '';
+  const params = [
+    valueTypeId,
+    probe.resolution_level,
+    probe.pos_x,
+    probe.pos_y,
+    probe.rel_x,
+    CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
+    probe.rel_y,
+    CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
+  ];
+  if (minAge > 0) params.push(minAge);
   const [rows] = await db.execute(
     `SELECT fv.vector_id, fv.image_id, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, fv.rel_x, fv.rel_y, fv.value, fv.size, vt.descriptor_json
      FROM feature_vectors fv
      JOIN value_types vt ON vt.value_type_id = fv.value_type
+     JOIN images im ON im.image_id = fv.image_id
      WHERE fv.value_type = ?
        AND fv.resolution_level = ?
        AND fv.pos_x = ?
        AND fv.pos_y = ?
        AND ABS(fv.rel_x - ?) <= ?
-       AND ABS(fv.rel_y - ?) <= ?`,
-    [
-      valueTypeId,
-      probe.resolution_level,
-      probe.pos_x,
-      probe.pos_y,
-      probe.rel_x,
-      CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
-      probe.rel_y,
-      CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
-    ]
+       AND ABS(fv.rel_y - ?) <= ?
+       AND im.ingestion_complete = 1 ${ageClause}`,
+    params
   );
 
   const targetFeature = {
@@ -520,12 +526,19 @@ async function findCandidateImages(db, probe) {
 }
 
 async function sampleRandomProbeSpec(db) {
+  const minAge = Number(settings?.training?.minCompletedImageAgeMinutes || 0);
+  const ageClause = minAge > 0 ? 'AND im.created_at <= (NOW() - INTERVAL ? MINUTE)' : '';
+  const params = [];
+  if (minAge > 0) params.push(minAge);
   const [rows] = await db.execute(
     `SELECT fv.vector_id, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, fv.rel_x, fv.rel_y, fv.size, vt.descriptor_json
      FROM feature_vectors fv
      JOIN value_types vt ON vt.value_type_id = fv.value_type
+     JOIN images im ON im.image_id = fv.image_id
+     WHERE im.ingestion_complete = 1 ${ageClause}
      ORDER BY RAND()
-     LIMIT 1`
+     LIMIT 1`,
+    params
   );
   if (rows.length === 0) return null;
   const row = rows[0];

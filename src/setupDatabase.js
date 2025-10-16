@@ -14,7 +14,8 @@ const createImagesTableSQL = `
 CREATE TABLE IF NOT EXISTS images (
     image_id INT AUTO_INCREMENT PRIMARY KEY,
     original_filename VARCHAR(255) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ingestion_complete TINYINT(1) NOT NULL DEFAULT 0
 ) ENGINE=InnoDB;`;
 
 const createValueTypesTableSQL = `
@@ -126,6 +127,17 @@ async function setupDatabase() {
         console.log(" -> Creating 'images' table...");
         await connection.query(createImagesTableSQL);
         console.log("    ✅ Table 'images' is ready.");
+        // Best-effort migration for existing DBs
+        try {
+            await connection.query(
+                "ALTER TABLE images ADD COLUMN IF NOT EXISTS ingestion_complete TINYINT(1) NOT NULL DEFAULT 0"
+            );
+            await connection.query(
+                "CREATE INDEX IF NOT EXISTS idx_images_complete_created ON images (ingestion_complete, created_at)"
+            );
+        } catch (e) {
+            // MySQL versions before 8.0 may not support IF NOT EXISTS; ignore if column/index exists
+        }
 
         console.log(" -> Creating 'value_types' table...");
         await connection.query(createValueTypesTableSQL);

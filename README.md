@@ -224,3 +224,62 @@ If you are wiring a custom client, call:
 1. `POST /search/start { "requestProbe": true }` → receive `{ status: "REQUEST_PROBE", sessionId, probeSpec }`.
 2. Measure that probe on your image and send `POST /search/start { sessionId, probe: { …, value } }`.
 3. For subsequent steps continue with `POST /search/refine` as before, passing each requested descriptor and measured value.
+
+
+Configuration & Tuning
+----------------------
+
+This release adds several robustness features to reduce MySQL lock contention during concurrent ingestion and correlation.
+
+Ingestion Consistency & Concurrency
+-----------------------------------
+
+• Short, autocommit writes: Image and feature rows are now inserted without a single long-running transaction. This greatly reduces lock duration under high concurrency.
+
+• Lock-light descriptor upsert: `value_types` resolution uses a read-first pattern (`SELECT` → `INSERT IGNORE` → `SELECT`) to avoid hot UPSERT conflicts when many workers reference the same descriptor.
+
+• Completion flag: Images now have `images.ingestion_complete TINYINT(1) DEFAULT 0`. The flag is set to `1` only after all feature rows are persisted. All discovery/evaluation queries filter to completed images only, preventing partial ingests from being read.
+
+• Optional “min age” gating: You can exclude very recent ingests from comparisons to further reduce contention bursts right after writes.
+
+• Session isolation: DB connections attempt to set `READ COMMITTED` to reduce gap-lock waits (best effort).
+
+Schema migration note
+---------------------
+
+Run the setup once to add the new column and helper index if you already have a database:
+
+    node src/setupDatabase.js
+
+New/Updated Environment Variables
+---------------------------------
+
+Add these (optionally) to your `.env` file:
+
+• TRAINING_MIN_COMPLETED_IMAGE_AGE_MINUTES
+  - Description: Minimum age, in minutes, for an image to be eligible in correlations/evaluation queries.
+  - Default: `0` (no age gating)
+
+• DB_OPERATION_MAX_RETRIES
+  - Description: Max retries for individual insert operations that encounter transient lock timeouts.
+  - Default: `4`
+
+• DB_OPERATION_RETRY_BASE_MS
+  - Description: Base backoff for per-row retries (jitter added).
+  - Default: `40`
+
+• DEFAULT_THREADS
+  - Description: Caps concurrent ingest workers used by `train.js`.
+  - Default: unset (auto-scales to CPU, with a safe cap)
+
+Deprecated (no longer used by ingestion):
+
+• DB_TRANSACTION_MAX_RETRIES, DB_TRANSACTION_RETRY_BASE_MS
+  - Ingestion switched to short autocommit operations with targeted per-row retries. These legacy variables are ignored by the new path.
+
+Operational tips
+----------------
+
+• If you still observe lock waits under heavy load, temporarily lower parallelism with `--threads=<n>` on `train.js` or set `DEFAULT_THREADS` in `.env`.
+
+• For multi-process coordination at very large scale, consider a DB-backed job queue that claims work with `SELECT ... FOR UPDATE SKIP LOCKED` (MySQL 8.0+), so idle workers skip locked rows instead of waiting. This project’s ingestion pipeline is already robust without it; add only if you run multiple independent processes.
