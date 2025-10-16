@@ -15,10 +15,10 @@ function resolvePath(filePath) {
 }
 
 async function handleIngest(job) {
-    const { file, discoverIterations = 0 } = job;
+    const { file, discoverIterations = 0, augmentations } = job;
     try {
         const resolvedFile = resolvePath(file);
-        const result = await ingestImage(resolvedFile, discoverIterations);
+        const result = await ingestImage(resolvedFile, discoverIterations, { augmentations });
         parentPort.postMessage({
             type: 'result',
             payload: {

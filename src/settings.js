@@ -77,6 +77,8 @@ const trainingSettings = {
   resourceSampleIntervalMs: getNumber('RESOURCE_SAMPLE_INTERVAL_MS', 2500),
   bootstrapCommandDefaultIterations: getNumber('BOOTSTRAP_COMMAND_DEFAULT_ITERATIONS', 75),
   minCompletedImageAgeMinutes: getNumber('TRAINING_MIN_COMPLETED_IMAGE_AGE_MINUTES', 0),
+  augmentationsPerImage: getNumber('TRAINING_AUGMENTATIONS_PER_IMAGE', 3),
+  augmentationList: getStringList('TRAINING_AUGMENTATION_LIST', []),
   selfEvaluation: {
     enabled: getBoolean('TRAINING_SELF_EVAL_ENABLED', true),
     maxSamples: getNumber('TRAINING_SELF_EVAL_MAX_SAMPLES', 8),

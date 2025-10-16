@@ -177,6 +177,22 @@ Every ingest now prints how many constellation vectors each augmentation produce
 When you enable `--reprobe`, the trainer now streams per-image hit/miss summaries together with the last probe accuracy so you can monitor how well the freshly inserted vectors anchor the search.
 The trainer also performs an automatic self-evaluation during the first few ingests (configurable via `TRAINING_SELF_EVAL_*` env variables). It replays the same elastic matching logic used in evaluation mode and prints the best match, the self-rank, and whether the similarity threshold had to relax, so you get immediate feedback without running `--evaluate`.
 
+Augmentation Controls
+---------------------
+
+- Use `--augmentations=<list>` (or `--aug=`) to restrict the pool for this run (e.g., `original,gaussian_blur,center_crop_80`).
+- Use `--aug-per-pass=<n>` to limit how many augmentations are applied per image in this run (default from `TRAINING_AUGMENTATIONS_PER_IMAGE`, default 3). `original` is always included.
+- Optional `--aug-seed=<seed>` varies deterministic sampling between runs while keeping selection stable across files.
+
+Environment variables:
+
+- `TRAINING_AUGMENTATIONS_PER_IMAGE`: default per-image augmentation budget.
+- `TRAINING_AUGMENTATION_LIST`: override the global augmentation pool (comma-separated).
+- `TRAINING_VERBOSE_AUGMENT_LOGS`: if set to `true`, prints coarse progress inside each augmentation.
+- `AUG_PROGRESS_STEPS`: when verbose logs are enabled, how many progress checkpoints to print per augmentation (e.g., `4`).
+
+Note: a deterministic `center_crop_80` augmentation is included to build robustness to partial crops and resolution changes.
+
 Need to prune the dataset later? Run:
 
     node src/insert.js remove <image_id|original_filename>

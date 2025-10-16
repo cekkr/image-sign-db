@@ -93,10 +93,14 @@ async function runCorrelationDiscovery(iterations) {
     }
 }
 
-async function ingestImage(imagePath, discoverIterations = 0) {
+async function ingestImage(imagePath, discoverIterations = 0, ingestOptions = {}) {
     const resolvedPath = path.resolve(process.cwd(), imagePath);
     console.log(`\n📥 Ingesting image: ${resolvedPath}`);
-    const { imageId, featureCount } = await extractAndStoreFeatures(resolvedPath);
+    const { imageId, featureCount } = await extractAndStoreFeatures(resolvedPath, {
+        augmentations: Array.isArray(ingestOptions.augmentations) && ingestOptions.augmentations.length > 0
+            ? ingestOptions.augmentations
+            : undefined,
+    });
     console.log(`   → Stored ${featureCount} feature vectors (image_id=${imageId})`);
 
     if (discoverIterations > 0) {
@@ -120,8 +124,11 @@ async function handleAddCommand(positional, options) {
     }
 
     const discoverIterations = Number.parseInt(options.discover ?? '0', 10);
+    const augList = typeof options.augmentations === 'string'
+        ? String(options.augmentations).split(',').map((s) => s.trim()).filter(Boolean)
+        : undefined;
     await ensureValueTypeCapacity();
-    await ingestImage(imagePath, discoverIterations);
+    await ingestImage(imagePath, discoverIterations, { augmentations: augList });
 }
 
 async function handleRemoveCommand(positional) {

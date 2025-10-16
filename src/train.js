@@ -25,6 +25,7 @@ const {
 } = require('./evaluate');
 const RealTimePruner = require('./lib/realTimePruner');
 const { ensureValueTypeCapacity } = require('./lib/schema');
+const { AUGMENTATION_ORDER, createSeededRandom } = require('./lib/augmentations');
 
 let cliProgress;
 try {
@@ -74,6 +75,10 @@ function parseArgs(argv) {
     evaluateRuns: EVALUATION_DEFAULT_OPTIONS.runs,
     evaluateTop: EVALUATION_DEFAULT_OPTIONS.top,
     evaluateFilters: [...EVALUATION_DEFAULT_OPTIONS.filters],
+    // Augmentation controls
+    augmentations: null,
+    augPerPass: settings.training.augmentationsPerImage,
+    augSeed: process.env.TRAINING_AUGMENTATION_GLOBAL_SEED || '',
   };
   const positional = [];
   for (const token of args) {
@@ -103,6 +108,17 @@ function parseArgs(argv) {
           .map((entry) => entry.trim())
           .filter(Boolean);
         if (filters.length > 0) options.evaluateFilters = filters;
+      } else if (key === 'augmentations' || key === 'aug' || key === 'augList') {
+        const aug = String(val)
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter(Boolean);
+        if (aug.length > 0) options.augmentations = aug;
+      } else if (key === 'aug-per-pass' || key === 'augPerPass') {
+        const n = Number(val);
+        if (Number.isFinite(n) && n > 0) options.augPerPass = Math.floor(n);
+      } else if (key === 'aug-seed' || key === 'augSeed') {
+        options.augSeed = String(val);
       }
     } else {
       positional.push(token);
@@ -277,7 +293,7 @@ class OnlineCorrelationRunner {
 
 async function ingestFilesConcurrently(
   files,
-  { iterationsPerIngest = 0, maxThreads, onImageIngested } = {},
+  { iterationsPerIngest = 0, maxThreads, onImageIngested, augmentationPool, augPerPass, augSeed } = {},
   correlationRunner
 ) {
   if (!files || files.length === 0) return { ingested: [], failures: [] };
@@ -324,6 +340,35 @@ async function ingestFilesConcurrently(
     max: maxThreads && maxThreads > 0 ? Math.max(1, Math.min(maxThreads, 32)) : Math.max(1, Math.min(cpuCount, 8)),
   };
 
+  // Resolve the augmentation pool from options + settings + defaults.
+  const envAugList = settings.training.augmentationList;
+  const baseAugPool = Array.isArray(envAugList) && envAugList.length > 0 ? envAugList : AUGMENTATION_ORDER;
+
+  function buildAugmentationPool() {
+    const list = Array.isArray(augmentationPool) && augmentationPool.length
+      ? augmentationPool
+      : baseAugPool;
+    const unique = [...new Set(list)];
+    // Always ensure 'original' is present
+    if (!unique.includes('original')) unique.unshift('original');
+    return unique;
+  }
+
+  function selectAugmentationsForFile(file) {
+    const pool = buildAugmentationPool();
+    const perPass = Math.max(1, Number(augPerPass) || 1);
+    if (perPass >= pool.length) return pool;
+    const withoutOriginal = pool.filter((name) => name !== 'original');
+    const rng = createSeededRandom(`${augSeed || ''}:${file}`);
+    // Fisher-Yates shuffle using seeded RNG
+    for (let i = withoutOriginal.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(rng() * (i + 1));
+      [withoutOriginal[i], withoutOriginal[j]] = [withoutOriginal[j], withoutOriginal[i]];
+    }
+    const sample = withoutOriginal.slice(0, Math.max(0, perPass - 1));
+    return ['original', ...sample];
+  }
+
   function assignWork(info) {
     if (closed || info.busy || pending.length === 0) return;
     const file = pending.shift();
@@ -332,9 +377,10 @@ async function ingestFilesConcurrently(
     info.busy = true;
     info.currentFile = file;
     activeWorkers += 1;
+    const augmentations = selectAugmentationsForFile(file);
     info.worker.postMessage({
       type: 'ingest',
-      payload: { file, discoverIterations: 0 },
+      payload: { file, discoverIterations: 0, augmentations },
     });
     updateProgress();
   }
@@ -956,6 +1002,11 @@ async function main() {
       {
         iterationsPerIngest: correlationIterations,
         maxThreads,
+        augmentationPool: Array.isArray(options.augmentations) && options.augmentations.length > 0
+          ? options.augmentations
+          : undefined,
+        augPerPass: options.augPerPass,
+        augSeed: options.augSeed,
         onImageIngested: (payload) => {
           selfEvaluator.enqueue(payload);
           realTimePruner.onImageIngested(payload);

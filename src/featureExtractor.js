@@ -31,13 +31,20 @@ function sleep(ms) {
 
 async function collectFeaturesForAugmentations(originalImage, imagePath, augmentations = AUGMENTATION_ORDER) {
     const featureBatches = [];
+    const total = augmentations.length;
 
-    for (const augmentationName of augmentations) {
+    for (let i = 0; i < total; i += 1) {
+        const augmentationName = augmentations[i];
+        const label = `${augmentationName}`;
+        const startedAt = Date.now();
+        console.log(`     ↳ Starting augmentation '${label}' (${i + 1}/${total})`);
         const { gradientFeatures, allFeatures } = await generateAllFeaturesForAugmentation(
             originalImage,
             imagePath,
             augmentationName
         );
+        const elapsed = (Date.now() - startedAt) / 1000;
+        console.log(`       ✓ Completed '${label}' in ${elapsed.toFixed(1)}s`);
         featureBatches.push({
             augmentation: augmentationName,
             gradientFeatures,

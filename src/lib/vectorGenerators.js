@@ -116,12 +116,30 @@ async function generateAllFeaturesForAugmentation(originalImage, imagePath, augm
 
     const gradientFeatures = [];
 
+    // Optional coarse progress logging (disabled by default)
+    const progressEnabled = /^(1|true|yes|on)$/i.test(String(process.env.TRAINING_VERBOSE_AUGMENT_LOGS || ''));
+    const progressStepsEnv = Number.parseInt(String(process.env.AUG_PROGRESS_STEPS || ''), 10);
+    const progressSteps = Number.isFinite(progressStepsEnv) && progressStepsEnv > 0 ? progressStepsEnv : 0;
+    const progressInterval = progressSteps > 0 ? Math.max(1, Math.floor(SAMPLES_PER_AUGMENTATION / progressSteps)) : Infinity;
+
+    const startedAt = Date.now();
+
     for (let ordinal = 0; ordinal < SAMPLES_PER_AUGMENTATION; ordinal += 1) {
         const sampleId = getSampleId(augmentationName, ordinal);
         const baseParams = generateBaseParameters(sampleId);
         const feature = buildFeatureFromSample(rawPixels, meta, baseParams);
         if (feature) {
             gradientFeatures.push(feature);
+        }
+
+        if (progressEnabled && progressInterval !== Infinity) {
+            const done = ordinal + 1;
+            if (done % progressInterval === 0 || done === SAMPLES_PER_AUGMENTATION) {
+                const pct = Math.min(100, Math.round((done / SAMPLES_PER_AUGMENTATION) * 100));
+                const elapsed = (Date.now() - startedAt) / 1000;
+                // Use a simple, short line to avoid log spam
+                console.log(`       ↺ ${augmentationName}: ${pct}% (${done}/${SAMPLES_PER_AUGMENTATION}) in ${elapsed.toFixed(1)}s`);
+            }
         }
     }
 

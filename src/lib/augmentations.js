@@ -69,9 +69,31 @@ function applyRandomCombo(baseImage, baseMeta, imagePath, augmentationName) {
     return transformed;
 }
 
+function applyCenterCrop(baseImage, baseMeta, ratio = 0.8) {
+    const width = baseMeta.width;
+    const height = baseMeta.height;
+    const cropWidth = Math.max(1, Math.floor(width * ratio));
+    const cropHeight = Math.max(1, Math.floor(height * ratio));
+    const left = Math.floor((width - cropWidth) / 2);
+    const top = Math.floor((height - cropHeight) / 2);
+    return baseImage
+        .clone()
+        .extract({ left, top, width: cropWidth, height: cropHeight })
+        .resize(width, height, { fit: 'cover' });
+}
+
 function applyAugmentation(baseImage, augmentationName, baseMeta, imagePath) {
     if (BASE_AUGMENTATIONS[augmentationName]) {
         return BASE_AUGMENTATIONS[augmentationName](baseImage);
+    }
+    if (augmentationName === 'center_crop' || augmentationName === 'center_crop_80') {
+        return applyCenterCrop(baseImage, baseMeta, 0.8);
+    }
+    if (augmentationName === 'center_crop_75') {
+        return applyCenterCrop(baseImage, baseMeta, 0.75);
+    }
+    if (augmentationName === 'center_crop_60') {
+        return applyCenterCrop(baseImage, baseMeta, 0.6);
     }
     if (augmentationName.startsWith('random_combo_')) {
         return applyRandomCombo(baseImage, baseMeta, imagePath, augmentationName);
@@ -84,6 +106,8 @@ const AUGMENTATION_ORDER = Object.freeze([
     'mirror_horizontal',
     'mirror_vertical',
     'gaussian_blur',
+    // Add a deterministic cropping augmentation to improve robustness
+    'center_crop_80',
     ...STOCHASTIC_AUGMENTATIONS,
 ]);
 
