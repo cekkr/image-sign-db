@@ -12,4 +12,4 @@ node src/train.js ./datasets/unsplash-images-collection --evaluate
 
 ## Desktop
 
-node src/train.js ./datasets/pinterest_images --discover=10 --bootstrap=50 --reprobe=25 --shuffle=true
+node src/train.js ./datasets/pinterest_images --discover=10 --bootstrap=50 --reprobe=25
