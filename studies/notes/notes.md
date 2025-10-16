@@ -9,3 +9,7 @@ To remember:
 nice --10 node src/train.js ./datasets/unsplash-images-collection --discover=20 --bootstrap=10 --reprobe=5
 
 node src/train.js ./datasets/unsplash-images-collection --evaluate
+
+## Desktop
+
+node src/train.js ./datasets/pinterest_images --discover=20 --bootstrap=75 --reprobe=50
