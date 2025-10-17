@@ -4,6 +4,7 @@ const settings = require('../settings');
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
 const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { parseDescriptor } = require('./descriptor');
+const { descriptorToSpec } = require('./constellation');
 const { recordVectorUsage } = require('./storageManager');
 
 async function createDbConnection() {
@@ -338,4 +339,37 @@ module.exports = {
     updateNodeStats,
     getOrCreateFeatureGroupNode,
     upsertFeatureGroupStats,
+    selectTopDescriptors,
 };
+
+async function selectTopDescriptors(db, options = {}) {
+    const limit = Math.max(1, Number(options.limit ?? 200));
+    const minSampleSize = Math.max(0, Number(options.minSampleSize ?? 0));
+    const [rows] = await db.execute(
+        `SELECT fgs.value_type, fgs.resolution_level, fgs.sample_size, fgs.mean_distance, fgs.std_distance,
+                fgs.mean_cosine, fgs.mean_pearson, vt.descriptor_json
+         FROM feature_group_stats fgs
+         JOIN value_types vt ON vt.value_type_id = fgs.value_type
+         ORDER BY fgs.sample_size DESC
+         LIMIT ?`,
+        [limit]
+    );
+    const results = [];
+    for (const row of rows) {
+        if (minSampleSize > 0 && Number(row.sample_size || 0) < minSampleSize) continue;
+        const descriptor = parseDescriptor(row.descriptor_json);
+        const spec = descriptorToSpec(descriptor);
+        if (!spec) continue;
+        results.push({
+            value_type: row.value_type,
+            resolution_level: row.resolution_level,
+            sample_size: row.sample_size,
+            mean_distance: row.mean_distance,
+            std_distance: row.std_distance,
+            mean_cosine: row.mean_cosine,
+            mean_pearson: row.mean_pearson,
+            spec,
+        });
+    }
+    return results;
+}

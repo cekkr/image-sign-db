@@ -223,7 +223,35 @@ async function generateSpecificVector(imagePath, spec, options = {}) {
     };
 }
 
+async function generateFeaturesForAugmentationOrdinals(originalImage, imagePath, augmentationName, ordinals) {
+    if (!Array.isArray(ordinals) || ordinals.length === 0) {
+        return { gradientFeatures: [], allFeatures: [] };
+    }
+    const baseMeta = await originalImage.metadata();
+    const augmentedImage = applyAugmentation(originalImage, augmentationName, baseMeta, imagePath);
+    const { rawPixels, meta } = await getRawPixels(augmentedImage.clone());
+
+    const gradientFeatures = [];
+    const startedAt = Date.now();
+
+    for (let i = 0; i < ordinals.length; i += 1) {
+        const ordinal = ordinals[i];
+        const sampleId = getSampleId(augmentationName, Math.max(0, Math.floor(ordinal)));
+        const baseParams = generateBaseParameters(sampleId);
+        const feature = buildFeatureFromSample(rawPixels, meta, baseParams);
+        if (feature) {
+            gradientFeatures.push(feature);
+        }
+    }
+
+    return {
+        gradientFeatures,
+        allFeatures: [...gradientFeatures],
+    };
+}
+
 module.exports = {
     generateAllFeaturesForAugmentation,
     generateSpecificVector,
+    generateFeaturesForAugmentationOrdinals,
 };

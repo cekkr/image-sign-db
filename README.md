@@ -177,6 +177,23 @@ Every ingest now prints how many constellation vectors each augmentation produce
 When you enable `--reprobe`, the trainer now streams per-image hit/miss summaries together with the last probe accuracy so you can monitor how well the freshly inserted vectors anchor the search.
 The trainer also performs an automatic self-evaluation during the first few ingests (configurable via `TRAINING_SELF_EVAL_*` env variables). It replays the same elastic matching logic used in evaluation mode and prints the best match, the self-rank, and whether the similarity threshold had to relax, so you get immediate feedback without running `--evaluate`.
 
+Progressive Ingestion (Adaptive, Faster)
+----------------------------------------
+
+Training no longer needs a fixed, arbitrary number of vectors per image. A progressive mode (enabled by default) ingests data in multiple short cycles:
+
+- Cycle 1: take a small, random subset of constellation samples per augmentation.
+- Cycles 2+: ask the database for the highest‑value descriptors (from `feature_group_stats`) and measure just those on the image.
+
+This reduces lock contention and dramatically cuts per‑image insert volume while focusing on features that improve evaluation.
+
+Environment knobs (set in `.env`):
+
+- `TRAINING_PROGRESSIVE_ENABLED` (default `true`): toggle progressive mode.
+- `TRAINING_PROGRESSIVE_CYCLES` (default `3`): number of cycles per image.
+- `TRAINING_PROGRESSIVE_RANDOM_PER_AUG` (default `300`): random samples per augmentation in cycle 1.
+- `TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE` (default `300`): guided samples per subsequent cycle.
+- `STORE_IMAGE_BLOB` (default `false`): if `true`, stores a copy of the image in `image_blobs` for future re‑vectorization as the model evolves.
 Augmentation Controls
 ---------------------
 

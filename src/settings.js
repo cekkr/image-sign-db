@@ -99,6 +99,14 @@ const trainingSettings = {
     minGroupAgeMinutes: getNumber('TRAINING_REALTIME_PRUNING_MIN_GROUP_AGE_MINUTES', 45),
     maxGroupHitCount: getNumber('TRAINING_REALTIME_PRUNING_MAX_GROUP_HIT_COUNT', 1),
   },
+  progressive: {
+    enabled: getBoolean('TRAINING_PROGRESSIVE_ENABLED', true),
+    cycles: getNumber('TRAINING_PROGRESSIVE_CYCLES', 3),
+    randomPerAug: getNumber('TRAINING_PROGRESSIVE_RANDOM_PER_AUG', 300),
+    guidedPerCycle: getNumber('TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE', 300),
+  },
+  // Optional: store a copy of the original image in DB for future re-vectorization
+  storeImageBlob: getBoolean('STORE_IMAGE_BLOB', false),
 };
 
 const settings = {

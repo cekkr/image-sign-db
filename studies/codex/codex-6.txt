@@ -1,0 +1,60 @@
+Here’s a focused redesign to fix the slow ingestion/locking and remove the “fixed 10000 vectors” constraint. I implemented progressive, guided ingestion with fast batched DB writes, plus an optional image snapshot in DB so you can re‑vectorize later as the model improves.
+
+What changed
+
+Batched inserts + bulk value-type resolution
+Resolves many descriptor IDs in one go, then inserts vectors in batches to minimize round‑trips and lock time.
+Aims to keep autocommit writes short and lock‑light while being much faster than row‑by‑row.
+Files:
+src/featureExtractor.js:172, 205
+src/featureExtractor.js:300
+Progressive, multi‑cycle ingestion (no fixed 10k)
+Cycle 1: small random subset per augmentation
+Cycles 2+: “guided” picks from feature_group_stats (descriptors that historically separate best), only measuring those on the image
+Controlled via env vars; defaults keep volumes modest while improving usefulness.
+Files:
+src/featureExtractor.js:354
+src/insert.js:9, 66
+Guided descriptor selection from DB
+Ranks descriptors from feature_group_stats and turns them into sampler specs for the current image.
+File: src/lib/knowledge.js:101
+Optional image snapshot in DB
+If STORE_IMAGE_BLOB=true, a copy of the original image is stored in image_blobs so you can later re‑vectorize the exact input as the model evolves (no reliance on external FS).
+File: src/featureExtractor.js:467
+Targeted generator for small batches
+New helper to generate vectors only for specific sample ordinals (supports the progressive random pass).
+File: src/lib/vectorGenerators.js:226
+Settings and docs
+New training knobs (enabled by default) for cycles and per‑cycle volumes.
+Files:
+src/settings.js: training.progressive and storeImageBlob
+README.md: Progressive Ingestion section added
+How to use
+
+Environment knobs (in .env):
+TRAINING_PROGRESSIVE_ENABLED=true
+TRAINING_PROGRESSIVE_CYCLES=3
+TRAINING_PROGRESSIVE_RANDOM_PER_AUG=300
+TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE=300
+STORE_IMAGE_BLOB=false (set true to keep an image copy in DB)
+Train as usual; the pipeline now ingests in short, lock‑light cycles:
+node src/train.js <dataset_dir> [--discover=N] [--threads=M]
+If you want the previous “full sweep” behavior, set TRAINING_PROGRESSIVE_ENABLED=false.
+Why this fixes your pain
+
+No single huge write: Autocommit, batched inserts drastically reduce lock time and DB chatter.
+No arbitrary “10k vectors”: Multi‑cycle keeps early passes tiny, then adds only high‑utility descriptors informed by the existing DB.
+Future updates: With the optional image copy stored, you can re‑vectorize the same pixels later as the model’s descriptor definitions evolve.
+Tuning tips
+
+If you still hit lock waits, lower --threads or TRAINING_PROGRESSIVE_RANDOM_PER_AUG or TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE.
+If your DB has little or no correlation stats yet, guided cycles will insert fewer vectors; you can temporarily bump TRAINING_PROGRESSIVE_RANDOM_PER_AUG during bootstrapping or run insert.js bootstrap.
+Notable file references
+
+src/featureExtractor.js:354
+src/lib/vectorGenerators.js:226
+src/lib/knowledge.js:101
+src/insert.js:66
+src/settings.js:120
+README.md
+Want me to run a quick local ingest on a subset to confirm the speed/insert counts, or tune the defaults to your hardware/DB?

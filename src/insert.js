@@ -6,7 +6,7 @@ const mysql = require('mysql2/promise');
 require('dotenv').config();
 
 // --- INTERNAL MODULES ---
-const { extractAndStoreFeatures } = require('./featureExtractor');
+const { extractAndStoreFeatures, extractAndStoreFeaturesProgressive } = require('./featureExtractor');
 const settings = require('./settings');
 const { discoverCorrelations, createDbConnection } = require('./lib/knowledge');
 const { ensureStorageCapacity } = require('./lib/storageManager');
@@ -96,7 +96,9 @@ async function runCorrelationDiscovery(iterations) {
 async function ingestImage(imagePath, discoverIterations = 0, ingestOptions = {}) {
     const resolvedPath = path.resolve(process.cwd(), imagePath);
     console.log(`\n📥 Ingesting image: ${resolvedPath}`);
-    const { imageId, featureCount } = await extractAndStoreFeatures(resolvedPath, {
+    const progressive = settings?.training?.progressive?.enabled ?? true;
+    const extractor = progressive ? extractAndStoreFeaturesProgressive : extractAndStoreFeatures;
+    const { imageId, featureCount } = await extractor(resolvedPath, {
         augmentations: Array.isArray(ingestOptions.augmentations) && ingestOptions.augmentations.length > 0
             ? ingestOptions.augmentations
             : undefined,
