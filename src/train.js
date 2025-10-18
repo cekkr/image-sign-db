@@ -196,7 +196,7 @@ class OnlineCorrelationRunner {
                 console.log(`\n🔎 Running ${batchIterations} online correlation iteration(s)...`);
               }
             },
-            onDiscriminatorSelected: ({ metrics, ambiguousCandidates }) => {
+            onDiscriminatorSelected: ({ metrics, ambiguousCandidates, startFeature, discriminatorFeature, topMatches }) => {
               if (!metrics) return;
               batchMetrics.push({
                 score: metrics.score ?? 0,
@@ -209,6 +209,23 @@ class OnlineCorrelationRunner {
                 sampleSize: metrics.sampleSize ?? 0,
                 candidates: ambiguousCandidates ?? 0,
               });
+
+              // Optional detailed per-iteration logging of top matches
+              if (settings.training.correlationDebugLog && Array.isArray(topMatches) && topMatches.length > 0) {
+                const startChannel = startFeature?.descriptor?.channel ?? `#${startFeature?.value_type ?? '?'}`;
+                const discChannel = discriminatorFeature?.descriptor?.channel ?? `#${discriminatorFeature?.value_type ?? '?'}`;
+                const header = `   [90m[1mSelected ${startChannel} (res=${startFeature?.resolution_level}) + ${discChannel} (res=${discriminatorFeature?.resolution_level}) | cohesion ${Number(metrics.cohesion ?? 0).toFixed(4)} | affinity ${Number(metrics.affinity ?? 0).toFixed(4)} | candidates ${ambiguousCandidates ?? 0}`;
+                console.log(header);
+                const k = Math.min(topMatches.length, settings.training.correlationTopLogK || 5);
+                for (let i = 0; i < k; i += 1) {
+                  const m = topMatches[i];
+                  const label = m.filename || `image#${m.imageId}`;
+                  const distLabel = m.distanceMean !== null && m.distanceMean !== undefined
+                    ? ` | distance ${Number(m.distanceMean).toFixed(4)}`
+                    : '';
+                  console.log(`      ${i + 1}. ${label} | score ${Number(m.score).toFixed(4)} | affinity ${Number(m.affinity).toFixed(4)} | cohesion ${Number(m.cohesion).toFixed(4)} | sample ${Number(m.sampleSize)}${distLabel}`);
+                }
+              }
             },
           });
           this.warnedInsufficient = false;

@@ -99,6 +99,9 @@ const trainingSettings = {
     minGroupAgeMinutes: getNumber('TRAINING_REALTIME_PRUNING_MIN_GROUP_AGE_MINUTES', 45),
     maxGroupHitCount: getNumber('TRAINING_REALTIME_PRUNING_MAX_GROUP_HIT_COUNT', 1),
   },
+  // Debug/observability for correlation discovery
+  correlationDebugLog: getBoolean('TRAINING_CORRELATION_DEBUG_LOG', false),
+  correlationTopLogK: getNumber('TRAINING_CORRELATION_TOP_LOG_K', 5),
   progressive: {
     enabled: getBoolean('TRAINING_PROGRESSIVE_ENABLED', true),
     cycles: getNumber('TRAINING_PROGRESSIVE_CYCLES', 3),

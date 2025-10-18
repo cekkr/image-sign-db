@@ -2,6 +2,7 @@ const mysql = require('mysql2/promise');
 require('dotenv').config();
 const settings = require('../settings');
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
+const { collectElasticMatches } = require('./elasticMatcher');
 const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { parseDescriptor } = require('./descriptor');
 const { descriptorToSpec } = require('./constellation');
@@ -293,12 +294,89 @@ async function discoverCorrelations({
 
             await recordVectorUsage(dbConnection, [bestDiscriminator.vector_id], 2, metricsWithScore?.score ?? 0);
 
+            // Optionally compute and report top correlated images for this discriminator.
+            let topMatches = [];
+            const topK = Math.max(0, Number(settings?.training?.correlationTopLogK ?? 0));
+            if (topK > 0 && candidateImageList.length > 0) {
+                try {
+                    const [rows] = await dbConnection.execute(
+                        `SELECT fv.image_id, fv.value, fv.rel_x, fv.rel_y, fv.size, fv.value_type, fv.resolution_level, fv.pos_x, fv.pos_y, img.original_filename
+                         FROM feature_vectors fv
+                         JOIN images img ON img.image_id = fv.image_id
+                         WHERE fv.value_type = ?
+                           AND fv.resolution_level = ?
+                           AND fv.pos_x = ?
+                           AND fv.pos_y = ?
+                           AND ABS(fv.rel_x - ?) <= ?
+                           AND ABS(fv.rel_y - ?) <= ?
+                           AND img.ingestion_complete = 1
+                           AND fv.image_id IN (${candidateImageList.map(() => '?').join(',')})`,
+                        [
+                            bestDiscriminator.value_type,
+                            bestDiscriminator.resolution_level,
+                            bestDiscriminator.pos_x,
+                            bestDiscriminator.pos_y,
+                            bestDiscriminator.rel_x,
+                            CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
+                            bestDiscriminator.rel_y,
+                            CONSTELLATION_CONSTANTS.OFFSET_TOLERANCE,
+                            ...candidateImageList,
+                        ]
+                    );
+
+                    // Form a target feature compatible with scoring helpers
+                    const targetFeature = {
+                        value_type: bestDiscriminator.value_type,
+                        resolution_level: bestDiscriminator.resolution_level,
+                        pos_x: bestDiscriminator.pos_x,
+                        pos_y: bestDiscriminator.pos_y,
+                        rel_x: bestDiscriminator.rel_x,
+                        rel_y: bestDiscriminator.rel_y,
+                        size: bestDiscriminator.size,
+                        value: bestDiscriminator.value,
+                    };
+
+                    // Use elastic grouping to keep consistency with evaluation
+                    const selection = collectElasticMatches(rows, targetFeature, {
+                        baseThreshold: settings.search.valueThreshold,
+                        minUniqueImages: Math.max(1, Math.min(topK, rows.length || 0)),
+                        maxEntries: Math.max(32, topK * 12),
+                    });
+
+                    const scored = [];
+                    for (const group of selection.grouped.values()) {
+                        const evaluation = scoreCandidateFeature(targetFeature, group.features);
+                        if (!evaluation) continue;
+                        const distances = group.distances || [];
+                        const distanceMean = distances.length
+                            ? distances.reduce((acc, v) => acc + v, 0) / distances.length
+                            : null;
+                        scored.push({
+                            imageId: group.imageId,
+                            filename: group.label,
+                            score: Number(evaluation.score) || 0,
+                            affinity: Number(evaluation.metrics?.affinity) || 0,
+                            cohesion: Number(evaluation.metrics?.cohesion) || 0,
+                            sampleSize: Number(evaluation.metrics?.sampleSize ?? evaluation.metrics?.originalCandidateCount ?? 0) || 0,
+                            distanceMean,
+                        });
+                    }
+
+                    scored.sort((a, b) => b.score - a.score);
+                    topMatches = scored.slice(0, topK);
+                } catch {
+                    // non-fatal: skip detailed match reporting
+                    topMatches = [];
+                }
+            }
+
             onDiscriminatorSelected?.({
                 iterationNumber,
                 startFeature,
                 discriminatorFeature: bestDiscriminator,
                 metrics: metricsWithScore,
                 ambiguousCandidates: candidateImageIds.size,
+                topMatches,
             });
 
             const startNodeId = await getOrCreateFeatureNode(dbConnection, startFeature);

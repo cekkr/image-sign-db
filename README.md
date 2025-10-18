@@ -164,6 +164,20 @@ Create a folder (e.g., `training_dataset`) and fill it with the images you want 
     # Kick off training
     node src/train.js ./path/to/dataset --discover=15 --bootstrap=75 --reprobe=50
 
+Debugging per-iteration correlations
+-----------------------------------
+
+Enable detailed per-cycle logs that list which images correlated for each discovered discriminator during training by setting these environment variables:
+
+- `TRAINING_CORRELATION_DEBUG_LOG=1` to turn on detailed logs.
+- `TRAINING_CORRELATION_TOP_LOG_K=5` to control how many top matches to print per cycle.
+
+Example:
+
+    TRAINING_CORRELATION_DEBUG_LOG=1 TRAINING_CORRELATION_TOP_LOG_K=5 node src/train.js ./path/to/dataset --discover=12
+
+This prints, for each selected discriminator, the top correlated images with their scores, affinities, cohesion, and mean distance.
+
     # Training check evaluation
     node src/train.js <dataset_dir> --evaluate --evaluate-filters=original,cropping --evaluate-runs=3 --evaluate-top=5 prints per-image match tables plus a summary; adjust filters/runs/top as needed.
 
