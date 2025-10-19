@@ -11,7 +11,7 @@ require('dotenv').config();
 const { bootstrapCorrelations } = require('./insert');
 const { generateSpecificVector } = require('./featureExtractor');
 const settings = require('./settings');
-const { createDbConnection, discoverCorrelations } = require('./lib/knowledge');
+const { createDbConnection, discoverCorrelations, fetchConstellationGraph } = require('./lib/knowledge');
 const { CHANNEL_DIMENSIONS, CONSTELLATION_CONSTANTS } = require('./lib/constants');
 const { euclideanDistance } = require('./lib/correlationMetrics');
 const { parseDescriptor } = require('./lib/descriptor');
@@ -615,7 +615,7 @@ async function sampleRandomProbeSpec(db) {
   });
 }
 
-async function reprobeOne(db, imagePath, imageId, options = {}) {
+async function reprobeWithRandomSampling(db, imagePath, imageId, options = {}) {
   const maxSteps = options.maxSteps ?? CHANNEL_DIMENSIONS.length;
   let constellationPath = [];
   let remaining = null;
@@ -662,6 +662,255 @@ async function reprobeOne(db, imagePath, imageId, options = {}) {
   const remainingCount = Array.isArray(remaining) ? remaining.length : 0;
   const ok = remaining && remainingCount === 1 && remaining[0] === imageId;
   return { ok, initial, steps: constellationPath.length, path: constellationPath, remainingCount };
+}
+
+function radiansToDegrees(angle) {
+  return angle * (180 / Math.PI);
+}
+
+function angularDifference(a, b) {
+  let diff = a - b;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  return Math.abs(diff);
+}
+
+function computeConfidence(hits, misses) {
+  const h = Math.max(0, Number(hits) || 0);
+  const m = Math.max(0, Number(misses) || 0);
+  const total = h + m;
+  return total > 0 ? h / total : 0;
+}
+
+function computeConstellationScore(hits, misses) {
+  const h = Math.max(0, Number(hits) || 0);
+  const m = Math.max(0, Number(misses) || 0);
+  return h - m * 0.35;
+}
+
+async function reprobeUsingConstellations(db, imagePath, imageId, options = {}) {
+  const limit = Math.max(8, Number(options.constellationLimit ?? 80));
+  const minHits = Math.max(0, Number(options.constellationMinHits ?? 1));
+
+  let rawEntries;
+  try {
+    rawEntries = await fetchConstellationGraph(db, { limit, minHits });
+  } catch (error) {
+    console.warn(`   ↳ Unable to load constellation graph: ${error?.message ?? error}`);
+    return null;
+  }
+  if (!Array.isArray(rawEntries) || rawEntries.length === 0) return null;
+
+  const normalizedEntries = [];
+  const anchorGroups = new Map();
+
+  for (const raw of rawEntries) {
+    const spec = descriptorToSpec(raw.relatedDescriptor);
+    if (!spec) continue;
+    const normalizedSpec = normalizeProbeSpec({
+      ...spec,
+      descriptor: spec.descriptor ?? raw.relatedDescriptor,
+      descriptorKey: spec.descriptorKey,
+    });
+    if (!normalizedSpec) continue;
+    const anchorSpec = raw.anchorDescriptor ? descriptorToSpec(raw.anchorDescriptor) : null;
+    const entry = {
+      raw,
+      normalizedSpec,
+      dedupeKey: `${normalizedSpec.descriptorKey}:${normalizedSpec.resolution_level}:${normalizedSpec.pos_x}:${normalizedSpec.pos_y}`,
+      anchorDescriptorKey: anchorSpec?.descriptorKey ?? null,
+      anchorVectorId: raw.anchorVectorId,
+      geometry: {
+        length: Number(raw.vector_length) || 0,
+        angle: Number(raw.vector_angle) || 0,
+        valueDelta: Number(raw.vector_value) || 0,
+      },
+      stats: {
+        hits: Number(raw.hit_count) || 0,
+        misses: Number(raw.miss_count) || 0,
+      },
+    };
+    entry.stats.confidence = computeConfidence(entry.stats.hits, entry.stats.misses);
+    entry.score = computeConstellationScore(entry.stats.hits, entry.stats.misses);
+    normalizedEntries.push(entry);
+    if (!anchorGroups.has(entry.anchorVectorId)) anchorGroups.set(entry.anchorVectorId, []);
+    anchorGroups.get(entry.anchorVectorId).push(entry);
+  }
+
+  if (normalizedEntries.length === 0) return null;
+
+  normalizedEntries.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.stats.confidence !== a.stats.confidence) return b.stats.confidence - a.stats.confidence;
+    return a.dedupeKey.localeCompare(b.dedupeKey);
+  });
+
+  for (const group of anchorGroups.values()) {
+    group.sort((a, b) => {
+      if (b.stats.confidence !== a.stats.confidence) return b.stats.confidence - a.stats.confidence;
+      if (b.stats.hits !== a.stats.hits) return b.stats.hits - a.stats.hits;
+      return a.dedupeKey.localeCompare(b.dedupeKey);
+    });
+  }
+
+  const queue = [];
+  const enqueued = new Set();
+  for (const entry of normalizedEntries) {
+    if (enqueued.has(entry.dedupeKey)) continue;
+    queue.push(entry);
+    enqueued.add(entry.dedupeKey);
+  }
+
+  if (queue.length === 0) return null;
+
+  const used = new Set();
+  let steps = 0;
+  let remaining = null;
+  let constellationPath = [];
+  const maxSteps = Math.max(1, Number(options.maxSteps ?? CHANNEL_DIMENSIONS.length));
+  const relatedFanout = Math.max(1, Number(options.relatedFanout ?? 3));
+  const globalFanout = Math.max(1, Number(options.globalFanout ?? 2));
+  const angleTolerance = Number.isFinite(options.angleTolerance) ? options.angleTolerance : Math.PI / 18;
+  const lengthTolerance = Number.isFinite(options.lengthTolerance) ? options.lengthTolerance : 0.12;
+
+  let initialCount = 0;
+
+  while (queue.length > 0 && steps < maxSteps) {
+    const entry = queue.shift();
+    if (!entry) break;
+    if (used.has(entry.dedupeKey)) continue;
+    used.add(entry.dedupeKey);
+
+    const spec = entry.normalizedSpec;
+    const vector = await generateSpecificVector(imagePath, spec);
+    if (!vector) {
+      console.log(`   ↳ ⚠️ Unable to realize constellation ${spec.descriptorKey}; skipping.`);
+      continue;
+    }
+
+    const probe = {
+      ...spec,
+      value: vector.value,
+      size: vector.size ?? spec.size,
+      descriptor: vector.descriptor ?? spec.descriptor,
+      descriptorKey: vector.descriptorKey ?? spec.descriptorKey,
+    };
+
+    steps += 1;
+    console.log(
+      `   ✳️ Constellation step ${steps}: ${probe.descriptorKey} (anchor ${entry.anchorDescriptorKey ?? entry.anchorVectorId ?? 'n/a'})`
+    );
+    console.log(
+      `      geometry angle ${radiansToDegrees(entry.geometry.angle).toFixed(1)}° | length ${entry.geometry.length.toFixed(
+        4
+      )} | confidence ${(entry.stats.confidence * 100).toFixed(1)}% (hits ${entry.stats.hits}, misses ${entry.stats.misses})`
+    );
+
+    const candidateRaw = await findCandidateImages(db, probe);
+    const candidateIds = Array.isArray(candidateRaw) ? [...candidateRaw] : [];
+    const candidateSet = new Set(candidateIds);
+    const nextRemaining =
+      remaining === null ? candidateIds : remaining.filter((id) => candidateSet.has(id));
+    const prevLabel = remaining === null ? '∅' : String(remaining.length);
+    console.log(`      candidates ${prevLabel} → ${nextRemaining.length}`);
+
+    remaining = nextRemaining;
+    if (steps === 1) {
+      initialCount = remaining.length;
+    }
+
+    constellationPath = extendConstellationPath(constellationPath, {
+      descriptorKey: probe.descriptorKey,
+      candidateCount: remaining.length,
+      rel_x: probe.rel_x,
+      rel_y: probe.rel_y,
+      size: probe.size,
+    });
+
+    if (remaining.length <= 1) break;
+
+    const relatedGroup = anchorGroups.get(entry.anchorVectorId) || [];
+    const anchorQueued = [];
+    for (const candidate of relatedGroup) {
+      if (candidate.dedupeKey === entry.dedupeKey) continue;
+      if (used.has(candidate.dedupeKey) || enqueued.has(candidate.dedupeKey)) continue;
+      anchorQueued.push(candidate);
+      enqueued.add(candidate.dedupeKey);
+      if (anchorQueued.length >= relatedFanout) break;
+    }
+    if (anchorQueued.length > 0) {
+      for (let i = anchorQueued.length - 1; i >= 0; i -= 1) {
+        queue.unshift(anchorQueued[i]);
+      }
+      console.log(
+        `      ↺ queued ${anchorQueued.length} related constellation(s) from anchor ${
+          entry.anchorDescriptorKey ?? entry.anchorVectorId ?? 'n/a'
+        }: ${anchorQueued.map((c) => c.normalizedSpec.descriptorKey).join(', ')}`
+      );
+    }
+
+    const similar = [];
+    for (const candidate of normalizedEntries) {
+      if (candidate.anchorVectorId === entry.anchorVectorId) continue;
+      if (candidate.dedupeKey === entry.dedupeKey) continue;
+      if (used.has(candidate.dedupeKey) || enqueued.has(candidate.dedupeKey)) continue;
+      const angleDiff = angularDifference(candidate.geometry.angle, entry.geometry.angle);
+      if (angleDiff > angleTolerance) continue;
+      const lengthDiff = Math.abs(candidate.geometry.length - entry.geometry.length);
+      if (lengthDiff > lengthTolerance) continue;
+      similar.push({ candidate, angleDiff, lengthDiff });
+    }
+    similar.sort((a, b) => {
+      if (a.angleDiff !== b.angleDiff) return a.angleDiff - b.angleDiff;
+      return a.lengthDiff - b.lengthDiff;
+    });
+    const globalQueued = [];
+    for (const item of similar.slice(0, globalFanout)) {
+      globalQueued.push(item);
+      enqueued.add(item.candidate.dedupeKey);
+      queue.push(item.candidate);
+    }
+    if (globalQueued.length > 0) {
+      console.log(
+        `      ↺ queued ${globalQueued.length} geometry-similar constellation(s): ${globalQueued
+          .map(
+            (entryLike) =>
+              `${entryLike.candidate.normalizedSpec.descriptorKey} (Δθ=${radiansToDegrees(entryLike.angleDiff).toFixed(
+                1
+              )}°, Δℓ=${entryLike.lengthDiff.toFixed(3)})`
+          )
+          .join(', ')}`
+      );
+    }
+  }
+
+  if (constellationPath.length === 0) return null;
+
+  const ok = Array.isArray(remaining) && remaining.length === 1 && remaining[0] === imageId;
+  const remainingCount = Array.isArray(remaining) ? remaining.length : 0;
+  if (!ok && remainingCount > 1) {
+    const preview = remaining.slice(0, 6).join(', ');
+    console.log(
+      `      ↳ remaining ambiguous candidates (${remainingCount}): ${preview}${
+        remaining.length > 6 ? '…' : ''
+      }`
+    );
+  }
+
+  return {
+    ok,
+    initial: initialCount,
+    steps: constellationPath.length,
+    path: constellationPath,
+    remainingCount,
+  };
+}
+
+async function reprobeOne(db, imagePath, imageId, options = {}) {
+  const constellationResult = await reprobeUsingConstellations(db, imagePath, imageId, options);
+  if (constellationResult) return constellationResult;
+  console.log('   ↳ Falling back to random constellation sampling.');
+  return reprobeWithRandomSampling(db, imagePath, imageId, options);
 }
 
 class TrainingSelfEvaluator {

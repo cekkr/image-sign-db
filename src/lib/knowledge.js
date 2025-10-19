@@ -147,6 +147,63 @@ async function upsertFeatureGroupStats(dbConnection, startFeature, discriminator
     );
 }
 
+async function fetchConstellationGraph(dbConnection, options = {}) {
+    const limit = Math.max(1, Number(options.limit ?? 80));
+    const minHits = Math.max(0, Number(options.minHits ?? 1));
+
+    const [rows] = await dbConnection.execute(
+        `SELECT
+            kn.node_id,
+            kn.parent_node_id,
+            kn.vector_length,
+            kn.vector_angle,
+            kn.vector_value,
+            kn.hit_count,
+            kn.miss_count,
+            fv1.vector_id AS anchor_vector_id,
+            fv1.value_type AS anchor_value_type,
+            fv2.vector_id AS related_vector_id,
+            fv2.value_type AS related_value_type,
+            vt1.descriptor_json AS anchor_descriptor_json,
+            vt2.descriptor_json AS related_descriptor_json
+         FROM knowledge_nodes kn
+         JOIN feature_vectors fv1 ON fv1.vector_id = kn.vector_1_id
+         JOIN value_types vt1 ON vt1.value_type_id = fv1.value_type
+         JOIN feature_vectors fv2 ON fv2.vector_id = kn.vector_2_id
+         JOIN value_types vt2 ON vt2.value_type_id = fv2.value_type
+         WHERE kn.node_type = 'GROUP'
+           AND kn.vector_2_id IS NOT NULL
+           AND kn.hit_count >= ?
+         ORDER BY kn.hit_count DESC, kn.miss_count ASC, kn.node_id ASC
+         LIMIT ?`,
+        [minHits, limit]
+    );
+
+    const results = [];
+    for (const row of rows) {
+        const anchorDescriptor = parseDescriptor(row.anchor_descriptor_json);
+        const relatedDescriptor = parseDescriptor(row.related_descriptor_json);
+        if (!relatedDescriptor) continue;
+        results.push({
+            nodeId: row.node_id,
+            parentNodeId: row.parent_node_id,
+            anchorVectorId: Number(row.anchor_vector_id) || null,
+            relatedVectorId: Number(row.related_vector_id) || null,
+            anchorValueType: Number(row.anchor_value_type) || null,
+            relatedValueType: Number(row.related_value_type) || null,
+            hit_count: Number(row.hit_count) || 0,
+            miss_count: Number(row.miss_count) || 0,
+            vector_length: Number(row.vector_length) || 0,
+            vector_angle: Number(row.vector_angle) || 0,
+            vector_value: Number(row.vector_value) || 0,
+            anchorDescriptor,
+            relatedDescriptor,
+        });
+    }
+
+    return results;
+}
+
 async function discoverCorrelations({
     iterations,
     similarityThreshold,
@@ -417,6 +474,7 @@ module.exports = {
     updateNodeStats,
     getOrCreateFeatureGroupNode,
     upsertFeatureGroupStats,
+    fetchConstellationGraph,
     selectTopDescriptors,
 };
 

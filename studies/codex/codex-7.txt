@@ -1,0 +1,8 @@
+Added fetchConstellationGraph so the training pipeline can pull ranked GROUP relationships (anchor + related vector descriptors) directly from the knowledge graph instead of iterating image by image (src/lib/knowledge.js:150).
+Reworked probing to iterate per constellation with visible logging: constellations are queued, related ones are spawned from the same anchor or matching geometry, and ambiguous candidates are reported while still falling back to the legacy random sampler when the graph is empty (src/train.js:691, src/train.js:909).
+Introduced geometry helpers for angle/length deltas and confidence scoring to drive queue ordering and produce human-readable diagnostics during reprobe runs (src/train.js:667, src/train.js:671, src/train.js:678, src/train.js:685).
+Testing: not run (no automated suite available).
+
+Next steps:
+
+Run node src/train.js --reprobe=1 against a dataset with populated knowledge_nodes to review the new constellation-first logs and ensure the graph holds enough hits to avoid the fallback path.
