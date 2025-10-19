@@ -216,17 +216,32 @@ function descriptorToSpec(descriptor) {
 }
 
 function extendConstellationPath(path = [], stepInput = {}) {
+    const candidateCount = Number.isFinite(stepInput.candidateCount) ? stepInput.candidateCount : 0;
+    const confidenceRaw = Number.isFinite(stepInput.confidence) ? stepInput.confidence : 1;
+    const confidence = Math.max(0, Math.min(1, confidenceRaw));
+    const baseAccuracy = candidateCount > 0 ? 1 / candidateCount : 0;
+    const accuracyScore = Number((baseAccuracy * (confidence || 1)).toFixed(6));
+    const previousCumulative = path.length > 0 ? path[path.length - 1].cumulativeAccuracy ?? 1 : 1;
+    const cumulativeAccuracy = Number((previousCumulative * (accuracyScore || 1)).toFixed(6));
     const step = {
         descriptorKey: stepInput.descriptorKey,
-        candidateCount: stepInput.candidateCount ?? 0,
+        candidateCount,
         rel_x: stepInput.rel_x ?? 0,
         rel_y: stepInput.rel_y ?? 0,
         size: stepInput.size ?? 0,
+        source: stepInput.source || 'unknown',
+        confidence,
+        hits: Number.isFinite(stepInput.hits) ? Number(stepInput.hits) : null,
+        misses: Number.isFinite(stepInput.misses) ? Number(stepInput.misses) : null,
+        accuracyScore,
+        cumulativeAccuracy,
     };
-    const accuracyScore = step.candidateCount > 0 ? 1 / step.candidateCount : 0;
-    const previousCumulative = path.length > 0 ? path[path.length - 1].cumulativeAccuracy ?? 1 : 1;
-    step.accuracyScore = Number(accuracyScore.toFixed(6));
-    step.cumulativeAccuracy = Number((previousCumulative * (step.accuracyScore || 1)).toFixed(6));
+    if (typeof stepInput.reason === 'string' && stepInput.reason) {
+        step.reason = stepInput.reason;
+    }
+    if (stepInput.knowledgeNodeId) {
+        step.knowledgeNodeId = stepInput.knowledgeNodeId;
+    }
     return [...path, step];
 }
 

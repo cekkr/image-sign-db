@@ -59,6 +59,24 @@ function normalizeProbeSpec(spec = {}) {
     offset_y: Number(normalized.offset_y.toFixed(6)),
   };
   normalized.descriptorKey = createDescriptorKey(normalized.descriptor);
+  if (spec && typeof spec.source === 'string') {
+    normalized.source = spec.source;
+  }
+  if (spec && Number.isFinite(spec.confidence)) {
+    normalized.confidence = Number(spec.confidence);
+  }
+  if (spec && typeof spec.reason === 'string' && spec.reason) {
+    normalized.reason = spec.reason;
+  }
+  if (spec && spec.knowledgeNodeId) {
+    normalized.knowledgeNodeId = spec.knowledgeNodeId;
+  }
+  if (spec && Number.isFinite(spec.hits)) {
+    normalized.hits = Number(spec.hits);
+  }
+  if (spec && Number.isFinite(spec.misses)) {
+    normalized.misses = Number(spec.misses);
+  }
 
   return normalized;
 }

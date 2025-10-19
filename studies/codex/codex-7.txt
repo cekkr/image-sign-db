@@ -6,3 +6,16 @@ Testing: not run (no automated suite available).
 Next steps:
 
 Run node src/train.js --reprobe=1 against a dataset with populated knowledge_nodes to review the new constellation-first logs and ensure the graph holds enough hits to avoid the fallback path.
+
+
+====
+
+Explore better the concept of "constellation" (or pattern, remember to write its synonymous): it has to takes a vector and then related it to other possible constellation with other vectors found both on the server that randomly on the client (the client shouldn't send enough information to rebuild the image): on the long term, it creates a sort of "decisional tree of possible complex constellations", and the fact that vectors and constellation has only relative values and not absolute, it works even with distorted, morrired etc images. On the long term, the "probability tree" becames ever ever more precise, says what feature extract client side to prove the theory or require more precision and attempts (or gives up admitting no relationships with signed image on db). So, this is a sort of "machine learning that works on a classic database", and this is important too about the learning about what vectors/constellations/groups are important to discover/save and what to ignore, for this reason the first train.js with random images is so important
+
+Added fetchRelatedConstellations to surface high-confidence constellation/pattern neighbours with probability scores for search-time branching (src/lib/knowledge.js:470-553), and extended extendConstellationPath to record source, confidence, hit/miss stats, and knowledge IDs in the decision trail (src/lib/constellation.js:218-245).
+Reworked the search loop to mix learned probes with exploration: startSearch/refineSearch now preserve probe metadata, enrich constellation paths, and track channel fallbacks (src/index.js:186-353), while buildNextQuestion prioritises knowledge-guided branches before injecting random probes for privacy (src/index.js:358-419).
+Propagated probe metadata end-to-end: normalization keeps source/confidence/hits fields (src/evaluate.js:62-79), the CLI prints these tags so operators can see when the server follows the pattern tree versus exploring (src/clientAPI.js:38-136).
+Documented the probability-tree workflow, synonym usage (“constellation” / “pattern”), metadata semantics, and the importance of early random training runs in both README and TECH_NOTES (README.md:45-278, TECH_NOTES.md:60-168).
+Verification: node --check src/index.js, node --check src/lib/knowledge.js, and node --check src/clientAPI.js.
+
+Next steps: 1) Re-run node src/train.js <dataset> on a shuffled dataset to seed the updated probability tree. 2) Start the server/client and observe source/confidence fields to validate knowledge-guided probing.

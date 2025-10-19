@@ -35,8 +35,12 @@ async function findImageRemotely(imagePath) {
     }
     let sessionId = result.sessionId;
     const probeSpec = result.probeSpec;
+    const initialSource = probeSpec.source ? ` source=${probeSpec.source}` : '';
+    const initialConfidence = Number.isFinite(probeSpec.confidence)
+        ? ` confidence=${Number(probeSpec.confidence).toFixed(3)}`
+        : '';
     console.log(
-        `  Server selected descriptor ${probeSpec.descriptorKey} (channel: ${probeSpec.descriptor?.channel ?? '?'}, span=${(probeSpec.span ?? probeSpec.size ?? 0).toFixed(4)}, offset=[${(probeSpec.offset_x ?? probeSpec.rel_x ?? 0).toFixed(4)}, ${(probeSpec.offset_y ?? probeSpec.rel_y ?? 0).toFixed(4)}])`
+        `  Server selected descriptor ${probeSpec.descriptorKey} (channel: ${probeSpec.descriptor?.channel ?? '?'}, span=${(probeSpec.span ?? probeSpec.size ?? 0).toFixed(4)}, offset=[${(probeSpec.offset_x ?? probeSpec.rel_x ?? 0).toFixed(4)}, ${(probeSpec.offset_y ?? probeSpec.rel_y ?? 0).toFixed(4)}])${initialSource}${initialConfidence}`
     );
 
     const probeVector = await generateSpecificVector(imagePath, probeSpec);
@@ -76,8 +80,12 @@ async function findImageRemotely(imagePath) {
         const nextQuestion = result.nextQuestion;
         if (!nextQuestion) break;
 
+        const sourceLabel = nextQuestion.source ? ` source=${nextQuestion.source}` : '';
+        const confLabel = Number.isFinite(nextQuestion.confidence)
+            ? ` confidence=${Number(nextQuestion.confidence).toFixed(3)}`
+            : '';
         console.log(
-            `  [Iteration ${iterations}] Server requests descriptor ${nextQuestion.descriptorKey} (channel: ${nextQuestion.descriptor?.channel ?? '?'}, span=${(nextQuestion.span ?? nextQuestion.size ?? 0).toFixed(4)}, offset=[${(nextQuestion.offset_x ?? nextQuestion.rel_x ?? 0).toFixed(4)}, ${(nextQuestion.offset_y ?? nextQuestion.rel_y ?? 0).toFixed(4)}])`
+            `  [Iteration ${iterations}] Server requests descriptor ${nextQuestion.descriptorKey} (channel: ${nextQuestion.descriptor?.channel ?? '?'}, span=${(nextQuestion.span ?? nextQuestion.size ?? 0).toFixed(4)}, offset=[${(nextQuestion.offset_x ?? nextQuestion.rel_x ?? 0).toFixed(4)}, ${(nextQuestion.offset_y ?? nextQuestion.rel_y ?? 0).toFixed(4)}])${sourceLabel}${confLabel}`
         );
 
         const nextVector = await generateSpecificVector(imagePath, nextQuestion);

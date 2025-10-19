@@ -4,7 +4,7 @@ const settings = require('../settings');
 const { scoreCandidateFeature, euclideanDistance } = require('./correlationMetrics');
 const { collectElasticMatches } = require('./elasticMatcher');
 const { CONSTELLATION_CONSTANTS } = require('./constants');
-const { parseDescriptor } = require('./descriptor');
+const { parseDescriptor, createDescriptorKey } = require('./descriptor');
 const { descriptorToSpec } = require('./constellation');
 const { recordVectorUsage } = require('./storageManager');
 
@@ -467,6 +467,79 @@ async function discoverCorrelations({
     }
 }
 
+async function fetchRelatedConstellations(dbConnection, options = {}) {
+    const limit = Math.max(1, Number(options.limit ?? 12));
+    const minHits = Math.max(0, Number(options.minHits ?? 1));
+    const baseDescriptorKey = options.descriptorKey;
+    let valueTypeId = Number(options.valueTypeId);
+
+    if (!valueTypeId) {
+        if (!baseDescriptorKey) return [];
+        const [valueTypeRows] = await dbConnection.execute(
+            'SELECT value_type_id FROM value_types WHERE descriptor_hash = ? LIMIT 1',
+            [baseDescriptorKey]
+        );
+        if (valueTypeRows.length === 0) return [];
+        valueTypeId = Number(valueTypeRows[0].value_type_id);
+    }
+
+    const whereClauses = [`kn.node_type = 'GROUP'`, `kn.vector_2_id IS NOT NULL`, `fv1.value_type = ?`];
+    const params = [valueTypeId];
+
+    if (Number.isFinite(options.resolutionLevel)) {
+        whereClauses.push('fv1.resolution_level = ?');
+        params.push(Number(options.resolutionLevel));
+    }
+
+    whereClauses.push('kn.hit_count >= ?');
+    params.push(minHits);
+
+    const [rows] = await dbConnection.execute(
+        `SELECT kn.node_id,
+                kn.hit_count,
+                kn.miss_count,
+                fv2.value_type AS related_value_type,
+                fv2.resolution_level AS related_resolution_level,
+                vt2.descriptor_json AS related_descriptor_json
+         FROM knowledge_nodes kn
+         JOIN feature_vectors fv1 ON fv1.vector_id = kn.vector_1_id
+         JOIN feature_vectors fv2 ON fv2.vector_id = kn.vector_2_id
+         JOIN value_types vt2 ON vt2.value_type_id = fv2.value_type
+         WHERE ${whereClauses.join(' AND ')}
+         ORDER BY kn.hit_count DESC, kn.miss_count ASC, kn.node_id ASC
+         LIMIT ?`,
+        [...params, limit]
+    );
+
+    const seen = new Map();
+    for (const row of rows) {
+        const descriptor = parseDescriptor(row.related_descriptor_json);
+        if (!descriptor) continue;
+        const spec = descriptorToSpec(descriptor);
+        if (!spec) continue;
+        const descriptorKey = spec.descriptorKey ?? createDescriptorKey(descriptor);
+        if (descriptorKey === baseDescriptorKey) continue;
+        const hits = Number(row.hit_count) || 0;
+        const misses = Number(row.miss_count) || 0;
+        const total = Math.max(0, hits + misses);
+        const confidence = total > 0 ? hits / total : hits > 0 ? 1 : 0;
+        const existing = seen.get(descriptorKey);
+        if (!existing || existing.confidence < confidence) {
+            seen.set(descriptorKey, {
+                descriptor,
+                spec,
+                descriptorKey,
+                confidence: Math.max(0, Math.min(1, confidence)),
+                hits,
+                misses,
+                knowledgeNodeId: Number(row.node_id) || null,
+            });
+        }
+    }
+
+    return Array.from(seen.values());
+}
+
 module.exports = {
     createDbConnection,
     discoverCorrelations,
@@ -476,6 +549,7 @@ module.exports = {
     upsertFeatureGroupStats,
     fetchConstellationGraph,
     selectTopDescriptors,
+    fetchRelatedConstellations,
 };
 
 async function selectTopDescriptors(db, options = {}) {

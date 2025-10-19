@@ -8,7 +8,7 @@ The core principle is a secure, server-guided search that minimizes data transfe
 The Algorithm Logic
 -------------------
 
-The system is built on four key concepts that work together to create an intelligent and efficient recognition engine.
+The system is built on several key concepts that work together to create an intelligent and efficient recognition engine.
 
 ### 1\. Multidimensional Vectorization: The "Image Hypercube"
 
@@ -41,6 +41,15 @@ The "brain" of the system is the `knowledge_nodes` table in MySQL. This table is
 *   **Learning via Stats:** Each node tracks raw `hit_count` and `miss_count`. These counters are updated whenever a feature (or feature pair) proves useful, providing the utility score that guides the search loop.
     
 Complementing the graph is the `feature_group_stats` table. It aggregates relative statistics per channel and resolution (average vector length, angle, separation metrics) so discovery sweeps can be summarised without duplicating individual links. The search API can consult these stats or pick alternative channels on the fly.
+
+### 3\. Probabilistic Constellation Tree ("Pattern Tree")
+
+The term *constellation* (also referenced as a *pattern*) captures how relative vectors cooperate over time. Every measured descriptor becomes a branch in a probability tree that grows as the system learns.
+
+*   **Knowledge-driven edges:** The server pulls the highest-confidence neighbours for the current descriptor from `knowledge_nodes`, using hit/miss statistics to assign a confidence score. These branches are returned to the client with metadata (`source=knowledge`, `confidence=<0-1>`), telling the client which hypothesis the server wants to test next.
+*   **Exploratory probes:** To keep learning unbiased and privacy-friendly, each session also injects occasional random probes (`source=exploration`/`random`). These rely on the deterministic constellation library but avoid sending enough information to recreate the original image.
+*   **Relative-only geometry:** Because anchors, spans, and offsets are stored in `[0,1]`, the same constellation tree works across mirrored, cropped, rescaled, or color-shifted images without leaking absolute pixel data to the server.
+*   **Bootstrapping matters:** The first `train.js` sweep over a shuffled dataset seeds this tree with diverse evidence. Subsequent ingests continuously update probabilities so the server can decide whether to request more detail, jump across a pattern group, or abandon a failing branch.
 
 ### Patterns vs. Constellations
 
@@ -164,6 +173,8 @@ Create a folder (e.g., `training_dataset`) and fill it with the images you want 
     # Kick off training
     node src/train.js ./path/to/dataset --discover=15 --bootstrap=75 --reprobe=50
 
+> Tip: Start with a broad, shuffled dataset. Early random ingests populate the constellation/pattern probability tree so the server has high-confidence branches to follow during later searches.
+
 Debugging per-iteration correlations
 -----------------------------------
 
@@ -253,7 +264,7 @@ You can find a match for a new image in two ways. The system will continue to le
     # Optional: adjust the maximum on-disk footprint (in gigabytes)
     curl -X POST http://localhost:3000/settings/max-db-size -H "Content-Type: application/json" -d '{"value":6}'
         
-    Every `/search/start` and `/search/refine` response now embeds the statistical profile that informed the next question. The CLI prints those metrics so you can monitor how separation quality evolves during the dialog.
+    Every `/search/start` and `/search/refine` response now embeds the statistical profile that informed the next question. Each `nextQuestion` also reports its `source` (`knowledge`, `exploration`, or `random`) and a `confidence` score derived from the constellation/pattern probability tree. The CLI prints those metrics so you can monitor how separation quality evolves during the dialog.
         
 
 **B) Standalone CLI Mode**
@@ -268,7 +279,7 @@ The CLI mirrors the server behaviour and will surface any correlation metrics it
 
 If you are wiring a custom client, call:
 
-1. `POST /search/start { "requestProbe": true }` → receive `{ status: "REQUEST_PROBE", sessionId, probeSpec }`.
+1. `POST /search/start { "requestProbe": true }` → receive `{ status: "REQUEST_PROBE", sessionId, probeSpec }`. The probe includes `source`/`confidence` metadata so a client can track whether the server is pursuing a learned pattern or exploring.
 2. Measure that probe on your image and send `POST /search/start { sessionId, probe: { …, value } }`.
 3. For subsequent steps continue with `POST /search/refine` as before, passing each requested descriptor and measured value.
 

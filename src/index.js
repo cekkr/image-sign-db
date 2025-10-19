@@ -12,6 +12,7 @@ const { ingestImage, removeImage, bootstrapCorrelations } = require('./insert');
 const { recordVectorUsage, saveSkipPattern } = require('./lib/storageManager');
 const { extendConstellationPath, createRandomConstellationSpec, descriptorToSpec } = require('./lib/constellation');
 const { normalizeProbeSpec, ensureValueTypeRecord: ensureValueTypeRecordBase } = require('./evaluate');
+const { fetchRelatedConstellations } = require('./lib/knowledge');
 
 // --- CONFIGURATION ---
 const SERVER_PORT = settings.server.port;
@@ -118,6 +119,9 @@ async function requestInitialProbe() {
             descriptorKey: feature.descriptorKey ?? baseSpec.descriptorKey,
         });
         if (getSkipCount(normalized.descriptorKey) >= SKIP_THRESHOLD) continue;
+        normalized.source = 'seed';
+        normalized.confidence = 1;
+        normalized.reason = 'initial-seed';
         return { probe: normalized, feature };
     }
     return null;
@@ -181,6 +185,15 @@ async function findCandidateImages(db, probe) {
 
 async function startSearch(probeSpec, existingSessionId = null) {
     const normalizedProbe = normalizeProbeSpec(probeSpec);
+    if (!normalizedProbe) {
+        return { status: 'NO_MATCH' };
+    }
+    if (!normalizedProbe.source) {
+        normalizedProbe.source = existingSessionId ? 'follow-up' : 'initial';
+    }
+    if (!Number.isFinite(normalizedProbe.confidence)) {
+        normalizedProbe.confidence = 1;
+    }
     const db = await connectToDatabase();
     let probeToUse = { ...normalizedProbe };
     if (getSkipCount(probeToUse.descriptorKey) >= SKIP_THRESHOLD) {
@@ -193,6 +206,12 @@ async function startSearch(probeSpec, existingSessionId = null) {
                 random: false,
             });
             if (!candidate) continue;
+            candidate.source = normalizedProbe.source;
+            candidate.confidence = normalizedProbe.confidence;
+            candidate.reason = 'channel-fallback';
+            if (Number.isFinite(normalizedProbe.hits)) candidate.hits = normalizedProbe.hits;
+            if (Number.isFinite(normalizedProbe.misses)) candidate.misses = normalizedProbe.misses;
+            if (normalizedProbe.knowledgeNodeId) candidate.knowledgeNodeId = normalizedProbe.knowledgeNodeId;
             if (getSkipCount(candidate.descriptorKey) >= SKIP_THRESHOLD) continue;
             probeToUse = candidate;
             break;
@@ -206,6 +225,12 @@ async function startSearch(probeSpec, existingSessionId = null) {
         rel_x: probeToUse.rel_x,
         rel_y: probeToUse.rel_y,
         size: probeToUse.size,
+        source: probeToUse.source || normalizedProbe.source,
+        confidence: Number.isFinite(probeToUse.confidence) ? probeToUse.confidence : normalizedProbe.confidence,
+        hits: Number.isFinite(probeToUse.hits) ? probeToUse.hits : undefined,
+        misses: Number.isFinite(probeToUse.misses) ? probeToUse.misses : undefined,
+        knowledgeNodeId: probeToUse.knowledgeNodeId,
+        reason: probeToUse.reason || normalizedProbe.reason || 'initial-probe',
     });
     if (candidates.length === 0) {
         await saveSkipPattern(db, probeToUse.descriptor);
@@ -241,6 +266,26 @@ async function refineSearch(sessionId, probeSpec) {
     }
 
     const normalizedProbe = normalizeProbeSpec(probeSpec);
+    if (!normalizedProbe) {
+        return { status: 'NO_MATCH' };
+    }
+    if (!normalizedProbe.source) {
+        normalizedProbe.source = session.probeSpec?.source || 'follow-up';
+    }
+    if (!Number.isFinite(normalizedProbe.confidence)) {
+        normalizedProbe.confidence = Number.isFinite(session.probeSpec?.confidence)
+            ? session.probeSpec.confidence
+            : 1;
+    }
+    if (!Number.isFinite(normalizedProbe.hits) && Number.isFinite(session.probeSpec?.hits)) {
+        normalizedProbe.hits = session.probeSpec.hits;
+    }
+    if (!Number.isFinite(normalizedProbe.misses) && Number.isFinite(session.probeSpec?.misses)) {
+        normalizedProbe.misses = session.probeSpec.misses;
+    }
+    if (!normalizedProbe.knowledgeNodeId && session.probeSpec?.knowledgeNodeId) {
+        normalizedProbe.knowledgeNodeId = session.probeSpec.knowledgeNodeId;
+    }
     const db = await connectToDatabase();
     if (getSkipCount(normalizedProbe.descriptorKey) >= SKIP_THRESHOLD) {
         await saveSkipPattern(db, normalizedProbe.descriptor);
@@ -261,6 +306,12 @@ async function refineSearch(sessionId, probeSpec) {
             rel_x: normalizedProbe.rel_x,
             rel_y: normalizedProbe.rel_y,
             size: normalizedProbe.size,
+            source: normalizedProbe.source,
+            confidence: normalizedProbe.confidence,
+            hits: normalizedProbe.hits,
+            misses: normalizedProbe.misses,
+            knowledgeNodeId: normalizedProbe.knowledgeNodeId,
+            reason: normalizedProbe.reason || 'no-match',
         });
         session.constellationPath = updatedPath;
         return { status: 'NO_MATCH', constellationPath: updatedPath };
@@ -273,6 +324,12 @@ async function refineSearch(sessionId, probeSpec) {
             rel_x: normalizedProbe.rel_x,
             rel_y: normalizedProbe.rel_y,
             size: normalizedProbe.size,
+            source: normalizedProbe.source,
+            confidence: normalizedProbe.confidence,
+            hits: normalizedProbe.hits,
+            misses: normalizedProbe.misses,
+            knowledgeNodeId: normalizedProbe.knowledgeNodeId,
+            reason: normalizedProbe.reason || 'resolved-match',
         });
         return { status: 'MATCH_FOUND', imageId: remaining[0], constellationPath: updatedPath };
     }
@@ -286,6 +343,12 @@ async function refineSearch(sessionId, probeSpec) {
         rel_x: normalizedProbe.rel_x,
         rel_y: normalizedProbe.rel_y,
         size: normalizedProbe.size,
+        source: normalizedProbe.source,
+        confidence: normalizedProbe.confidence,
+        hits: normalizedProbe.hits,
+        misses: normalizedProbe.misses,
+        knowledgeNodeId: normalizedProbe.knowledgeNodeId,
+        reason: normalizedProbe.reason || 'refine',
     });
     searchSessions.set(sessionId, session);
 
@@ -294,12 +357,60 @@ async function refineSearch(sessionId, probeSpec) {
 
 async function buildNextQuestion(session) {
     if (!session || session.phase !== SESSION_PHASE.ACTIVE) return null;
-    const maxAttempts = 64;
+    const db = await connectToDatabase();
+    const knowledgeCandidates = [];
+
+    if (session.probeSpec?.descriptorKey) {
+        try {
+            const related = await fetchRelatedConstellations(db, {
+                descriptorKey: session.probeSpec.descriptorKey,
+                valueTypeId: session.probeSpec.valueTypeId,
+                resolutionLevel: session.probeSpec.resolution_level,
+                limit: 24,
+                minHits: 1,
+            });
+            for (const candidate of related) {
+                if (!candidate || !candidate.descriptorKey) continue;
+                if (session.askedDescriptorKeys.has(candidate.descriptorKey)) continue;
+                if (getSkipCount(candidate.descriptorKey) >= SKIP_THRESHOLD) continue;
+                knowledgeCandidates.push(candidate);
+            }
+        } catch (error) {
+            console.warn('⚠️  Knowledge lookup failed:', error?.message ?? error);
+        }
+    }
+
+    if (knowledgeCandidates.length > 0) {
+        knowledgeCandidates.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
+        const explorationBias = Math.random();
+        if (explorationBias >= 0.2) {
+            const candidate = knowledgeCandidates[0];
+            const normalized = normalizeProbeSpec({
+                ...candidate.spec,
+                source: 'knowledge',
+                confidence: candidate.confidence,
+                knowledgeNodeId: candidate.knowledgeNodeId,
+                hits: candidate.hits,
+                misses: candidate.misses,
+                reason: 'knowledge-link',
+            });
+            if (normalized && !session.askedDescriptorKeys.has(normalized.descriptorKey)) {
+                return normalized;
+            }
+        }
+    }
+
+    const maxAttempts = 96;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
         const candidateSpec = createRandomConstellationSpec({
-            augmentation: session.probeSpec.augmentation,
+            augmentation: session.probeSpec?.augmentation,
         });
-        const normalized = normalizeProbeSpec(candidateSpec);
+        const normalized = normalizeProbeSpec({
+            ...candidateSpec,
+            source: knowledgeCandidates.length > 0 ? 'exploration' : 'random',
+            confidence: knowledgeCandidates.length > 0 ? 0.35 : 0.25,
+            reason: knowledgeCandidates.length > 0 ? 'exploration-random-mix' : 'random-probe',
+        });
         if (!normalized) continue;
         if (session.askedDescriptorKeys.has(normalized.descriptorKey)) continue;
         if (getSkipCount(normalized.descriptorKey) >= SKIP_THRESHOLD) continue;

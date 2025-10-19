@@ -33,6 +33,7 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - Optional `image_blobs` (created on demand when `STORE_IMAGE_BLOB=true`) stores original pixels for re-vectorization (`src/featureExtractor.js`).
 
 ## 5. Constellation Descriptors
+- Constellations (also referenced as *patterns*) encode how two relative anchor patches relate under a specific augmentation/channel.
 - Descriptor space is defined by `CONSTELLATION_CONSTANTS` (relative span, offset magnitude, anchor/offset tolerances) and channel list `[h, s, v, luminance, stddev]` (`src/lib/constants.js`).
 - Deterministic sampling uses `SAMPLES_PER_AUGMENTATION` seeds per augmentation; descriptors hash `augmentation`, anchor coordinates, span, offsets, channel (`src/lib/constellation.js`).
 - Descriptors are normalized to resolution-independent anchors (`anchor_u/v`), spans (`span`), and offsets (`offset_x/y`), enabling cross-scale and mirrored matching.
@@ -62,6 +63,7 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - Adaptive worker pool:
   - Uses Node worker threads (`src/workers/ingestWorker.js`) for ingestion; sizing reacts to CPU load, memory, and queue length.
   - Worker jobs call `insert.js` ingestion path, so all storage safeguards remain consistent.
+- Early bootstrapping with shuffled datasets seeds the constellation/pattern probability tree before knowledge-driven probes dominate search requests.
 - Online correlation discovery:
   - `discoverCorrelations` selects discriminators, updates `knowledge_nodes`, `feature_group_stats`, and logs metrics.
   - `TRAINING_CORRELATION_DEBUG_LOG` and `TRAINING_CORRELATION_TOP_LOG_K` gate verbose per-iteration diagnostics.
@@ -83,6 +85,7 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
   - For each useful pair it creates/updates FEATURE and GROUP nodes, increments hit/miss counts, and writes aggregate stats (`feature_group_stats`).
 - `fetchConstellationGraph`:
   - Returns ranked GROUP relationships (hit_count >= configurable minimum) with parsed descriptors, enabling probe queues to follow proven geometry.
+- `fetchRelatedConstellations` feeds the online search loop with the highest-confidence neighbours for a descriptor, translating hit/miss history into a probability score that is echoed back to clients.
 - `recordVectorUsage` tracks descriptor value whenever used in search or correlation; data feeds pruning decisions.
 - `ensureValueTypeCapacity` (from `src/lib/schema.js`) upgrades schema columns to `MEDIUMINT` to avoid overflow before ingestion proceeds.
 
@@ -94,13 +97,14 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - Session management:
   - Maintains per-session phase, candidate set, asked descriptors, and `constellationPath`.
   - Initial probe is sampled randomly from DB, skipping descriptors that exceed `SKIP_THRESHOLD` (learned failures).
+  - Each probe now carries `source`, `confidence`, `hits`, and `misses`; `extendConstellationPath` multiplies those probabilities so the server (and client) can observe the evolving decision tree.
   - Each response records relaxations (elastic matcher), thresholds, and updates skip caches.
 - Candidate selection:
   - `ensureValueTypeRecord` resolves descriptor IDs through shared evaluator logic (`src/evaluate.js`).
   - `collectElasticMatches` sorts vector hits with threshold relaxation to avoid losing near misses.
   - Usage of matching vectors is incremented (`recordVectorUsage`).
 - Constellation-driven refinement:
-  - Uses `extendConstellationPath` and `createRandomConstellationSpec` to walk the knowledge graph; falls back to random sampling when knowledge is missing.
+  - Uses `fetchRelatedConstellations` + `extendConstellationPath` to prioritise learned patterns (`source=knowledge`) while occasionally injecting random probes (`source=exploration`/`random`) for privacy and continued learning.
 - CLI mode mirrors HTTP logic for offline searches (`node src/index.js find <image>`).
 
 ## 11. Client Tools & Scripts
@@ -160,6 +164,7 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - Set `TRAINING_CORRELATION_DEBUG_LOG=1` & `TRAINING_CORRELATION_TOP_LOG_K` for per-iteration candidate dumps.
 - Evaluation output reports affinity/cohesion/spread and threshold relaxations; elastic matcher logs when fallback tolerances were needed.
 - Search responses include relaxations and constellation path metrics so clients can trace scoring decisions.
+- Constellation path steps log `source`, `confidence`, `hits`, and `misses`, making the probability tree visible during API calls.
 - Real-time pruning logs begin with `🧹`; track to ensure pruning is functioning.
 
 ## 17. Dataset References & Notes
