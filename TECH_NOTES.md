@@ -176,3 +176,5 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - [ ] After significant updates, re-run `node src/setupDatabase.js`, retrain datasets, and update evaluation baselines.
 
 _Sync protocol_: After each development session, append updates here summarizing architectural changes, new tunables, schema migrations, and operational guidance.
+
+Automation: run `npm run maintenance:check` to verify documentation updates accompany core code modifications enforced by the first four checklist items.
