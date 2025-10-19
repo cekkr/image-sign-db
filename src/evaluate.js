@@ -7,6 +7,7 @@ const { CONSTELLATION_CONSTANTS, CHANNEL_DIMENSIONS } = require('./lib/constants
 const { createSeededRandom } = require('./lib/augmentations');
 const { collectElasticMatches } = require('./lib/elasticMatcher');
 const { scoreCandidateFeature } = require('./lib/correlationMetrics');
+const { normalizeResolutionLevel, resolutionLevelKey, RESOLUTION_LEVEL_TOLERANCE } = require('./lib/resolutionLevel');
 
 const VALUE_THRESHOLD = settings.search.valueThreshold;
 const KNOWN_AUGMENTATIONS = new Set(AUGMENTATION_ORDER);
@@ -42,10 +43,7 @@ function normalizeProbeSpec(spec = {}) {
 
   normalized.pos_x = Math.round(normalized.anchor_u * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
   normalized.pos_y = Math.round(normalized.anchor_v * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
-  normalized.resolution_level = Math.max(
-    0,
-    Math.min(255, Math.round(normalized.size * CONSTELLATION_CONSTANTS.SPAN_SCALE)),
-  );
+  normalized.resolution_level = normalizeResolutionLevel(normalized.size);
 
   normalized.descriptor = {
     family: 'delta',
@@ -191,7 +189,7 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, optio
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     const candidate = normalizeProbeSpec({ augmentation: filter.augmentation });
     if (!candidate) continue;
-    const dedupeKey = `${candidate.descriptorKey}:${candidate.resolution_level}:${candidate.pos_x}:${candidate.pos_y}`;
+    const dedupeKey = `${candidate.descriptorKey}:${resolutionLevelKey(candidate.resolution_level)}:${candidate.pos_x}:${candidate.pos_y}`;
     if (attempted.has(dedupeKey)) continue;
     attempted.add(dedupeKey);
     if (!fallback) fallback = candidate;
@@ -203,7 +201,7 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, optio
   if (!spec && fallback) {
     spec = fallback;
     if (dedupeSet) {
-      const fallbackKey = `${spec.descriptorKey}:${spec.resolution_level}:${spec.pos_x}:${spec.pos_y}`;
+    const fallbackKey = `${spec.descriptorKey}:${resolutionLevelKey(spec.resolution_level)}:${spec.pos_x}:${spec.pos_y}`;
       dedupeSet.add(fallbackKey);
     }
   }
@@ -255,6 +253,7 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, optio
   const params = [
     targetFeature.value_type,
     targetFeature.resolution_level,
+    RESOLUTION_LEVEL_TOLERANCE,
     targetFeature.pos_x,
     targetFeature.pos_y,
     spec.rel_x,
@@ -268,7 +267,7 @@ async function evaluateFilterRun(db, imagePath, imageId, filter, runIndex, optio
      FROM feature_vectors fv
      JOIN images img ON img.image_id = fv.image_id
      WHERE fv.value_type = ?
-       AND fv.resolution_level = ?
+       AND ABS(fv.resolution_level - ?) <= ?
        AND fv.pos_x = ?
        AND fv.pos_y = ?
        AND ABS(fv.rel_x - ?) <= ?

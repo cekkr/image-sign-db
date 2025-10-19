@@ -26,6 +26,7 @@ const {
 const RealTimePruner = require('./lib/realTimePruner');
 const { ensureValueTypeCapacity } = require('./lib/schema');
 const { AUGMENTATION_ORDER, createSeededRandom } = require('./lib/augmentations');
+const { resolutionLevelKey, RESOLUTION_LEVEL_TOLERANCE } = require('./lib/resolutionLevel');
 
 let cliProgress;
 try {
@@ -549,6 +550,7 @@ async function findCandidateImages(db, probe) {
   const params = [
     valueTypeId,
     probe.resolution_level,
+    RESOLUTION_LEVEL_TOLERANCE,
     probe.pos_x,
     probe.pos_y,
     probe.rel_x,
@@ -563,7 +565,7 @@ async function findCandidateImages(db, probe) {
      JOIN value_types vt ON vt.value_type_id = fv.value_type
      JOIN images im ON im.image_id = fv.image_id
      WHERE fv.value_type = ?
-       AND fv.resolution_level = ?
+       AND ABS(fv.resolution_level - ?) <= ?
        AND fv.pos_x = ?
        AND fv.pos_y = ?
        AND ABS(fv.rel_x - ?) <= ?
@@ -626,7 +628,7 @@ async function reprobeWithRandomSampling(db, imagePath, imageId, options = {}) {
     steps += 1;
     const probeSpec = await sampleRandomProbeSpec(db);
     if (!probeSpec) break;
-    const dedupeKey = `${probeSpec.descriptorKey}:${probeSpec.resolution_level}:${probeSpec.pos_x}:${probeSpec.pos_y}`;
+    const dedupeKey = `${probeSpec.descriptorKey}:${resolutionLevelKey(probeSpec.resolution_level)}:${probeSpec.pos_x}:${probeSpec.pos_y}`;
     if (usedKeys.has(dedupeKey)) {
       steps -= 1;
       continue;
@@ -717,7 +719,7 @@ async function reprobeUsingConstellations(db, imagePath, imageId, options = {}) 
     const entry = {
       raw,
       normalizedSpec,
-      dedupeKey: `${normalizedSpec.descriptorKey}:${normalizedSpec.resolution_level}:${normalizedSpec.pos_x}:${normalizedSpec.pos_y}`,
+      dedupeKey: `${normalizedSpec.descriptorKey}:${resolutionLevelKey(normalizedSpec.resolution_level)}:${normalizedSpec.pos_x}:${normalizedSpec.pos_y}`,
       anchorDescriptorKey: anchorSpec?.descriptorKey ?? null,
       anchorVectorId: raw.anchorVectorId,
       geometry: {

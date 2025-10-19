@@ -13,6 +13,7 @@ const { recordVectorUsage, saveSkipPattern } = require('./lib/storageManager');
 const { extendConstellationPath, createRandomConstellationSpec, descriptorToSpec } = require('./lib/constellation');
 const { normalizeProbeSpec, ensureValueTypeRecord: ensureValueTypeRecordBase } = require('./evaluate');
 const { fetchRelatedConstellations } = require('./lib/knowledge');
+const { normalizeResolutionLevel, RESOLUTION_LEVEL_TOLERANCE } = require('./lib/resolutionLevel');
 
 // --- CONFIGURATION ---
 const SERVER_PORT = settings.server.port;
@@ -88,7 +89,7 @@ function rowToFeature(row) {
     return {
         ...row,
         value_type: row.value_type,
-        resolution_level: row.resolution_level,
+        resolution_level: normalizeResolutionLevel(Number(row.resolution_level)),
         rel_x: row.rel_x,
         rel_y: row.rel_y,
         value: row.value,
@@ -136,7 +137,7 @@ async function findCandidateImages(db, probe) {
          FROM feature_vectors fv
          JOIN value_types vt ON vt.value_type_id = fv.value_type
          WHERE fv.value_type = ?
-           AND fv.resolution_level = ?
+           AND ABS(fv.resolution_level - ?) <= ?
            AND fv.pos_x = ?
            AND fv.pos_y = ?
            AND ABS(fv.rel_x - ?) <= ?
@@ -144,6 +145,7 @@ async function findCandidateImages(db, probe) {
         [
             valueTypeId,
             probe.resolution_level,
+            RESOLUTION_LEVEL_TOLERANCE,
             probe.pos_x,
             probe.pos_y,
             probe.rel_x,

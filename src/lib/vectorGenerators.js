@@ -9,6 +9,7 @@ const {
     getSampleId,
     SAMPLES_PER_AUGMENTATION,
 } = require('./constellation');
+const { normalizeResolutionLevel } = require('./resolutionLevel');
 
 const CHANNEL_NORMALISERS = Object.freeze({
     h: 360,
@@ -88,10 +89,7 @@ function buildFeatureFromSample(rawPixels, meta, baseParams) {
 
     const anchorBucketX = Math.round(descriptor.anchor_u * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
     const anchorBucketY = Math.round(descriptor.anchor_v * CONSTELLATION_CONSTANTS.ANCHOR_SCALE);
-    const spanBucket = Math.max(
-        0,
-        Math.min(255, Math.round(descriptor.span * CONSTELLATION_CONSTANTS.SPAN_SCALE)),
-    );
+    const resolutionLevel = normalizeResolutionLevel(descriptor.span);
 
     return {
         descriptor,
@@ -99,7 +97,7 @@ function buildFeatureFromSample(rawPixels, meta, baseParams) {
         channel: descriptor.channel,
         sampleId: baseParams.sampleId,
         augmentation: descriptor.augmentation,
-        resolution_level: spanBucket,
+        resolution_level: resolutionLevel,
         pos_x: anchorBucketX,
         pos_y: anchorBucketY,
         rel_x: descriptor.offset_x,

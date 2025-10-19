@@ -1,4 +1,5 @@
 const { euclideanDistance } = require('./correlationMetrics');
+const { normalizeResolutionLevel } = require('./resolutionLevel');
 
 function ensureNumber(value, fallback = 0) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -9,7 +10,7 @@ function ensureNumber(value, fallback = 0) {
 function normalizeFeatureFromRow(row) {
   return {
     value_type: ensureNumber(row.value_type),
-    resolution_level: ensureNumber(row.resolution_level),
+    resolution_level: normalizeResolutionLevel(ensureNumber(row.resolution_level)),
     value: ensureNumber(row.value),
     rel_x: ensureNumber(row.rel_x),
     rel_y: ensureNumber(row.rel_y),

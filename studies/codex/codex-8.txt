@@ -1,0 +1,13 @@
+In the creation of the SQL table feature_vectors, resolution_level is signed as TINYINT and this is a HUGE error: this corrupt the "relativism" working of the algorithm. In practice, the resolution_level assumes a certain level of "blurring" so the vectors obtained as more "raw" values, optimal to find corrispodences with low resolution images or higly filtered. Fix also the consquent javascript code
+
+
+Resolution Level Fix
+
+Switched feature_vectors/feature_group_stats to store resolution_level as DECIMAL(6,5) with safe ALTER fallbacks and documented the change (src/setupDatabase.js:58-168, TECH_NOTES.md:27-32).
+Introduced resolutionLevel utility helpers so all callers share the same rounding precision and comparison tolerance (src/lib/resolutionLevel.js:1-35).
+Feature generation and guided ingestion now emit normalized span values instead of 0–255 buckets, preserving blur fidelity when persisting vectors (src/lib/vectorGenerators.js:92-107; src/featureExtractor.js:418-428).
+Search, training, and knowledge queries normalize DB reads, build stable dedupe keys, and compare resolution levels via tolerance-based filters so legacy data keeps working (src/index.js:85-186; src/evaluate.js:24-276; src/train.js:552-723; src/lib/knowledge.js:27-544).
+Distance metrics, elastic matching, seed tooling, and docs were aligned with the new semantics (src/lib/correlationMetrics.js:1-28; src/lib/elasticMatcher.js:1-18; src/testCorrelations.js:21-135; TECH_NOTES.md:27-32).
+Recommended next step: run node src/setupDatabase.js (or apply the ALTERs manually) against existing databases before resuming ingestion/search so the schema change is in place.
+
+No automated tests were run; consider exercising a small ingest/search path once the migration is applied.

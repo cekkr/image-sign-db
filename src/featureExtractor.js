@@ -13,6 +13,7 @@ const { createDescriptorKey, serializeDescriptor } = require('./lib/descriptor')
 const { SAMPLES_PER_AUGMENTATION } = require('./lib/constellation');
 const settings = require('./settings');
 const { selectTopDescriptors } = require('./lib/knowledge');
+const { normalizeResolutionLevel } = require('./lib/resolutionLevel');
 
 const MAX_OPERATION_RETRIES = parseRetryEnv(process.env.DB_OPERATION_MAX_RETRIES, 4);
 const OPERATION_RETRY_BASE_MS = parseRetryEnv(process.env.DB_OPERATION_RETRY_BASE_MS, 40);
@@ -414,10 +415,10 @@ async function extractAndStoreFeaturesProgressive(imagePath, options = {}) {
                 if (!vector) continue;
                 const anchorBucketX = Math.round((spec.anchor_u ?? 0.5) * 10000);
                 const anchorBucketY = Math.round((spec.anchor_v ?? 0.5) * 10000);
-                const spanBucket = Math.max(0, Math.min(255, Math.round((spec.span ?? 0.05) * 255)));
+                const resolutionLevel = normalizeResolutionLevel(vector.size ?? spec.span ?? 0);
                 guided.push({
                     descriptor: vector.descriptor ?? spec.descriptor ?? spec,
-                    resolution_level: spanBucket,
+                    resolution_level: resolutionLevel,
                     pos_x: anchorBucketX,
                     pos_y: anchorBucketY,
                     rel_x: vector.rel_x,

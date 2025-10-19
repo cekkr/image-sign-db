@@ -24,12 +24,12 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 ## 4. Database Schema (MySQL)
 - `images`: top-level image records with `ingestion_complete` gating partially ingested rows (`src/setupDatabase.js`).
 - `value_types`: hashed descriptor definitions (`descriptor_hash`, `descriptor_json`).
-- `feature_vectors`: measured constellation values per augmentation/resolution/anchor (`value_type`, `resolution_level`, `rel_x`, `rel_y`, `size`).
+- `feature_vectors`: measured constellation values per augmentation/resolution/anchor (`value_type`, `resolution_level`, `rel_x`, `rel_y`, `size`), with `resolution_level` stored as a DECIMAL(6,5) blur span to preserve relative scale.
 - `feature_usage`: per-vector usage counters + last score for pruning heuristics.
 - `skip_patterns`: descriptors to avoid; supports pruning and search fallbacks.
 - `system_settings`: runtime settings such as `max_db_size_gb`.
 - `knowledge_nodes`: hierarchical graph linking feature vectors (`node_type` `FEATURE`/`GROUP`, `vector_length`, `vector_angle`, hit/miss stats).
-- `feature_group_stats`: aggregated mean/separation statistics per descriptor + resolution; drives guided sampling and probing.
+- `feature_group_stats`: aggregated mean/separation statistics per descriptor + resolution (matching DECIMAL(6,5) resolution levels); drives guided sampling and probing.
 - Optional `image_blobs` (created on demand when `STORE_IMAGE_BLOB=true`) stores original pixels for re-vectorization (`src/featureExtractor.js`).
 
 ## 5. Constellation Descriptors

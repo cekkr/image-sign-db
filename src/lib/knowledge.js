@@ -7,6 +7,7 @@ const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { parseDescriptor, createDescriptorKey } = require('./descriptor');
 const { descriptorToSpec } = require('./constellation');
 const { recordVectorUsage } = require('./storageManager');
+const { normalizeResolutionLevel, RESOLUTION_LEVEL_TOLERANCE } = require('./resolutionLevel');
 
 async function createDbConnection() {
     const conn = await mysql.createConnection({
@@ -27,6 +28,7 @@ function hydrateFeatureRow(row) {
     const descriptor = parseDescriptor(row.descriptor_json);
     return {
         ...row,
+        resolution_level: normalizeResolutionLevel(Number(row.resolution_level)),
         descriptor,
     };
 }
@@ -250,7 +252,7 @@ async function discoverCorrelations({
                  JOIN value_types vt ON vt.value_type_id = fv.value_type
                  JOIN images im ON im.image_id = fv.image_id
                  WHERE fv.value_type = ?
-                   AND fv.resolution_level = ?
+                   AND ABS(fv.resolution_level - ?) <= ?
                    AND fv.pos_x = ?
                    AND fv.pos_y = ?
                    AND ABS(fv.rel_x - ?) <= ?
@@ -260,6 +262,7 @@ async function discoverCorrelations({
                 [
                     startFeature.value_type,
                     startFeature.resolution_level,
+                    RESOLUTION_LEVEL_TOLERANCE,
                     startFeature.pos_x,
                     startFeature.pos_y,
                     startFeature.rel_x,
@@ -306,7 +309,7 @@ async function discoverCorrelations({
                  JOIN value_types vt ON vt.value_type_id = fv.value_type
                  JOIN images im ON im.image_id = fv.image_id
                  WHERE fv.value_type = ?
-                   AND fv.resolution_level = ?
+                   AND ABS(fv.resolution_level - ?) <= ?
                    AND fv.pos_x = ?
                    AND fv.pos_y = ?
                    AND ABS(fv.rel_x - ?) <= ?
@@ -322,6 +325,7 @@ async function discoverCorrelations({
                     [
                         candidate.value_type,
                         candidate.resolution_level,
+                        RESOLUTION_LEVEL_TOLERANCE,
                         candidate.pos_x,
                         candidate.pos_y,
                         candidate.rel_x,
@@ -361,7 +365,7 @@ async function discoverCorrelations({
                          FROM feature_vectors fv
                          JOIN images img ON img.image_id = fv.image_id
                          WHERE fv.value_type = ?
-                           AND fv.resolution_level = ?
+                           AND ABS(fv.resolution_level - ?) <= ?
                            AND fv.pos_x = ?
                            AND fv.pos_y = ?
                            AND ABS(fv.rel_x - ?) <= ?
@@ -371,6 +375,7 @@ async function discoverCorrelations({
                         [
                             bestDiscriminator.value_type,
                             bestDiscriminator.resolution_level,
+                            RESOLUTION_LEVEL_TOLERANCE,
                             bestDiscriminator.pos_x,
                             bestDiscriminator.pos_y,
                             bestDiscriminator.rel_x,
@@ -487,8 +492,9 @@ async function fetchRelatedConstellations(dbConnection, options = {}) {
     const params = [valueTypeId];
 
     if (Number.isFinite(options.resolutionLevel)) {
-        whereClauses.push('fv1.resolution_level = ?');
-        params.push(Number(options.resolutionLevel));
+        const normalizedResolution = normalizeResolutionLevel(Number(options.resolutionLevel));
+        whereClauses.push('ABS(fv1.resolution_level - ?) <= ?');
+        params.push(normalizedResolution, RESOLUTION_LEVEL_TOLERANCE);
     }
 
     whereClauses.push('kn.hit_count >= ?');
@@ -572,12 +578,12 @@ async function selectTopDescriptors(db, options = {}) {
         if (!spec) continue;
         results.push({
             value_type: row.value_type,
-            resolution_level: row.resolution_level,
-            sample_size: row.sample_size,
-            mean_distance: row.mean_distance,
-            std_distance: row.std_distance,
-            mean_cosine: row.mean_cosine,
-            mean_pearson: row.mean_pearson,
+            resolution_level: normalizeResolutionLevel(Number(row.resolution_level)),
+            sample_size: Number(row.sample_size),
+            mean_distance: Number(row.mean_distance),
+            std_distance: Number(row.std_distance),
+            mean_cosine: Number(row.mean_cosine),
+            mean_pearson: Number(row.mean_pearson),
             spec,
         });
     }

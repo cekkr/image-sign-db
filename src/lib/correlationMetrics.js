@@ -1,4 +1,5 @@
 const settings = require('../settings');
+const { resolutionLevelsMatch } = require('./resolutionLevel');
 
 const MAX_CANDIDATE_SAMPLE = Math.max(1, settings.correlation.maxCandidateSample);
 const MIN_AFFINITY = Math.max(0, Math.min(1, settings.correlation.minAffinity));
@@ -15,7 +16,9 @@ function buildFeatureVector(feature) {
 
 function euclideanDistance(a, b) {
     if (!a || !b) return Infinity;
-    if (a.value_type !== b.value_type || a.resolution_level !== b.resolution_level) return Infinity;
+    if (a.value_type !== b.value_type || !resolutionLevelsMatch(a.resolution_level, b.resolution_level)) {
+        return Infinity;
+    }
     const componentsA = buildFeatureVector(a);
     const componentsB = buildFeatureVector(b);
     let sum = 0;

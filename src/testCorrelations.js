@@ -2,6 +2,7 @@
 const mysql = require('mysql2/promise');
 require('dotenv').config();
 const { createDescriptorKey, serializeDescriptor } = require('./lib/descriptor');
+const { normalizeResolutionLevel } = require('./lib/resolutionLevel');
 
 // --- SAMPLE DATA ---
 const sampleCorrelations = [
@@ -17,7 +18,7 @@ const sampleCorrelations = [
             offset_x: 0.35,
             offset_y: 0.05,
         },
-        resolution_level: Math.round(0.08 * 255),
+        resolution_level: normalizeResolutionLevel(0.08),
         avg_length: 0.25,
         avg_angle: 0.12,
         sample_size: 24,
@@ -38,7 +39,7 @@ const sampleCorrelations = [
             offset_x: -0.27,
             offset_y: 0.18,
         },
-        resolution_level: Math.round(0.12 * 255),
+        resolution_level: normalizeResolutionLevel(0.12),
         avg_length: 0.33,
         avg_angle: -0.35,
         sample_size: 19,
@@ -59,7 +60,7 @@ const sampleCorrelations = [
             offset_x: -0.42,
             offset_y: -0.24,
         },
-        resolution_level: Math.round(0.06 * 255),
+        resolution_level: normalizeResolutionLevel(0.06),
         avg_length: 0.22,
         avg_angle: -0.55,
         sample_size: 31,

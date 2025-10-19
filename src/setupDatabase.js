@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS feature_vectors (
     vector_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     image_id INT NOT NULL,
     value_type MEDIUMINT UNSIGNED NOT NULL,
-    resolution_level TINYINT UNSIGNED NOT NULL,
+    resolution_level DECIMAL(6,5) NOT NULL,
     pos_x SMALLINT UNSIGNED NOT NULL,
     pos_y SMALLINT UNSIGNED NOT NULL,
     rel_x FLOAT NOT NULL,
@@ -91,7 +91,7 @@ const createFeatureGroupStatsTableSQL = `
 CREATE TABLE IF NOT EXISTS feature_group_stats (
     stat_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     value_type MEDIUMINT UNSIGNED NOT NULL,
-    resolution_level TINYINT UNSIGNED NOT NULL,
+    resolution_level DECIMAL(6,5) NOT NULL,
     avg_length FLOAT NOT NULL,
     avg_angle FLOAT NOT NULL,
     sample_size INT UNSIGNED DEFAULT 0,
@@ -146,6 +146,13 @@ async function setupDatabase() {
         console.log(" -> Creating 'feature_vectors' table...");
         await connection.query(createFeatureVectorsTableSQL);
         console.log("    ✅ Table 'feature_vectors' is ready.");
+        try {
+            await connection.query(
+                "ALTER TABLE feature_vectors MODIFY COLUMN resolution_level DECIMAL(6,5) NOT NULL"
+            );
+        } catch (e) {
+            // Older MySQL versions may not support MODIFY COLUMN with IF EXISTS; ignore on failure.
+        }
         
         console.log(" -> Creating new 'knowledge_nodes' table...");
         await connection.query(createKnowledgeNodesTableSQL);
@@ -153,6 +160,13 @@ async function setupDatabase() {
         console.log(" -> Creating 'feature_group_stats' table...");
         await connection.query(createFeatureGroupStatsTableSQL);
         console.log("    ✅ Table 'feature_group_stats' is ready.");
+        try {
+            await connection.query(
+                "ALTER TABLE feature_group_stats MODIFY COLUMN resolution_level DECIMAL(6,5) NOT NULL"
+            );
+        } catch (e) {
+            // Graceful fallback for installations where the column already has the desired definition.
+        }
 
         console.log(" -> Creating 'feature_usage' table...");
         await connection.query(createFeatureUsageTableSQL);
