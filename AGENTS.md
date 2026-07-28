@@ -2,14 +2,17 @@
 
 Fast-access operational reference for agents working in this repository.
 
-**Image Sign DB** is a research-stage content-based image retrieval (CBIR) engine written in CommonJS Node.js on top of MySQL. It never stores or compares whole images: it samples a deterministic *constellation* of relative anchor/neighbour patch pairs, stores only the HSV/luminance **delta** between them, and identifies an image through a server-driven question/answer dialogue in which the client measures only the descriptors the server asks for.
+**Image Sign DB** is a research-stage content-based image retrieval (CBIR) engine written in CommonJS Node.js. It never stores or compares whole images: it samples a deterministic *constellation* of relative anchor/neighbour patch pairs, stores only the HSV/luminance **delta** between them, and identifies an image through a server-driven question/answer dialogue in which the client measures only the descriptors the server asks for.
+
+> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. **Everything described in this handbook as current behavior is still the MySQL implementation** — no Cheetah code exists in [`src/`](src) yet. Do not read the roadmap as a description of what runs.
 
 What this project is **not**:
 
 - It is **not** a production service. There is no authentication, no rate limiting, no test suite, and no packaging/release pipeline.
-- It is **not** an embedding/vector-database system. There are no learned embeddings, no ANN index, and no neural model — "learning" means hit/miss counters and aggregate statistics in MySQL.
+- It is **not** an embedding/vector-database system. There are no learned embeddings, no ANN index, and no neural model — "learning" means hit/miss counters and aggregate statistics in the database.
 - `src/vectorCustom.js` is **not** part of the pipeline. It is a legacy grid-averaging experiment targeting an `image_vectors` table that the current schema does not create.
 - The **quadtree / `hsv_tree_mean` / `hsv_tree_delta`** feature family described in [`README.md`](README.md) is **not implemented** on this revision (see [Known Gaps](#known-gaps)).
+- The [`cheetah/`](cheetah) submodule is **not** this project's code. It is a standalone Go database server with its own handbook, its own tests, and its own `main` branch — see [Working with the Cheetah submodule](#working-with-the-cheetah-submodule).
 
 Vocabulary, defined once:
 
@@ -20,16 +23,18 @@ Vocabulary, defined once:
 
 ## Read This First
 
-1. [`AGENTS.md`](AGENTS.md) (this file) — operational map, contracts, and ownership. Authoritative for *where* things live and *what must not break*.
-2. [`TECH_NOTES.md`](TECH_NOTES.md) — the project's declared canonical technical reference (schema, pipeline, tunables). Authoritative for architecture intent; its §18 checklist is machine-enforced by [`scripts/check-maintenance.js`](scripts/check-maintenance.js). Verify its claims against source before relying on them — some are ahead of the code.
-3. [`src/settings.js`](src/settings.js) — the **only** authoritative list of environment variables and their defaults. README/TECH_NOTES prose about env flags is secondary.
-4. [`src/setupDatabase.js`](src/setupDatabase.js) — the authoritative schema (DDL text is inline). No migration files exist; this script *is* the migration.
-5. [`README.md`](README.md) — user/operator guide and algorithm rationale. Describes some behavior that is aspirational; see [Known Gaps](#known-gaps).
-6. [`README.html`](README.html) — a standalone marketing/explainer page (Tailwind + Chart.js from CDNs). Carries no authority over behavior; do not treat it as documentation to keep in sync.
-7. [`studies/notes/notes.md`](studies/notes/notes.md) — dataset names and historical command lines. Convenience only.
-8. [`studies/codex/`](studies/codex) and [`studies/logs_history/`](studies/logs_history) — archived agent transcripts and training logs. **Historical artifacts, lowest authority.** Their metric values reflect older schemas (e.g. integer `res=74` resolution levels) and must never be quoted as current behavior.
+1. [`AGENTS.md`](AGENTS.md) (this file) — operational map, contracts, and ownership. Authoritative for *where* things live and *what must not break* **today**.
+2. [`ROADMAP.md`](ROADMAP.md) — the MySQL→Cheetah migration plan, target key layout, and phase gates. Authoritative for *where the project is going*; it proves nothing about what currently runs. Every item there is `Planned` until it is marked `Shipped` here.
+3. [`TECH_NOTES.md`](TECH_NOTES.md) — the project's declared canonical technical reference (schema, pipeline, tunables). Authoritative for architecture intent; its §18 checklist is machine-enforced by [`scripts/check-maintenance.js`](scripts/check-maintenance.js). Verify its claims against source before relying on them — some are ahead of the code.
+4. [`src/settings.js`](src/settings.js) — the **only** authoritative list of environment variables and their defaults. README/TECH_NOTES prose about env flags is secondary.
+5. [`src/setupDatabase.js`](src/setupDatabase.js) — the authoritative MySQL schema (DDL text is inline). No migration files exist; this script *is* the migration.
+6. [`cheetah/AGENTS.md`](cheetah/AGENTS.md) — the submodule's own handbook. **Authoritative for everything about Cheetah**: protocol, on-disk contracts, config, build/test commands, and its pitfalls. Never document Cheetah behavior here from memory; link there. [`cheetah/README.md`](cheetah/README.md) holds the full command reference, and its `ExecuteCommand` switch in [`cheetah/src/database.go`](cheetah/src/database.go) is the real command inventory.
+7. [`README.md`](README.md) — user/operator guide and algorithm rationale. Describes some behavior that is aspirational; see [Known Gaps](#known-gaps).
+8. [`README.html`](README.html) — a standalone marketing/explainer page (Tailwind + Chart.js from CDNs). Carries no authority over behavior; do not treat it as documentation to keep in sync.
+9. [`studies/notes/notes.md`](studies/notes/notes.md) — dataset names and historical command lines. Convenience only.
+10. [`studies/codex/`](studies/codex) and [`studies/logs_history/`](studies/logs_history) — archived agent transcripts and training logs. **Historical artifacts, lowest authority.** Their metric values reflect older schemas (e.g. integer `res=74` resolution levels) and must never be quoted as current behavior.
 
-**Conflict order:** schema/DDL and executable code (2–4) beat prose (5–6) beat history (7–8). No test suite exists, so nothing in this repository is protected by an executable specification — treat every documented behavior as unverified until you read the source.
+**Conflict order:** schema/DDL and executable code (3–6) beat prose (7–8) beat history (9–10), and current-state facts (1) beat intent (2). No test suite exists, so nothing in this repository is protected by an executable specification — treat every documented behavior as unverified until you read the source.
 
 ## Collaboration and Maintenance Rules
 
@@ -38,7 +43,40 @@ Vocabulary, defined once:
 - **Datasets are untracked.** `datasets/*` is git-ignored; `.env` is git-ignored. Never commit images, credentials, or `.env`. `.gitignore` whitelists `.env.example`, but no such file exists — if you add environment variables, adding `.env.example` is the right place to document them.
 - **Preserve the dirty tree.** The working tree was clean at branch `main` when this file was written. Do not `git clean`, `git checkout --`, or stash unrelated changes to simplify your own work.
 - **Schema changes go in [`src/setupDatabase.js`](src/setupDatabase.js) only**, as `CREATE TABLE IF NOT EXISTS` plus a best-effort `ALTER` wrapped in `try/catch`. The script must stay idempotent and re-runnable on a populated database.
-- **Record future work in [`TECH_NOTES.md`](TECH_NOTES.md), not as present-tense prose in README.** A feature is "current" only when a symbol implements it.
+- **Record future work in [`ROADMAP.md`](ROADMAP.md), not as present-tense prose in README.** A feature is "current" only when a symbol implements it. Migration steps belong in the roadmap's phase checklists; move an item to `Shipped` in this file only after it is implemented **and** verified, and say how it was verified.
+
+### Working with the Cheetah submodule
+
+[`cheetah/`](cheetah) is a git submodule tracking `https://github.com/cekkr/cheetah` (`main`). It is a
+separate Go project with its own handbook, tests, and release discipline. Standing rules, per the
+project owner:
+
+1. **Pull it at the start of every request.** It is a moving target and this repository pins a SHA:
+
+   ```bash
+   git -C cheetah pull --ff-only origin main
+   ```
+
+2. **Changes to Cheetah source are committed directly on its `main`** — not on a branch, not carried
+   as a local diff. Before committing inside `cheetah/`, satisfy **its** rules, which are stricter
+   than this repository's:
+   - `gofmt -w` the files you touched; the tree must stay `gofmt -l .`-clean.
+   - `go build ./... && go vet ./... && go test ./src` must pass. Add `-race` when touching
+     `ManagedFile` handle lifecycle.
+   - Update [`cheetah/AGENTS.md`](cheetah/AGENTS.md) in the **same** commit when you change a command,
+     on-disk format, config key, file ownership, or feature status; put new roadmap work in
+     [`cheetah/NEXT_STEPS.md`](cheetah/NEXT_STEPS.md).
+   - Comments in that codebase are frequently Italian — match the surrounding language.
+   - New engine code goes in `cheetah/src/`, never at its repository root.
+3. **A Cheetah commit is only useful once pushed**, because this repository pins a SHA that must be
+   reachable for anyone else. Push to its `main` in the same step as the commit.
+4. **Bump the submodule pointer deliberately.** After pulling or committing, `git add cheetah` in
+   *this* repository is a separate, explicit decision — record the SHA in the commit message when
+   behavior here depends on it.
+5. **Never edit Cheetah to work around a bug you have not reported.** If our key shapes trip one of
+   its documented trie pitfalls, add a failing test in `cheetah/src/` first, then fix.
+6. **Do not vendor Cheetah's docs into this handbook.** Link to [`cheetah/AGENTS.md`](cheetah/AGENTS.md).
+   Two copies of a protocol description diverge in silence.
 
 ## Essential Project Principles
 
@@ -98,13 +136,48 @@ All ingestion writes are short autocommit statements, not one long transaction, 
 
 **Trust boundary:** the Express server is the trust boundary and it is **open** — no auth on any route, including `POST /images` (which reads an arbitrary server-local filesystem path) and `POST /discover` (unbounded CPU/DB work). Session state (`searchSessions`, `descriptorCache`, `skipCache`) is process-local, in-memory, and never expires.
 
+**Target architecture (Planned — see [`ROADMAP.md`](ROADMAP.md)):** MySQL is replaced by a Cheetah TCP
+client; the measurement layer is unchanged. Candidate lookup becomes a byte-prefix walk of the pair
+trie instead of an indexed SQL scan, candidate *intersection* becomes `GRAPH_RECALL` activation over
+descriptor seeds returning ranked image IDs, and next-probe selection becomes an n-gram follower
+lookup conditioned on the path so far rather than on the last probe alone. None of this exists in
+[`src/`](src) yet.
+
 ## Linked Source Tree and File Reference
 
 ### [`package.json`](package.json)
 
 Manifest. CommonJS (`"type": "commonjs"`), `main` is `src/index.js`. Only two scripts: `test` (deliberately fails) and `maintenance:check`. Runtime deps: `sharp` (libvips image ops), `mysql2`, `express` 5, `dotenv`, `cli-progress`.
 
-- **Common mistakes:** There is no `engines` field, but the code requires **Node 18+** (global `fetch` in `src/clientAPI.js`) and is developed on Node 24. Do not add ESM `import` syntax — every file uses `require`.
+- **Common mistakes:** There is no `engines` field, but the code requires **Node 18+** (global `fetch` in `src/clientAPI.js`) and is developed on Node 24. Do not add ESM `import` syntax — every file uses `require`. The Cheetah client planned in [`ROADMAP.md`](ROADMAP.md) needs **no new dependency** — its protocol is newline-delimited text over `net`; do not add one.
+
+### [`ROADMAP.md`](ROADMAP.md)
+
+The MySQL→Cheetah migration plan: rationale with a verified capability mapping, the target key/graph/n-gram layout, the Cheetah-side work queue, six phase checklists with exit gates, risks, and open questions.
+
+- **Key sections:** §3 (key design) is the migration's wire format and must be frozen before ingestion code is written; §4 lists candidate changes to the submodule; §5 holds the phase checkboxes; §7 lists decisions that still block phases.
+- **Called by / depends on:** the phase gates reference [`src/evaluate.js`](src/evaluate.js)'s harness as the parity check, since it is the only quasi-regression tool that exists.
+- **Common mistakes:** it is **intent, not description**. Nothing in it is implemented. Do not cite it as evidence that a capability exists, and do not copy its target-state prose into [`README.md`](README.md).
+
+### [`.gitmodules`](.gitmodules)
+
+Pins the [`cheetah`](cheetah) submodule to `https://github.com/cekkr/cheetah`. One entry.
+
+- **Common mistakes:** the submodule records a **commit SHA**, not a branch. `git -C cheetah pull` moves the checkout but does not update this repository's pointer until you `git add cheetah` — and the SHA must be pushed to Cheetah's `main` or it is unreachable for anyone else. See [Working with the Cheetah submodule](#working-with-the-cheetah-submodule).
+
+### [`cheetah/`](cheetah) — submodule, not this project's code
+
+Standalone single-binary **Go** key/value + graph + prediction database server (module `cheetahdb`, Go 1.24, ~23k lines under `cheetah/src/`). Speaks one newline-delimited text protocol over TCP (`0.0.0.0:4455` default) and an interactive CLI. Verified to build and run at pinned SHA `8ecdf35` on Go 1.25.4.
+
+- **Its own handbook governs it:** [`cheetah/AGENTS.md`](cheetah/AGENTS.md) (~1400 lines) is authoritative for its protocol, on-disk contracts, config, and pitfalls. [`cheetah/README.md`](cheetah/README.md) holds the command reference. [`cheetah/NEXT_STEPS.md`](cheetah/NEXT_STEPS.md) is its roadmap. [`cheetah/CONCEPTS.md`](cheetah/CONCEPTS.md) documents the n-gram reducer payload layouts we intend to reuse.
+- **The subsystems this migration depends on:** the pair trie ([`cheetah/src/database.go`](cheetah/src/database.go), [`cheetah/src/tables.go`](cheetah/src/tables.go)) for feature lookup; the graph store ([`cheetah/src/graph.go`](cheetah/src/graph.go)) and associative recall ([`cheetah/src/graph_recall.go`](cheetah/src/graph_recall.go)) for descriptor→image resolution; edge belief ([`cheetah/src/graph_uncertainty.go`](cheetah/src/graph_uncertainty.go)) to finally give confidence a meaning; and the registered reducers ([`cheetah/src/reducers.go`](cheetah/src/reducers.go)) for n-gram follower counts.
+- **Build and test from this repo root:**
+  - `go build -o cheetah-server ./cheetah/src` — the server binary (untracked).
+  - `go test ./cheetah/src` — its unit tests. Run these before any commit inside the submodule.
+- **Common mistakes:**
+  - **Its `src/` is Go, not ours.** `cheetah/src/` and `src/` are unrelated trees that happen to share a name; its own handbook flags the same collision against its former Python parent project.
+  - Do **not** add Cheetah's build outputs (`cheetah-server`, `cheetah_data/`) to this repository — its `.gitignore` covers them inside the submodule, ours does not cover them at the root.
+  - Editing files under `cheetah/` and committing only in *this* repository records nothing: submodule content lives in the submodule's own history. Commit there, push there, then bump the pointer here.
 
 ### [`src/settings.js`](src/settings.js)
 
@@ -698,6 +771,46 @@ npm run maintenance:check
 
 Not available: `npm test` (wired to fail deliberately), lint, format, typecheck, benchmark, packaging, and deployment. Do not invent them.
 
+### Cheetah submodule (migration work only)
+
+Prerequisites: Go 1.24+ (verified on 1.25.4). No CGO, no external services. Full details in [`cheetah/AGENTS.md`](cheetah/AGENTS.md) — the commands below are the ones needed from this repository.
+
+Pull it — **first action of every session**:
+
+```bash
+git -C cheetah pull --ff-only origin main
+```
+
+Build the server binary (untracked; do not commit it):
+
+```bash
+go build -o cheetah-server ./cheetah/src
+```
+
+Run it headless on a scratch port and data directory for experiments (mutates only that directory):
+
+```bash
+CHEETAH_HEADLESS=1 CHEETAH_LISTEN_ADDR=127.0.0.1:4467 CHEETAH_DATA_DIR=./scratch_data ./cheetah-server
+```
+
+Its test suite — run before any commit inside the submodule:
+
+```bash
+go test ./cheetah/src
+```
+
+Its format and vet gates, which must both be silent:
+
+```bash
+cd cheetah && gofmt -l . && go vet ./...
+```
+
+Create the feature database at stride 2 (the stride where adaptive pair indexing actually pays off; `pairs/format.dat` is authoritative on reopen, so this only takes effect at creation):
+
+```bash
+RESET_DB image_sign pair_bytes=2
+```
+
 ## Test Ownership Map
 
 **There is no automated test suite.** No test runner, no test files, no fixtures, no CI configuration. `npm test` exits 1 by design. Every contract in this document is unprotected by executable checks.
@@ -742,6 +855,7 @@ The closest substitutes, and what each actually covers:
 
 ### Experimental / Scaffold
 
+- **Cheetah migration groundwork** — the [`cheetah`](cheetah) submodule is added, pinned at `8ecdf35`, verified to build (`go build -o cheetah-server ./cheetah/src`) and verified over TCP for the exact mechanisms the plan depends on: `PAIR_SET`/`PAIR_GET`/`PAIR_SCAN`/`PAIR_SUMMARY`/`PAIR_REDUCE counts`, `GRAPH_NODE_SET`/`GRAPH_EDGE_SET`/`GRAPH_NEIGHBORS`/`GRAPH_DEGREE`, and `GRAPH_RECALL` returning a ranked image ID from a descriptor seed. **No integration code exists in [`src/`](src)** — the migration is at Phase 0 of [`ROADMAP.md`](ROADMAP.md).
 - `STORE_IMAGE_BLOB` / `image_blobs` — writes only, no reader, table absent from `setupDatabase.js`, and it contradicts the privacy premise.
 - `src/testCorrelations.js` — a seeding utility named like a test.
 - `src/vectorCustom.js` — dead legacy experiment against a table that no longer exists.
@@ -763,17 +877,22 @@ The closest substitutes, and what each actually covers:
 
 ### Near-Term Priorities
 
-1. Add unit coverage for the pure functions that guard descriptor identity — `createDescriptorKey`, the three descriptor builders, `normalizeProbeSpec`, `normalizeResolutionLevel`. No database needed; highest risk reduction per line.
-2. Record misses (in `refineSearch`, where `knowledgeNodeId` is already on the constellation path) so confidence becomes meaningful, then re-examine every ranking that reads it.
-3. Reconcile [`README.md`](README.md) with the code: remove or relabel the quadtree section and the "Learning on Search"/`feature_group_stats`-question claims as `Planned`.
-4. Add `ingestion_complete = 1` to the search path's queries and give `searchSessions` a TTL and a cap.
-5. Publish `.env.example` from [`src/settings.js`](src/settings.js) and route the remaining direct `process.env` reads through it where they are not load-time constants.
+The Cheetah migration in [`ROADMAP.md`](ROADMAP.md) is the primary direction; these are ordered to serve it rather than to polish the MySQL implementation that is being replaced.
+
+1. **Freeze the Cheetah key layout** ([`ROADMAP.md`](ROADMAP.md) §3) after measuring real page sizes with `PAIR_SUMMARY`. It is the migration's wire format and every later phase depends on it.
+2. **Add the first tests** (Roadmap 0.6) covering `createDescriptorKey`, the three descriptor builders, `normalizeProbeSpec`, `normalizeResolutionLevel`, and the new key codec. All pure, no database, highest risk reduction per line — and the migration needs a parity gate that does not yet exist.
+3. **Build the Cheetah client + key codec** (Roadmap phases 0–1) before touching any storage call site.
+4. **Record misses when porting the knowledge graph** (Roadmap 4.2). Cheetah edges carry a real belief scale, so this stops being a nice-to-have: shipping the graph layer without misses reproduces today's always-`1.0` confidence bug in a new store.
+5. Reconcile [`README.md`](README.md) with the code — remove or relabel the quadtree section and the "Learning on Search"/`feature_group_stats`-question claims as `Planned` — so the migration does not carry false documentation into the new architecture.
+
+Deferred while the migration is live (fix only if they block it): `ingestion_complete` in the search path, `searchSessions` TTL, `.env.example`. The first is explicitly carried into the new design as Roadmap 2.3.
 
 ## Task Start and Handoff Checklist
 
 **Before you change anything:**
 
-1. Read this file, then [`TECH_NOTES.md`](TECH_NOTES.md), then [`src/settings.js`](src/settings.js). Check `git status` and preserve unrelated changes.
+0. **Pull the submodule** — `git -C cheetah pull --ff-only origin main` — per [Working with the Cheetah submodule](#working-with-the-cheetah-submodule). Do this first, every session.
+1. Read this file, then [`ROADMAP.md`](ROADMAP.md) (to know which phase you are in), then [`TECH_NOTES.md`](TECH_NOTES.md) and [`src/settings.js`](src/settings.js). Check `git status` and preserve unrelated changes. For anything touching Cheetah, read [`cheetah/AGENTS.md`](cheetah/AGENTS.md) rather than assuming its protocol.
 2. Locate the owning file in the [source tree](#linked-source-tree-and-file-reference) and read its "Common mistakes" note before editing it.
 3. If your change touches descriptors, anchors, spans, resolution levels, or channels, re-read [Critical Implementation Contracts](#critical-implementation-contracts) and the [three-builders pitfall](#three-independent-descriptor-builders-must-stay-byte-identical). Assume you are changing a wire format.
 4. Verify the handbook's claim against the current source before relying on it — nothing here is enforced by tests.
@@ -784,4 +903,6 @@ The closest substitutes, and what each actually covers:
 6. If you changed descriptor shape, anchor scaling, channel normalisers, or `resolution_level` semantics, state explicitly that existing data is invalidated and a re-ingest is required.
 7. Update the affected `###` file subsection here — responsibilities, symbols, callers, and file-specific mistakes — plus [Features](#features-and-recurring-development-pitfalls), [Interface Ownership Map](#interface-ownership-map), and [Known Gaps](#known-gaps) as applicable. Remove instructions your change made false.
 8. Update [`README.md`](README.md) and/or [`TECH_NOTES.md`](TECH_NOTES.md) per the trigger table in [`scripts/check-maintenance.js`](scripts/check-maintenance.js), then run `npm run maintenance:check` **before** committing.
-9. Confirm no secrets, dataset files, or `.env` are staged, and that every local link in this file still resolves.
+9. **If you completed a roadmap item**, tick it in [`ROADMAP.md`](ROADMAP.md) *and* move it to `Shipped` here with its verification note. An item is never done in only one of the two places. If you discovered new migration work, add it to the roadmap rather than describing it here as behavior.
+10. **If you changed anything under [`cheetah/`](cheetah)**: `gofmt -w` the touched files, run `go build ./... && go vet ./... && go test ./src` inside the submodule, update [`cheetah/AGENTS.md`](cheetah/AGENTS.md) in the same commit, commit and push on its `main`, then bump the pointer here with `git add cheetah` and name the SHA in the commit message.
+11. Confirm no secrets, dataset files, `.env`, or Cheetah build outputs (`cheetah-server`, `cheetah_data/`) are staged, and that every local link in this file still resolves.

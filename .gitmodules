@@ -1,0 +1,3 @@
+[submodule "cheetah"]
+	path = cheetah
+	url = https://github.com/cekkr/cheetah
