@@ -330,6 +330,47 @@ Add these (optionally) to your `.env` file:
   - Description: Caps concurrent ingest workers used by `train.js`.
   - Default: unset (auto-scales to CPU, with a safe cap)
 
+Cheetah DB (migration groundwork — see `ROADMAP.md`). These configure the client
+and the development server helper under `src/lib/cheetah/`. **Nothing in the
+ingestion or search pipeline reads them yet**; setting `STORAGE_BACKEND=cheetah`
+today changes no behavior.
+
+• STORAGE_BACKEND
+  - Description: Which storage engine the pipeline talks to, `mysql` or `cheetah`.
+  - Default: `mysql` (the only backend implemented end-to-end)
+
+• CHEETAH_HOST / CHEETAH_PORT
+  - Description: Address of the Cheetah TCP listener.
+  - Default: `127.0.0.1` / `4455`
+
+• CHEETAH_DATABASE
+  - Description: Logical database the connection selects with `DATABASE <name>`.
+  - Default: `image_sign_db`
+
+• CHEETAH_DATA_DIR
+  - Description: Server data directory. Also read by the Go server itself.
+  - Default: `cheetah_data`
+
+• CHEETAH_POOL_SIZE
+  - Description: Connections in the client pool; size it like the ingest worker pool.
+  - Default: `4`
+
+• CHEETAH_CONNECT_TIMEOUT_MS / CHEETAH_COMMAND_TIMEOUT_MS / CHEETAH_MAX_IN_FLIGHT
+  - Description: Connect timeout, per-command timeout, and how many commands may be
+    pipelined on one socket before callers are queued.
+  - Defaults: `5000` / `30000` / `64`
+
+• CHEETAH_PAIR_INDEX_BYTES
+  - Description: Pair-trie stride. Only adopted when a database directory is *created* —
+    `pairs/format.dat` wins on every later open.
+  - Default: `2`
+
+• CHEETAH_GRAPH_TERM_INDEX
+  - Description: Cheetah's lexical term index. Off here on purpose: hex node ids that
+    share a word cross-match in `GRAPH_RECALL`, and the index costs a write on every
+    node upsert. Also read by the Go server itself.
+  - Default: `false`
+
 Deprecated (no longer used by ingestion):
 
 • DB_TRANSACTION_MAX_RETRIES, DB_TRANSACTION_RETRY_BASE_MS

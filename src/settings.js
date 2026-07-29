@@ -52,6 +52,34 @@ const searchSettings = {
 const databaseSettings = {
   schema: process.env.DB_NAME || 'image_hypercube_db',
   defaultMaxSizeGb: getNumber('DEFAULT_MAX_DB_SIZE_GB', 10),
+  // Which storage engine the pipeline talks to. `mysql` is the only backend
+  // implemented end-to-end today; `cheetah` selects the migration path being
+  // built out in ROADMAP.md and is not yet wired into ingestion or search.
+  backend: (function () {
+    const raw = String(process.env.STORAGE_BACKEND || 'mysql').trim().toLowerCase();
+    return raw === 'cheetah' ? 'cheetah' : 'mysql';
+  })(),
+};
+
+// Cheetah DB (ROADMAP.md). `dataDir`, `pairIndexBytes` and `graphTermIndex` are
+// also read by the Go server itself from CHEETAH_DATA_DIR /
+// CHEETAH_PAIR_INDEX_BYTES / CHEETAH_GRAPH_TERM_INDEX — they live here because
+// src/lib/cheetah/server.js spawns the server for development and tests.
+const cheetahSettings = {
+  host: process.env.CHEETAH_HOST || '127.0.0.1',
+  port: getNumber('CHEETAH_PORT', 4455),
+  database: process.env.CHEETAH_DATABASE || 'image_sign_db',
+  dataDir: process.env.CHEETAH_DATA_DIR || 'cheetah_data',
+  poolSize: getNumber('CHEETAH_POOL_SIZE', 4),
+  connectTimeoutMs: getNumber('CHEETAH_CONNECT_TIMEOUT_MS', 5000),
+  commandTimeoutMs: getNumber('CHEETAH_COMMAND_TIMEOUT_MS', 30000),
+  maxInFlight: getNumber('CHEETAH_MAX_IN_FLIGHT', 64),
+  // Stride 2 is a no-op at creation time only: pairs/format.dat wins on every
+  // later open, so this must be right the first time (ROADMAP §4).
+  pairIndexBytes: getNumber('CHEETAH_PAIR_INDEX_BYTES', 2),
+  // Off by default: hex node ids that share a lexical token cross-match in
+  // GRAPH_RECALL, and the index costs a write on every node upsert (§3.3).
+  graphTermIndex: getBoolean('CHEETAH_GRAPH_TERM_INDEX', false),
 };
 
 const correlationSettings = {
@@ -117,6 +145,7 @@ const settings = {
   server: serverSettings,
   search: searchSettings,
   database: databaseSettings,
+  cheetah: cheetahSettings,
   correlation: correlationSettings,
   training: trainingSettings,
 };

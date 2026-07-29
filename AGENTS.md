@@ -4,11 +4,11 @@ Fast-access operational reference for agents working in this repository.
 
 **Image Sign DB** is a research-stage content-based image retrieval (CBIR) engine written in CommonJS Node.js. It never stores or compares whole images: it samples a deterministic *constellation* of relative anchor/neighbour patch pairs, stores only the HSV/luminance **delta** between them, and identifies an image through a server-driven question/answer dialogue in which the client measures only the descriptors the server asks for.
 
-> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. **Everything described in this handbook as current behavior is still the MySQL implementation** — no Cheetah code exists in [`src/`](src) yet. Do not read the roadmap as a description of what runs.
+> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. **Everything described in this handbook as current behavior is still the MySQL implementation.** [`src/lib/cheetah/`](src/lib/cheetah) now exists (roadmap Phases 0–1: client, protocol codec, key codec, token vocabulary — see [Shipped](#shipped)), but **nothing in the pipeline calls it**: no ingestion, search, evaluation, or training path reads `STORAGE_BACKEND`, and setting it to `cheetah` changes no behavior. Do not read the roadmap as a description of what runs.
 
 What this project is **not**:
 
-- It is **not** a production service. There is no authentication, no rate limiting, no test suite, and no packaging/release pipeline.
+- It is **not** a production service. There is no authentication, no rate limiting, and no packaging/release pipeline. A test suite now exists but covers **only** the Cheetah migration groundwork ([`test/`](test)); the MySQL pipeline is unprotected.
 - It is **not** an embedding/vector-database system. There are no learned embeddings, no ANN index, and no neural model — "learning" means hit/miss counters and aggregate statistics in the database.
 - `src/vectorCustom.js` is **not** part of the pipeline. It is a legacy grid-averaging experiment targeting an `image_vectors` table that the current schema does not create.
 - The **quadtree / `hsv_tree_mean` / `hsv_tree_delta`** feature family described in [`README.md`](README.md) is **not implemented** on this revision (see [Known Gaps](#known-gaps)).
@@ -34,12 +34,13 @@ Vocabulary, defined once:
 9. [`studies/notes/notes.md`](studies/notes/notes.md) — dataset names and historical command lines. Convenience only.
 10. [`studies/codex/`](studies/codex) and [`studies/logs_history/`](studies/logs_history) — archived agent transcripts and training logs. **Historical artifacts, lowest authority.** Their metric values reflect older schemas (e.g. integer `res=74` resolution levels) and must never be quoted as current behavior.
 
-**Conflict order:** schema/DDL and executable code (3–6) beat prose (7–8) beat history (9–10), and current-state facts (1) beat intent (2). No test suite exists, so nothing in this repository is protected by an executable specification — treat every documented behavior as unverified until you read the source.
+**Conflict order:** schema/DDL and executable code (3–6) beat prose (7–8) beat history (9–10), and current-state facts (1) beat intent (2). Outside [`src/lib/cheetah/`](src/lib/cheetah), nothing in this repository is protected by an executable specification — treat every documented behavior as unverified until you read the source.
 
 ## Collaboration and Maintenance Rules
 
 - **Documentation sync is enforced.** Touching `src/lib/augmentations.js`, `src/lib/constants.js`, `src/lib/constellation.js`, `src/lib/vectorGenerators.js`, `src/lib/vectorSpecs.js`, `src/lib/descriptor.js`, `src/featureExtractor.js`, `src/settings.js`, `src/setupDatabase.js`, `src/lib/schema.js`, `src/index.js`, or `src/clientAPI.js` requires an accompanying edit to `README.md` and/or `TECH_NOTES.md`. Run `npm run maintenance:check` before committing. **Exception/limitation:** the checker reads `git status --porcelain`, so it only sees the *uncommitted* working tree — it passes trivially once you commit, and it does not know about `AGENTS.md`. Update this file by hand under the same triggers.
-- **No test suite exists.** `npm test` is wired to `exit 1` on purpose. Verification means running the real pipeline against a MySQL instance and a small dataset. Never report a change as "tested" without saying which command you ran and against what data.
+- **Tests cover the Cheetah groundwork only.** `npm test` runs `node --test test/*.test.js` — the protocol codec and the key codec, both pure. `npm run test:integration` additionally builds and spawns `cheetah-server` and round-trips against it. **Nothing in the MySQL pipeline is tested**: verification there still means running the real pipeline against a MySQL instance and a small dataset. Never report a change as "tested" without saying which command you ran and against what data.
+- **Anything under [`src/lib/cheetah/`](src/lib/cheetah) needs a test with it.** That directory was built test-first for a reason — the key layout is a wire format and the protocol is untyped text. Do not add a function there without covering it.
 - **Datasets are untracked.** `datasets/*` is git-ignored; `.env` is git-ignored. Never commit images, credentials, or `.env`. `.gitignore` whitelists `.env.example`, but no such file exists — if you add environment variables, adding `.env.example` is the right place to document them.
 - **Preserve the dirty tree.** The working tree was clean at branch `main` when this file was written. Do not `git clean`, `git checkout --`, or stash unrelated changes to simplify your own work.
 - **Schema changes go in [`src/setupDatabase.js`](src/setupDatabase.js) only**, as `CREATE TABLE IF NOT EXISTS` plus a best-effort `ALTER` wrapped in `try/catch`. The script must stay idempotent and re-runnable on a populated database.
@@ -147,7 +148,7 @@ lookup conditioned on the path so far rather than on the last probe alone. None 
 
 ### [`package.json`](package.json)
 
-Manifest. CommonJS (`"type": "commonjs"`), `main` is `src/index.js`. Only two scripts: `test` (deliberately fails) and `maintenance:check`. Runtime deps: `sharp` (libvips image ops), `mysql2`, `express` 5, `dotenv`, `cli-progress`.
+Manifest. CommonJS (`"type": "commonjs"`), `main` is `src/index.js`. Three scripts: `test` (`node --test test/*.test.js`), `test:integration` (the same suite with `CHEETAH_INTEGRATION=1`, which un-skips the live Cheetah round-trip), and `maintenance:check`. Runtime deps: `sharp` (libvips image ops), `mysql2`, `express` 5, `dotenv`, `cli-progress`. **No dev dependency**: the test runner is Node's own.
 
 - **Common mistakes:** There is no `engines` field, but the code requires **Node 18+** (global `fetch` in `src/clientAPI.js`) and is developed on Node 24. Do not add ESM `import` syntax — every file uses `require`. The Cheetah client planned in [`ROADMAP.md`](ROADMAP.md) needs **no new dependency** — its protocol is newline-delimited text over `net`; do not add one.
 
@@ -171,13 +172,43 @@ Standalone single-binary **Go** key/value + graph + prediction database server (
 
 - **Its own handbook governs it:** [`cheetah/AGENTS.md`](cheetah/AGENTS.md) (~1400 lines) is authoritative for its protocol, on-disk contracts, config, and pitfalls. [`cheetah/README.md`](cheetah/README.md) holds the command reference. [`cheetah/NEXT_STEPS.md`](cheetah/NEXT_STEPS.md) is its roadmap. [`cheetah/CONCEPTS.md`](cheetah/CONCEPTS.md) documents the n-gram reducer payload layouts we intend to reuse.
 - **The subsystems this migration depends on:** the pair trie ([`cheetah/src/database.go`](cheetah/src/database.go), [`cheetah/src/tables.go`](cheetah/src/tables.go)) for feature lookup; the graph store ([`cheetah/src/graph.go`](cheetah/src/graph.go)) and associative recall ([`cheetah/src/graph_recall.go`](cheetah/src/graph_recall.go)) for descriptor→image resolution; edge belief ([`cheetah/src/graph_uncertainty.go`](cheetah/src/graph_uncertainty.go)) to finally give confidence a meaning; and the registered reducers ([`cheetah/src/reducers.go`](cheetah/src/reducers.go)) for n-gram follower counts.
-- **Build and test from this repo root:**
-  - `go build -o cheetah-server ./cheetah/src` — the server binary (untracked).
-  - `go test ./cheetah/src` — its unit tests. Run these before any commit inside the submodule.
+- **Build and test — from inside the submodule, not from our root:**
+  - `cd cheetah && go build -o ../cheetah-server ./src` — the server binary (untracked).
+  - `cd cheetah && go test ./src` — its unit tests. Run these before any commit inside the submodule.
 - **Common mistakes:**
   - **Its `src/` is Go, not ours.** `cheetah/src/` and `src/` are unrelated trees that happen to share a name; its own handbook flags the same collision against its former Python parent project.
-  - Do **not** add Cheetah's build outputs (`cheetah-server`, `cheetah_data/`) to this repository — its `.gitignore` covers them inside the submodule, ours does not cover them at the root.
+  - **`go build ./cheetah/src` from our repository root fails** — there is no `go.mod` above `cheetah/`, so Go answers `cannot find main module`. Run it with `cheetah/` as the working directory.
+  - Cheetah's build outputs (`cheetah-server`, `cheetah_data/`) land at *our* root when built this way; our `.gitignore` covers both. Do not commit them.
   - Editing files under `cheetah/` and committing only in *this* repository records nothing: submodule content lives in the submodule's own history. Commit there, push there, then bump the pointer here.
+
+### [`src/lib/cheetah/`](src/lib/cheetah) — the migration's storage layer
+
+Six CommonJS modules, no new dependency (the protocol is `net` and newlines). **Nothing in the pipeline imports them yet** — see [Current Status](#experimental--scaffold). They implement Phases 0–1 of [`ROADMAP.md`](ROADMAP.md) and are covered by [`test/`](test).
+
+- [`protocol.js`](src/lib/cheetah/protocol.js) — pure codec, no socket. `parseResponse` (status split, `key=value` map, bare flags), `parseItems`, `parseCursor`, `decodePayload`, `parseBranches`, `encodeArgument`, `buildCommand`, `buildKeyValueCommand`, `assertKeySpaceIsOurs`, `rawArgument`.
+  - **`value=` owns the rest of the line.** `READ` answers `SUCCESS,size=<n>,value=<raw bytes>` unescaped, so a JSON payload legitimately contains commas. Splitting the whole line on `,` corrupts it.
+  - **`encodeArgument` hex-escapes a leading `x`.** Cheetah's `parseValue` decodes any argument starting with `x` as hex, so `x:foo` would be read as a malformed hex string. This is why the roadmap's `x:` namespace became `fn:`.
+  - **A `next_cursor` must be passed back through `rawArgument`**, never through the ordinary encoder — it is already in the `x<hex>` spelling and would be encoded twice, silently truncating a sweep to its first page.
+- [`client.js`](src/lib/cheetah/client.js) — `CheetahClient` (one socket, FIFO response matching, bounded pipelining via `maxInFlight`, reconnect with exponential backoff, `DATABASE` re-primed on every reconnect) and `CheetahPool` (`send` spreads over the least-loaded connection; `withConnection` leases one).
+  - **The protocol has no request IDs.** Responses match commands by arrival order, so any code path that could reorder writes on one socket breaks every later response. A command timeout therefore tears the connection down rather than abandoning its slot in the queue.
+  - A multi-command sequence that must not interleave (read-modify-write) needs `pool.withConnection`, not `pool.send`.
+- [`kv.js`](src/lib/cheetah/kv.js) — the two-step write. Cheetah separates bytes from names: `INSERT` returns an absolute key, `PAIR_SET` binds a prefix to it, so **a write is two round trips and a read is two**. `putValue`/`getValue`/`putJson`/`getJson`, plus `scanPage`/`scanPrefix`/`scanAll` for cursor paging.
+  - `putValue` defaults to a blind `INSERT`+`PAIR_SET`; `{upsert: true}` `EDIT`s in place instead, keeping the absolute key stable and not orphaning the old bytes. Write-once rows (`f:`) want the default; rewritten records want the upsert.
+  - The socket speaks latin1 for byte transparency, so UTF-8 payloads are transcoded on both edges (`toWire`/`fromWire`). Dropping that mangles any non-ASCII filename.
+- [`keys.js`](src/lib/cheetah/keys.js) — **the single owner of ROADMAP §3; no other file may concatenate a Cheetah key.** Namespaces, fixed-width hex segments, bucketing, graph node ids, and the inverse parsers.
+  - **Bucketing is integer arithmetic over a frozen 1e-6 quantum**, not float division. In float, `(v - tol) / width` lands on `224.99999999999997` where exact arithmetic gives `225`, widening the tolerance sweep from 2 buckets to 3 for about half of all probes.
+  - Bucket widths are **frozen constants**, deliberately not derived from `RESOLUTION_LEVEL_TOLERANCE`/`OFFSET_TOLERANCE` — a width that moved with an env var would change the key layout from the environment. The module throws at load if a tolerance is widened past half a bucket.
+  - Anchors use `Math.round(u * ANCHOR_SCALE)`, matching MySQL's `pos_x`/`pos_y` exactly, because anchors are an exact-match contract; everything else floors.
+  - Graph node ids are bare `n<hex>`/`m<hex>` with **no separator word** — a shared word like `desc` is enough for Cheetah's lexical term index to cross-match unrelated ids at score 0.33.
+- [`vocabulary.js`](src/lib/cheetah/vocabulary.js) — `TokenVocabulary`, the descriptor-hash → uint32 allocator persisted as `t:`/`r:` with the counter at `cfg:next_token`.
+  - **Allocation is process-local.** Cheetah has no compare-and-swap, so the counter is guarded by a single-flight promise chain in Node. Two *processes* ingesting into one database would race and hand the same id to two descriptors.
+- [`server.js`](src/lib/cheetah/server.js) — development/test lifecycle only: `ensureServerBinary` (builds from the submodule if missing), `startServer` (headless, polls for the listener), `stop` (SIGTERM then SIGKILL). Defaults to `CHEETAH_GRAPH_TERM_INDEX=0` and `pair_bytes=2`.
+
+### [`test/`](test)
+
+The project's first tests. `npm test` → `node --test test/*.test.js`; no dev dependency. See the [Test Ownership Map](#test-ownership-map) for what each file owns.
+
+- **Common mistakes:** `node --test test/` (a bare directory) fails on Node 24 — it resolves the path as a module. Use the glob. The integration file is skipped unless `CHEETAH_INTEGRATION=1`, so a green `npm test` does **not** mean the client was exercised against a real server.
 
 ### [`src/settings.js`](src/settings.js)
 
@@ -188,7 +219,8 @@ Single source of truth for configuration. Parses `.env` through `dotenv` and exp
   - `settings.client` — `API_BASE_URL` (default `http://localhost:3000`), `CLIENT_MAX_ITERATIONS` (10).
   - `settings.server` — `PORT` (3000).
   - `settings.search` — `VALUE_THRESHOLD` (0.08, the elastic matcher's base distance), `SKIP_THRESHOLD` (3, misses before a descriptor is treated as a dead end), `CLI_MAX_ITERATIONS` (12).
-  - `settings.database` — `DB_NAME` (`image_hypercube_db`), `DEFAULT_MAX_DB_SIZE_GB` (10).
+  - `settings.database` — `DB_NAME` (`image_hypercube_db`), `DEFAULT_MAX_DB_SIZE_GB` (10), `backend` (`STORAGE_BACKEND`, `mysql`|`cheetah`, default `mysql`; **no pipeline code reads it yet**).
+  - `settings.cheetah` — `CHEETAH_HOST` (`127.0.0.1`), `CHEETAH_PORT` (4455), `CHEETAH_DATABASE` (`image_sign_db`), `CHEETAH_DATA_DIR` (`cheetah_data`), `CHEETAH_POOL_SIZE` (4), `CHEETAH_CONNECT_TIMEOUT_MS` (5000), `CHEETAH_COMMAND_TIMEOUT_MS` (30000), `CHEETAH_MAX_IN_FLIGHT` (64), `CHEETAH_PAIR_INDEX_BYTES` (2), `CHEETAH_GRAPH_TERM_INDEX` (false). Read only by [`src/lib/cheetah/`](src/lib/cheetah). The last three are **also** read by the Go server process itself from its own environment — this group exists because [`src/lib/cheetah/server.js`](src/lib/cheetah/server.js) spawns it.
   - `settings.correlation` — `CORRELATION_SIMILARITY_THRESHOLD` (0.2), `CORRELATION_MAX_CANDIDATE_SAMPLE` (256), `CORRELATION_MIN_AFFINITY` (0.45), `CORRELATION_MIN_COHESION` (falls back to `CORRELATION_MIN_SPREAD`, then 0.25), online-runner batch caps.
   - `settings.training` — CLI defaults (`discover` 3, `bootstrap` 0, `reprobe` 0, `shuffle` true, `DEFAULT_THREADS` unset), `augmentationsPerImage` (3), `selfEvaluation.*`, `realTimePruning.*`, `progressive.*` (cycles 3, `randomPerAug` 300, `guidedPerCycle` 300), `storeImageBlob` (false), correlation debug logging.
 - **Deliberate exceptions — env vars read outside this file:** `DB_HOST`/`DB_USER`/`DB_PASSWORD`/`DB_NAME` (every `mysql.createConnection` call site), `DB_OPERATION_MAX_RETRIES` / `DB_OPERATION_RETRY_BASE_MS` ([`src/featureExtractor.js`](src/featureExtractor.js)), `CONSTELLATION_SAMPLES_PER_AUGMENTATION` / `SAMPLES_PER_AUGMENTATION` ([`src/lib/constants.js`](src/lib/constants.js)), `RESOLUTION_LEVEL_PRECISION` / `RESOLUTION_LEVEL_TOLERANCE` ([`src/lib/resolutionLevel.js`](src/lib/resolutionLevel.js)), `TRAINING_VERBOSE_AUGMENT_LOGS` / `AUG_PROGRESS_STEPS` ([`src/lib/vectorGenerators.js`](src/lib/vectorGenerators.js)), `TRAINING_AUGMENTATION_GLOBAL_SEED` ([`src/train.js`](src/train.js)). These are read at module load; they cannot be changed at runtime.
@@ -769,7 +801,19 @@ Documentation-sync gate — run **before** committing, since it inspects the unc
 npm run maintenance:check
 ```
 
-Not available: `npm test` (wired to fail deliberately), lint, format, typecheck, benchmark, packaging, and deployment. Do not invent them.
+Tests — fast, no database, no Go toolchain:
+
+```bash
+npm test
+```
+
+Tests including the live Cheetah round-trip (builds the submodule binary, spawns a headless server on an ephemeral port, cleans up after itself):
+
+```bash
+npm run test:integration
+```
+
+Not available: lint, format, typecheck, benchmark, packaging, and deployment. Do not invent them.
 
 ### Cheetah submodule (migration work only)
 
@@ -781,11 +825,13 @@ Pull it — **first action of every session**:
 git -C cheetah pull --ff-only origin main
 ```
 
-Build the server binary (untracked; do not commit it):
+Build the server binary (untracked; do not commit it). It must run with `cheetah/` as the working directory — the `go.mod` lives there, and from our root Go answers `cannot find main module`:
 
 ```bash
-go build -o cheetah-server ./cheetah/src
+cd cheetah && go build -o ../cheetah-server ./src
 ```
+
+`src/lib/cheetah/server.js` (`ensureServerBinary`) runs exactly this when the binary is missing, which is why `npm run test:integration` needs no manual build.
 
 Run it headless on a scratch port and data directory for experiments (mutates only that directory):
 
@@ -796,7 +842,7 @@ CHEETAH_HEADLESS=1 CHEETAH_LISTEN_ADDR=127.0.0.1:4467 CHEETAH_DATA_DIR=./scratch
 Its test suite — run before any commit inside the submodule:
 
 ```bash
-go test ./cheetah/src
+cd cheetah && go test ./src
 ```
 
 Its format and vet gates, which must both be silent:
@@ -813,9 +859,15 @@ RESET_DB image_sign pair_bytes=2
 
 ## Test Ownership Map
 
-**There is no automated test suite.** No test runner, no test files, no fixtures, no CI configuration. `npm test` exits 1 by design. Every contract in this document is unprotected by executable checks.
+**A test suite exists, and it covers the Cheetah migration groundwork only.** `npm test` runs `node --test test/*.test.js`; there is still no CI and no lint. Every contract in this document that concerns the **MySQL pipeline** remains unprotected by executable checks.
 
-The closest substitutes, and what each actually covers:
+| Test file | Owns | Runs by default |
+| --- | --- | --- |
+| [`test/cheetah-protocol.test.js`](test/cheetah-protocol.test.js) | Response parsing (`SUCCESS`/`ERROR`/`PENDING`, `value=` rest-of-line, `items=`, `next_cursor`, `payload=`, `branches=`) and argument encoding, including the `x<HEX>` escape and the `rawArgument` cursor pass-through | yes |
+| [`test/cheetah-keys.test.js`](test/cheetah-keys.test.js) | ROADMAP §3: key round-trip, byte-order == numeric-order via `Buffer.compare`, negative-offset ordering, the ≤2-bucket sweep contract, and a 10⁵-descriptor collision fuzz | yes |
+| [`test/cheetah-integration.test.js`](test/cheetah-integration.test.js) | Live round-trip against a spawned `cheetah-server`: pair set/get, paged scan, summary, graph recall, token vocabulary, pipelining, namespace delete | **no** — gated on `CHEETAH_INTEGRATION=1`, i.e. `npm run test:integration`, because it needs a Go toolchain |
+
+The closest substitutes for the untested MySQL pipeline, and what each actually covers:
 
 | Contract / subsystem | Nearest check | What it does **not** cover |
 | --- | --- | --- |
@@ -827,7 +879,7 @@ The closest substitutes, and what each actually covers:
 | Documentation sync | `npm run maintenance:check` | Only uncommitted changes; does not know about `AGENTS.md`; breaks on paths with spaces |
 | Correlation seeding | `node src/testCorrelations.js` | Not a test — it mutates the database and asserts nothing |
 
-**Known test gaps, in priority order:** descriptor-hash stability across the three builders; `normalizeProbeSpec` round-tripping; `collectElasticMatches` relaxation behavior; `normalizeResolutionLevel` boundaries; `extendConstellationPath` accuracy arithmetic. All are pure functions with no database dependency and would be cheap to cover first.
+**Known test gaps, in priority order:** descriptor-hash stability across the three builders; `normalizeProbeSpec` round-tripping; `collectElasticMatches` relaxation behavior; `normalizeResolutionLevel` boundaries; `extendConstellationPath` accuracy arithmetic. All are pure functions with no database dependency, all are now cheap to add — the runner exists and `test/` is wired up.
 
 ## Data, Security, Privacy, and Compatibility Boundaries
 
@@ -855,7 +907,7 @@ The closest substitutes, and what each actually covers:
 
 ### Experimental / Scaffold
 
-- **Cheetah migration groundwork** — the [`cheetah`](cheetah) submodule is added, pinned at `8ecdf35`, verified to build (`go build -o cheetah-server ./cheetah/src`) and verified over TCP for the exact mechanisms the plan depends on: `PAIR_SET`/`PAIR_GET`/`PAIR_SCAN`/`PAIR_SUMMARY`/`PAIR_REDUCE counts`, `GRAPH_NODE_SET`/`GRAPH_EDGE_SET`/`GRAPH_NEIGHBORS`/`GRAPH_DEGREE`, and `GRAPH_RECALL` returning a ranked image ID from a descriptor seed. **No integration code exists in [`src/`](src)** — the migration is at Phase 0 of [`ROADMAP.md`](ROADMAP.md).
+- **Cheetah migration groundwork ([`src/lib/cheetah/`](src/lib/cheetah), Phases 0–1 of [`ROADMAP.md`](ROADMAP.md))** — TCP client + pool, protocol codec, key codec, value/name helpers, token vocabulary, and a dev-server lifecycle helper. Verified by `npm test` (34 tests) and `npm run test:integration` (44), the latter building and driving a real `cheetah-server` at pinned SHA `8ecdf35`. **Nothing in the pipeline calls any of it** — no ingestion, search, evaluation, or training path reads `settings.database.backend`, so `STORAGE_BACKEND=cheetah` changes no behavior. Phase 2 (dual-write ingestion) is the next step and is blocked on the page-size measurement in ROADMAP §7 question 1.
 - `STORE_IMAGE_BLOB` / `image_blobs` — writes only, no reader, table absent from `setupDatabase.js`, and it contradicts the privacy premise.
 - `src/testCorrelations.js` — a seeding utility named like a test.
 - `src/vectorCustom.js` — dead legacy experiment against a table that no longer exists.
@@ -863,7 +915,7 @@ The closest substitutes, and what each actually covers:
 
 ### Known Gaps
 
-- **No automated tests, no CI, no lint.** The single largest risk to every contract in this document.
+- **No CI, no lint, and no tests outside [`src/lib/cheetah/`](src/lib/cheetah).** The single largest risk to every contract in this document. The runner now exists, so adding a test is no longer a project-setup task.
 - **`knowledge_nodes.miss_count` is never incremented**, so all confidences are 1.0 and the README's "Learning on Search" reinforcement loop does not exist in code.
 - **The quadtree feature family described in the README is unimplemented** — there is no `hsv_tree_mean`/`hsv_tree_delta` producer or consumer.
 - **The README's claim that the server picks the next question from `feature_group_stats` separation scores is stale.** `buildNextQuestion` uses `knowledge_nodes` via `fetchRelatedConstellations`, with random exploration; `feature_group_stats` feeds guided *ingestion*, not question selection.

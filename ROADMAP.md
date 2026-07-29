@@ -4,9 +4,11 @@ Authoritative plan for replacing MySQL with [`cheetah`](cheetah) as Image Sign D
 retrieval engine, and for rebuilding recognition around **n-gram probe paths** and a **property
 graph** that resolves a set of measured descriptors into an image ID.
 
-**Status of this document:** planning. Nothing below is implemented. Every item is `Planned` until it
-moves to `Shipped` in [`AGENTS.md`](AGENTS.md) with a verification note. Do not describe any of this
-as current behavior in [`README.md`](README.md) or [`TECH_NOTES.md`](TECH_NOTES.md).
+**Status of this document:** Phases 0 and 1 are implemented; Phases 2–6 are still planning. An item is
+`Planned` until it moves to `Shipped` in [`AGENTS.md`](AGENTS.md) with a verification note. Nothing
+under [`src/lib/cheetah/`](src/lib/cheetah) is wired into ingestion or search yet — setting
+`STORAGE_BACKEND=cheetah` today changes no behavior. Do not describe Phase 2+ as current behavior in
+[`README.md`](README.md) or [`TECH_NOTES.md`](TECH_NOTES.md).
 
 **Scope note:** this is a rewrite of the persistence and retrieval layer, not of the measurement
 layer. [`src/lib/constellation.js`](src/lib/constellation.js),
@@ -105,7 +107,7 @@ and becomes ranked evidence with a score, a distance, and a `via` path the serve
 | `r:` | `r:<tokenHex8>` | descriptorKey | reverse vocabulary |
 | `f:` | `f:<tokenHex8>/<resB>/<axB>/<ayB>/<offXB>/<offYB>/<imageHex8>/<seqHex4>` | `{value, size, rel_x, rel_y}` | `feature_vectors` |
 | `i:` | `i:<imageHex8>` | `{filename, created_at, complete}` | `images` |
-| `x:` | `x:<filenameHash>` | imageHex8 | `images.original_filename` lookup |
+| `fn:` | `fn:<filenameHash>` | imageHex8 | `images.original_filename` lookup |
 | `use:` | `use:<featureKeyHash>` | `{count, last_used, last_score}` | `feature_usage` |
 | `skip:` | `skip:<descriptorKey>` | `{count, last_used}` | `skip_patterns` |
 | `stat:` | `stat:<tokenHex8>/<resB>` | aggregate stats JSON | `feature_group_stats` |
@@ -121,6 +123,19 @@ Rules:
 - **Never emit keys under Cheetah's reserved control-byte prefixes** `\x01gn: \x02ge: \x03go:
   \x04gi: \x05gt:` or `graph/idx/`. All our prefixes are printable ASCII, so this holds by
   construction — keep it that way.
+- **No key may begin with `x`.** Cheetah decodes any positional argument with a leading `x` as hex
+  (`cheetah/src/helpers.go` → `parseValue`), so an `x:`-prefixed key is unaddressable in its bare
+  spelling. This is why the filename namespace above is `fn:` and not `x:`, and it is asserted by
+  `keys.assertValidKey`. The client escapes such arguments as `x<HEX>` automatically, but relying on
+  that would silently double the wire cost of the hottest namespace.
+
+**Implemented in [`src/lib/cheetah/keys.js`](src/lib/cheetah/keys.js)** — that file, not this table,
+is the authority now. Two layout decisions were made while writing it and are recorded here:
+
+- The n-gram `<order>` is **two hex digits** (`g:03:…`), not a bare number, so orders stay
+  byte-ordered against each other like every other segment.
+- Feature keys carry a trailing `<seqHex4>` after `<imageHex8>` to disambiguate several rows of one
+  image landing in the same bucket cell.
 
 ### 3.2 Turning tolerance into buckets (the load-bearing trick)
 
@@ -132,6 +147,14 @@ neighbours:
 bucket(v, width) = floor(v / width)      // width = 2 × tolerance, at least
 lookup(v)        = scan bucket(v-tol), bucket(v), bucket(v+tol)   // ≤ 2 distinct buckets in practice
 ```
+
+> **Do the division in integers.** Implementing this in floating point made the sweep return *three*
+> buckets for roughly half of all probes: `(v - tol) / width` evaluates to `224.99999999999997` where
+> exact arithmetic gives `225`, and because the tolerance is an exact multiple of the 1e-6 rounding
+> grid the descriptor builders already use, landing on a bucket boundary is the common case rather
+> than the rare one. [`keys.js`](src/lib/cheetah/keys.js) quantizes every value to 1e-6 first and
+> buckets integers, which makes the ≤2 guarantee exact. A property test asserts it over 10⁵ draws
+> per dimension.
 
 With `OFFSET_TOLERANCE = 1e-3` and `RESOLUTION_LEVEL_TOLERANCE = 1e-4` this gives:
 
@@ -236,40 +259,58 @@ Each phase ends in a verifiable state. Do not start a phase before its predecess
 
 ### Phase 0 — Groundwork *(no behavior change)*
 
-- [ ] **0.1** Submodule added and pinned. ✅ *Done* — `cheetah` at `8ecdf35`, builds clean with
-      `go build -o cheetah-server ./src` on Go 1.25.4.
-- [ ] **0.2** `src/lib/cheetah/client.js` — TCP client. Newline-delimited, **strictly one line in /
-      one line out**, a FIFO queue (the protocol has no request IDs, so responses match by order —
-      never fire two commands concurrently on one socket), reconnect with backoff, and a connection
-      pool sized like the ingest worker pool.
-- [ ] **0.3** `src/lib/cheetah/protocol.js` — response parser: `SUCCESS`/`ERROR,<reason>` split,
-      `key=value` field map, `payload=` base64→JSON decode, `items=` `<hex>:<key>[:<b64>]` splitting,
-      and hex-key decoding. Pure functions, no socket.
-- [ ] **0.4** `src/lib/cheetah/server.js` — dev lifecycle helper: spawn `cheetah-server` headless on a
-      configured port/data dir, wait for the listener, shut down cleanly.
-- [ ] **0.5** Settings: add a `settings.cheetah` group (`CHEETAH_HOST`, `CHEETAH_PORT`,
-      `CHEETAH_DATABASE`, `CHEETAH_DATA_DIR`, `CHEETAH_POOL_SIZE`, `STORAGE_BACKEND=mysql|cheetah`)
-      to [`src/settings.js`](src/settings.js), and document them per the maintenance checklist.
-- [ ] **0.6** **First tests in this project's history.** A `test/` directory + a runner in
-      `package.json` (`node --test`, no new dependency). Cover the protocol parser and the key codec
-      from §3 — both pure, both the highest-risk-per-line code in the migration.
+- [x] **0.1** Submodule added and pinned. ✅ *Done* — `cheetah` at `8ecdf35`. Build it from inside the
+      submodule (`cd cheetah && go build -o ../cheetah-server ./src`) on Go 1.25.4; there is no
+      `go.mod` at our repository root, so the root-relative spelling fails.
+- [x] **0.2** [`src/lib/cheetah/client.js`](src/lib/cheetah/client.js) — TCP client. Newline-delimited,
+      FIFO response matching (the protocol has no request IDs), bounded pipelining, reconnect with
+      backoff, `DATABASE` priming on every reconnect, and a `CheetahPool` with `withConnection`
+      leases for sequences that must not interleave.
+- [x] **0.3** [`src/lib/cheetah/protocol.js`](src/lib/cheetah/protocol.js) — response parser and
+      argument encoder. Pure functions, no socket.
+- [x] **0.4** [`src/lib/cheetah/server.js`](src/lib/cheetah/server.js) — dev lifecycle helper: builds
+      the binary if missing, spawns it headless on a configured port/data dir, polls for the
+      listener, SIGTERM→SIGKILL shutdown.
+- [x] **0.5** `settings.cheetah` in [`src/settings.js`](src/settings.js) + `settings.database.backend`
+      (`STORAGE_BACKEND`), documented in [`README.md`](README.md) and [`TECH_NOTES.md`](TECH_NOTES.md).
+- [x] **0.6** **First tests in this project's history.** `npm test` → `node --test test/*.test.js`,
+      no new dependency. `npm run test:integration` adds the live round-trip.
 
-**Exit check:** `node -e` round-trip of `PAIR_SET`/`PAIR_GET`/`PAIR_SCAN`/`GRAPH_RECALL` against a
-locally spawned server, plus `npm test` green.
+Two files were added that §5 did not name, both because the alternative was duplicating a contract
+across callers: [`kv.js`](src/lib/cheetah/kv.js) owns the two-step `INSERT`+`PAIR_SET` write, the
+`PAIR_GET`+`READ` read, and cursor paging; [`vocabulary.js`](src/lib/cheetah/vocabulary.js) is
+item 1.2.
+
+**Exit check: ✅ passed.** `npm run test:integration` builds and spawns a server on an ephemeral port
+and round-trips `PAIR_SET`/`PAIR_GET`/`PAIR_SCAN` (with paging)/`PAIR_SUMMARY`/`GRAPH_NODE_SET`/
+`GRAPH_EDGE_SET`/`GRAPH_RECALL`/`DEL pairs`; `npm test` is green at 34 tests.
+
+Three defects the live round-trip caught that the unit tests could not:
+
+1. A `next_cursor` fed back through the ordinary argument encoder is hex-encoded a second time — the
+   server resumes from a prefix that does not exist and the sweep **silently returns one page**
+   instead of failing. Fixed with `protocol.rawArgument` and a `kv.scanPrefix` helper so no caller
+   hand-rolls a cursor loop.
+2. `TokenVocabulary.descriptorFor` returned the token instead of the descriptor hash.
+3. Float bucketing widened the resolution sweep to 3 buckets — see the note in §3.2.
 
 ### Phase 1 — Key codec
 
-- [ ] **1.1** `src/lib/cheetah/keys.js` — the single owner of §3. `featureKey()`, `descriptorKey()`,
-      `imageKey()`, `ngramKey()`, `bucketize()`, and the inverse parsers. **No other file may
-      concatenate a Cheetah key.**
-- [ ] **1.2** Token vocabulary: allocate a uint32 per descriptor, persisted `t:`/`r:`. Needs an
-      atomic counter — use one `INSERT`-backed key (`cfg:next_token`) guarded by a single-flight
-      promise in Node, since Cheetah has no compare-and-swap.
-- [ ] **1.3** Property tests: round-trip every key type; assert byte-ordering matches numeric
-      ordering across bucket boundaries and negative offsets.
+- [x] **1.1** [`src/lib/cheetah/keys.js`](src/lib/cheetah/keys.js) — the single owner of §3.
+      **No other file may concatenate a Cheetah key.**
+- [x] **1.2** Token vocabulary ([`vocabulary.js`](src/lib/cheetah/vocabulary.js)): a uint32 per
+      descriptor, persisted `t:`/`r:`, counter at `cfg:next_token` guarded by a single-flight promise
+      chain, plus a per-descriptor in-flight map so concurrent first sights of the same hash collapse
+      to one allocation. **This is process-local.** Cheetah has no compare-and-swap, so two
+      *processes* ingesting into one database would race; today's pipeline has a single parent
+      process and the note is in the file.
+- [x] **1.3** Property tests ([`test/cheetah-keys.test.js`](test/cheetah-keys.test.js)).
 
-**Exit check:** `npm test` covers key round-trip and ordering; a fuzz run of 10⁵ random descriptors
-produces no collisions and no unordered pairs.
+**Exit check: ✅ passed.** 20 000 random feature keys sort identically by `Buffer.compare` (what
+`PAIR_SCAN` actually does) and by their numeric tuple; negative offsets sort below positive ones;
+10⁵ random descriptors produce >99 000 distinct hashes and >99 000 distinct feature keys with no
+encoding collisions; 10⁵ draws per toleranced dimension confirm the sweep never misses a row within
+tolerance and never exceeds 2 buckets.
 
 ### Phase 2 — Dual-write ingestion
 

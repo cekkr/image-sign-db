@@ -44,6 +44,11 @@ build/Release
 node_modules/
 jspm_packages/
 
+# Cheetah build output and data directory (the submodule ignores these inside
+# itself; built from our root they land here). See ROADMAP.md.
+cheetah-server
+cheetah_data/
+
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
 

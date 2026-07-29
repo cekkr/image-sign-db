@@ -123,7 +123,16 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
   - `client`: `API_BASE_URL`, `CLIENT_MAX_ITERATIONS`.
   - `server`: `PORT`.
   - `search`: `VALUE_THRESHOLD`, `SKIP_THRESHOLD`, `CLI_MAX_ITERATIONS`.
-  - `database`: schema name, default size cap (`DEFAULT_MAX_DB_SIZE_GB`).
+  - `database`: schema name, default size cap (`DEFAULT_MAX_DB_SIZE_GB`), and `backend`
+    (`STORAGE_BACKEND`, `mysql` | `cheetah`; `mysql` is the only backend implemented
+    end-to-end today).
+  - `cheetah`: connection and lifecycle settings for the Cheetah migration groundwork —
+    `CHEETAH_HOST`, `CHEETAH_PORT`, `CHEETAH_DATABASE`, `CHEETAH_DATA_DIR`,
+    `CHEETAH_POOL_SIZE`, `CHEETAH_CONNECT_TIMEOUT_MS`, `CHEETAH_COMMAND_TIMEOUT_MS`,
+    `CHEETAH_MAX_IN_FLIGHT`, `CHEETAH_PAIR_INDEX_BYTES`, `CHEETAH_GRAPH_TERM_INDEX`.
+    Read only by `src/lib/cheetah/*`; no pipeline code consumes them yet (see `ROADMAP.md`).
+    `CHEETAH_DATA_DIR`, `CHEETAH_PAIR_INDEX_BYTES` and `CHEETAH_GRAPH_TERM_INDEX` are also
+    read by the Go server process itself.
   - `correlation`: similarity thresholds, candidate sample caps, online runner sizing.
   - `training`: defaults for CLI flags, augmentation budgets, progressive ingestion, self-evaluation, real-time pruning, and debug logging.
 - Environment variables in `.env` override defaults; always document new flags here and in this file when adding tunables.
@@ -136,6 +145,15 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
   - High skip-count descriptors (cleans `feature_vectors`, `value_types`, and `skip_patterns`).
   - Stale GROUP nodes with low hits and age beyond threshold.
 - Logs summarize pruned vectors/descriptors/constellations for audit.
+
+## 13½. Tests (`test/`)
+- `npm test` runs `node --test test/*.test.js` — no test dependency is added; the runner is Node's own.
+- Coverage today is the Cheetah migration groundwork only: the wire-protocol parser
+  (`test/cheetah-protocol.test.js`) and the key codec (`test/cheetah-keys.test.js`). The
+  MySQL pipeline remains unprotected by tests; verification there still means running it.
+- `npm run test:integration` additionally builds `cheetah-server` from the submodule, spawns it
+  headless on an ephemeral port, and round-trips the client against it. It is skipped by plain
+  `npm test` (gated on `CHEETAH_INTEGRATION=1`) so the default suite needs no Go toolchain.
 
 ## 14. Dependencies & Runtime
 - Node.js (CommonJS modules).
