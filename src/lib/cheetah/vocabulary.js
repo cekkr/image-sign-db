@@ -7,11 +7,11 @@
 //
 // **Concurrency.** Cheetah has no compare-and-swap, so the counter at
 // `cfg:next_token` is guarded by a single-flight promise chain in Node. That
-// makes allocation safe within one process — including across the ingest worker
-// pool only if the pool shares this instance. Two *processes* ingesting into
-// the same database concurrently would race and can hand the same id to two
-// descriptors; today's pipeline runs one parent process, and the workers reach
-// storage through it. If that ever changes, allocation must move server-side.
+// makes allocation safe within one process. Two processes (including two worker
+// threads, whose CommonJS module state is isolated) ingesting into the same
+// database concurrently would race and can hand the same id to two descriptors.
+// `train.js` therefore forces one worker for the Cheetah backend. If that
+// restriction changes, allocation must move server-side.
 
 const { configKey, reverseTokenKey, tokenKey } = require('./keys');
 const { getValue, putValue } = require('./kv');
@@ -124,11 +124,65 @@ class TokenVocabulary {
 
     /** Resolve many descriptors, preserving input order. */
     async tokensFor(descriptorHashes) {
-        const out = [];
-        for (const hash of descriptorHashes) {
-            out.push(await this.tokenFor(hash));
+        const hashes = Array.isArray(descriptorHashes) ? descriptorHashes : [];
+        const unique = [...new Set(hashes)];
+        const fresh = unique.filter((hash) =>
+            !this.forward.has(hash) && !this.pendingLookups.has(hash)
+        );
+
+        if (fresh.length > 0) {
+            // Resolve all existing mappings concurrently, reserve one token
+            // block for the true misses, then pipeline both mapping directions.
+            // Register each hash in pendingLookups before the first read can
+            // finish so tokenFor() collapses onto this batch.
+            const batch = (async () => {
+                const storedValues = await Promise.all(
+                    fresh.map((hash) => getValue(this.conn, tokenKey(hash)))
+                );
+                const resolved = new Map();
+                const missing = [];
+                storedValues.forEach((stored, index) => {
+                    const hash = fresh[index];
+                    if (stored === null) {
+                        missing.push(hash);
+                        return;
+                    }
+                    const token = Number.parseInt(stored, 10);
+                    if (!Number.isFinite(token)) {
+                        throw new CheetahError(
+                            `cheetah token for ${hash} is not numeric: ${stored}`
+                        );
+                    }
+                    resolved.set(hash, token);
+                });
+
+                if (missing.length > 0) {
+                    const first = await this.allocate(missing.length);
+                    await Promise.all(missing.flatMap((hash, index) => {
+                        const token = first + index;
+                        resolved.set(hash, token);
+                        return [
+                            putValue(this.conn, reverseTokenKey(token), hash, { upsert: true }),
+                            putValue(this.conn, tokenKey(hash), String(token), { upsert: true }),
+                        ];
+                    }));
+                }
+                return resolved;
+            })();
+
+            for (const hash of fresh) {
+                const lookup = batch
+                    .then((resolved) => this.#remember(hash, resolved.get(hash)))
+                    .finally(() => {
+                        if (this.pendingLookups.get(hash) === lookup) {
+                            this.pendingLookups.delete(hash);
+                        }
+                    });
+                this.pendingLookups.set(hash, lookup);
+            }
         }
-        return out;
+
+        return Promise.all(hashes.map((hash) => this.tokenFor(hash)));
     }
 }
 

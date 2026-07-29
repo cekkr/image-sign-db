@@ -334,6 +334,19 @@ class CheetahPool {
         return this.send(buildCommand(name, ...args));
     }
 
+    /** Pool equivalent of `CheetahClient.commandOrThrow`. */
+    async commandOrThrow(name, ...args) {
+        const line = buildCommand(name, ...args);
+        const response = await this.send(line);
+        if (!response.ok) {
+            throw new CheetahError(`cheetah ${name} failed: ${response.error || response.raw}`, {
+                command: line,
+                response,
+            });
+        }
+        return response;
+    }
+
     async acquire() {
         if (this.closing) throw new CheetahError('cheetah pool is closed');
         const free = this.#leastLoaded();

@@ -4,7 +4,7 @@ Fast-access operational reference for agents working in this repository.
 
 **Image Sign DB** is a research-stage content-based image retrieval (CBIR) engine written in CommonJS Node.js. It never stores or compares whole images: it samples a deterministic *constellation* of relative anchor/neighbour patch pairs, stores only the HSV/luminance **delta** between them, and identifies an image through a server-driven question/answer dialogue in which the client measures only the descriptors the server asks for.
 
-> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. **Everything described in this handbook as current behavior is still the MySQL implementation.** [`src/lib/cheetah/`](src/lib/cheetah) now exists (roadmap Phases 0–1: client, protocol codec, key codec, token vocabulary — see [Shipped](#shipped)), but **nothing in the pipeline calls it**: no ingestion, search, evaluation, or training path reads `STORAGE_BACKEND`, and setting it to `cheetah` changes no behavior. Do not read the roadmap as a description of what runs.
+> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. The MySQL implementation remains the only complete pipeline. [`src/lib/cheetah/`](src/lib/cheetah) now implements roadmap Phases 0–2: `STORAGE_BACKEND=cheetah` routes exhaustive ingestion and the random first progressive cycle to Cheetah with completion gating and bounded payload-budget pruning. Search, evaluation, guided ingestion, discovery, image deletion, and graph-aware pruning are not ported. Do not read later roadmap phases as a description of what runs.
 
 What this project is **not**:
 
@@ -183,13 +183,15 @@ Standalone single-binary **Go** key/value + graph + prediction database server (
 
 ### [`src/lib/cheetah/`](src/lib/cheetah) — the migration's storage layer
 
-Six CommonJS modules, no new dependency (the protocol is `net` and newlines). **Nothing in the pipeline imports them yet** — see [Current Status](#experimental--scaffold). They implement Phases 0–1 of [`ROADMAP.md`](ROADMAP.md) and are covered by [`test/`](test).
+Seven CommonJS modules, no new dependency (the protocol is `net` and newlines). They implement
+Phases 0–1 plus the Phase 2 storage/ingestion slice in [`ROADMAP.md`](ROADMAP.md) and are covered by
+[`test/`](test).
 
 - [`protocol.js`](src/lib/cheetah/protocol.js) — pure codec, no socket. `parseResponse` (status split, `key=value` map, bare flags), `parseItems`, `parseCursor`, `decodePayload`, `parseBranches`, `encodeArgument`, `buildCommand`, `buildKeyValueCommand`, `assertKeySpaceIsOurs`, `rawArgument`.
   - **`value=` owns the rest of the line.** `READ` answers `SUCCESS,size=<n>,value=<raw bytes>` unescaped, so a JSON payload legitimately contains commas. Splitting the whole line on `,` corrupts it.
   - **`encodeArgument` hex-escapes a leading `x`.** Cheetah's `parseValue` decodes any argument starting with `x` as hex, so `x:foo` would be read as a malformed hex string. This is why the roadmap's `x:` namespace became `fn:`.
   - **A `next_cursor` must be passed back through `rawArgument`**, never through the ordinary encoder — it is already in the `x<hex>` spelling and would be encoded twice, silently truncating a sweep to its first page.
-- [`client.js`](src/lib/cheetah/client.js) — `CheetahClient` (one socket, FIFO response matching, bounded pipelining via `maxInFlight`, reconnect with exponential backoff, `DATABASE` re-primed on every reconnect) and `CheetahPool` (`send` spreads over the least-loaded connection; `withConnection` leases one).
+- [`client.js`](src/lib/cheetah/client.js) — `CheetahClient` (one socket, FIFO response matching, bounded pipelining via `maxInFlight`, reconnect with exponential backoff, `DATABASE` re-primed on every reconnect) and `CheetahPool` (`send` spreads over the least-loaded connection; `withConnection` leases one; `commandOrThrow` mirrors the client surface so KV helpers accept either).
   - **The protocol has no request IDs.** Responses match commands by arrival order, so any code path that could reorder writes on one socket breaks every later response. A command timeout therefore tears the connection down rather than abandoning its slot in the queue.
   - A multi-command sequence that must not interleave (read-modify-write) needs `pool.withConnection`, not `pool.send`.
 - [`kv.js`](src/lib/cheetah/kv.js) — the two-step write. Cheetah separates bytes from names: `INSERT` returns an absolute key, `PAIR_SET` binds a prefix to it, so **a write is two round trips and a read is two**. `putValue`/`getValue`/`putJson`/`getJson`, plus `scanPage`/`scanPrefix`/`scanAll` for cursor paging.
@@ -201,7 +203,29 @@ Six CommonJS modules, no new dependency (the protocol is `net` and newlines). **
   - Anchors use `Math.round(u * ANCHOR_SCALE)`, matching MySQL's `pos_x`/`pos_y` exactly, because anchors are an exact-match contract; everything else floors.
   - Graph node ids are bare `n<hex>`/`m<hex>` with **no separator word** — a shared word like `desc` is enough for Cheetah's lexical term index to cross-match unrelated ids at score 0.33.
 - [`vocabulary.js`](src/lib/cheetah/vocabulary.js) — `TokenVocabulary`, the descriptor-hash → uint32 allocator persisted as `t:`/`r:` with the counter at `cfg:next_token`.
-  - **Allocation is process-local.** Cheetah has no compare-and-swap, so the counter is guarded by a single-flight promise chain in Node. Two *processes* ingesting into one database would race and hand the same id to two descriptors.
+  - **Allocation is process-local.** Cheetah has no compare-and-swap, so the counter is guarded by a single-flight promise chain in Node; `tokensFor` reads existing mappings concurrently, reserves one block for misses, and pipelines both directions. Two processes (including worker threads with isolated module state) ingesting into one database would race, so `train.js` forces one Cheetah worker.
+- [`store.js`](src/lib/cheetah/store.js) — `CheetahStore`, the Phase 2 storage interface:
+  `ensureDescriptor`, `putFeatures`, `putImage`, `markComplete`, `findCandidates`, `recordUsage`,
+  `saveSkip`, `getSetting`/`setSetting`, `featureSummary`, `storageSummary`,
+  `measureFeaturePages`, and `ensureStorageCapacity`.
+  - On connect it writes or validates `cfg:key_layout_version`; a mismatch fails loudly and requires
+    a fresh database/re-ingest.
+  - Image IDs are random collision-checked uint32 values, not another process-local counter. Feature
+    writes are bounded batches of pipelined `INSERT`→`PAIR_SET` pairs.
+  - `findCandidates` uses `PAIR_REDUCE continuations` to hydrate each scan page without a `READ` per
+    row, applies exact tolerance filters in Node, and drops every image whose `i:` record is not
+    `complete:true`. It returns raw rows; elastic matching and ranking remain Phase 3.
+  - Duplicate rows in one feature bucket receive a per-ingest sequence suffix. Interrupted ingests
+    are not resumed; they remain incomplete and invisible.
+  - `storageSummary` totals `PAIR_SUMMARY.total_payload_bytes` for all owned namespaces without
+    hydrating values. This is a stable payload-retention signal, **not** physical disk usage; it
+    excludes trie/table/filesystem overhead.
+  - `ensureStorageCapacity` reads `cfg:max_db_size_gb`, ranks complete-image feature rows by usage
+    count then last-use time, and deletes one bounded batch (maximum 5,000) with exact
+    `DEL pairs key=` operations plus matching `use:` rows. Usage payloads carry `feature_key`
+    because the SHA-1-based `use:` key is not invertible. Incomplete images are protected.
+  - No graph records exist in Cheetah yet. Phase 4 must exclude graph-pinned feature rows before
+    graph learning and size-budget pruning are enabled together.
 - [`server.js`](src/lib/cheetah/server.js) — development/test lifecycle only: `ensureServerBinary` (builds from the submodule if missing), `startServer` (headless, polls for the listener), `stop` (SIGTERM then SIGKILL). Defaults to `CHEETAH_GRAPH_TERM_INDEX=0` and `pair_bytes=2`.
 
 ### [`test/`](test)
@@ -219,8 +243,8 @@ Single source of truth for configuration. Parses `.env` through `dotenv` and exp
   - `settings.client` — `API_BASE_URL` (default `http://localhost:3000`), `CLIENT_MAX_ITERATIONS` (10).
   - `settings.server` — `PORT` (3000).
   - `settings.search` — `VALUE_THRESHOLD` (0.08, the elastic matcher's base distance), `SKIP_THRESHOLD` (3, misses before a descriptor is treated as a dead end), `CLI_MAX_ITERATIONS` (12).
-  - `settings.database` — `DB_NAME` (`image_hypercube_db`), `DEFAULT_MAX_DB_SIZE_GB` (10), `backend` (`STORAGE_BACKEND`, `mysql`|`cheetah`, default `mysql`; **no pipeline code reads it yet**).
-  - `settings.cheetah` — `CHEETAH_HOST` (`127.0.0.1`), `CHEETAH_PORT` (4455), `CHEETAH_DATABASE` (`image_sign_db`), `CHEETAH_DATA_DIR` (`cheetah_data`), `CHEETAH_POOL_SIZE` (4), `CHEETAH_CONNECT_TIMEOUT_MS` (5000), `CHEETAH_COMMAND_TIMEOUT_MS` (30000), `CHEETAH_MAX_IN_FLIGHT` (64), `CHEETAH_PAIR_INDEX_BYTES` (2), `CHEETAH_GRAPH_TERM_INDEX` (false). Read only by [`src/lib/cheetah/`](src/lib/cheetah). The last three are **also** read by the Go server process itself from its own environment — this group exists because [`src/lib/cheetah/server.js`](src/lib/cheetah/server.js) spawns it.
+  - `settings.database` — `DB_NAME` (`image_hypercube_db`), `DEFAULT_MAX_DB_SIZE_GB` (10), `backend` (`STORAGE_BACKEND`, `mysql`|`cheetah`, default `mysql`; the extractor and training/insert guards now read it).
+  - `settings.cheetah` — `CHEETAH_HOST` (`127.0.0.1`), `CHEETAH_PORT` (4455), `CHEETAH_DATABASE` (`image_sign_db`), `CHEETAH_DATA_DIR` (`cheetah_data`), `CHEETAH_POOL_SIZE` (4), `CHEETAH_CONNECT_TIMEOUT_MS` (5000), `CHEETAH_COMMAND_TIMEOUT_MS` (30000), `CHEETAH_MAX_IN_FLIGHT` (64), `CHEETAH_PAIR_INDEX_BYTES` (2), `CHEETAH_GRAPH_TERM_INDEX` (false). Read by [`src/lib/cheetah/`](src/lib/cheetah), which the extractor now calls for Cheetah ingestion. The last three are **also** read by the Go server process itself from its own environment — this group exists because [`src/lib/cheetah/server.js`](src/lib/cheetah/server.js) spawns it.
   - `settings.correlation` — `CORRELATION_SIMILARITY_THRESHOLD` (0.2), `CORRELATION_MAX_CANDIDATE_SAMPLE` (256), `CORRELATION_MIN_AFFINITY` (0.45), `CORRELATION_MIN_COHESION` (falls back to `CORRELATION_MIN_SPREAD`, then 0.25), online-runner batch caps.
   - `settings.training` — CLI defaults (`discover` 3, `bootstrap` 0, `reprobe` 0, `shuffle` true, `DEFAULT_THREADS` unset), `augmentationsPerImage` (3), `selfEvaluation.*`, `realTimePruning.*`, `progressive.*` (cycles 3, `randomPerAug` 300, `guidedPerCycle` 300), `storeImageBlob` (false), correlation debug logging.
 - **Deliberate exceptions — env vars read outside this file:** `DB_HOST`/`DB_USER`/`DB_PASSWORD`/`DB_NAME` (every `mysql.createConnection` call site), `DB_OPERATION_MAX_RETRIES` / `DB_OPERATION_RETRY_BASE_MS` ([`src/featureExtractor.js`](src/featureExtractor.js)), `CONSTELLATION_SAMPLES_PER_AUGMENTATION` / `SAMPLES_PER_AUGMENTATION` ([`src/lib/constants.js`](src/lib/constants.js)), `RESOLUTION_LEVEL_PRECISION` / `RESOLUTION_LEVEL_TOLERANCE` ([`src/lib/resolutionLevel.js`](src/lib/resolutionLevel.js)), `TRAINING_VERBOSE_AUGMENT_LOGS` / `AUG_PROGRESS_STEPS` ([`src/lib/vectorGenerators.js`](src/lib/vectorGenerators.js)), `TRAINING_AUGMENTATION_GLOBAL_SEED` ([`src/train.js`](src/train.js)). These are read at module load; they cannot be changed at runtime.
@@ -421,7 +445,11 @@ The knowledge graph: correlation discovery, pattern storage, and the queries tha
 Ingestion orchestration and persistence. Owns writes to `images`, `value_types`, `feature_vectors`, `feature_usage`, and the optional `image_blobs`. Does **not** own measurement semantics (that is `vectorGenerators.js`).
 
 - **Key functions and subparts:**
-  - `extractAndStoreFeaturesProgressive(imagePath, {augmentations})` — **the default path.** Inserts the `images` row with `ingestion_complete = 0`, optionally stores the blob, runs cycle 1 (random ordinals per augmentation via `chooseUniqueOrdinals`), then cycles 2..N (guided descriptors from `selectTopDescriptors`, measured one at a time with `generateSpecificVector`), then sets `ingestion_complete = 1`.
+  - `extractAndStoreFeaturesProgressive(imagePath, {augmentations})` — **the default path.** Dispatches on `settings.database.backend`. MySQL inserts the `images` row with `ingestion_complete = 0`, optionally stores the blob, runs cycle 1 (random ordinals per augmentation via `chooseUniqueOrdinals`), then cycles 2..N (guided descriptors from `selectTopDescriptors`, measured one at a time with `generateSpecificVector`), then sets `ingestion_complete = 1`. Cheetah delegates to `extractAndStoreFeaturesProgressiveCheetah`.
+  - `extractAndStoreFeaturesProgressiveCheetah` — creates an incomplete `i:` record, measures/stores the random ordinal cycle through `CheetahStore`, marks it complete, then enforces the Cheetah payload budget. Guided cycles and `STORE_IMAGE_BLOB` are explicitly skipped until their storage/read paths exist.
+  - `storeFeaturesMysql` / `storeFeaturesCheetah` / `storeFeatures` — exhaustive persistence implementations plus the backend dispatcher. The MySQL implementation is unchanged; Cheetah writes each augmentation batch through the store.
+  - `enforceCheetahCapacity` — runs after the completion marker in both Cheetah ingestion modes,
+    logs deleted feature rows, and warns when one bounded prune batch cannot reach the target.
   - `extractAndStoreFeatures` / `extractFeatures` / `collectFeaturesForAugmentations` / `storeFeatures` — the legacy exhaustive path, reachable only when `TRAINING_PROGRESSIVE_ENABLED=false` or via the file's own CLI. Sweeps all `SAMPLES_PER_AUGMENTATION` ordinals — orders of magnitude slower.
   - `ensureValueTypeId(db, descriptor, cache)` — single-descriptor resolution: cache → `SELECT` → `INSERT IGNORE` → `SELECT`, with bounded retry on `ER_LOCK_DEADLOCK`/`ER_LOCK_WAIT_TIMEOUT`.
   - `resolveValueTypesBulk` / `persistFeaturesBatched` — the batched equivalents (chunks of 500 for descriptors, 400 rows per `INSERT`), plus `feature_usage` seeding derived from `insertId + affectedRows`.
@@ -434,6 +462,7 @@ Ingestion orchestration and persistence. Owns writes to `images`, `value_types`,
   - `persistFeaturesBatched`'s `feature_usage` seeding assumes contiguous auto-increment ids from a multi-row `INSERT`; it is wrapped in a bare `catch {}` and will silently skip on any gap.
   - Several `try {} catch {}` blocks swallow errors around `ingestion_complete` and blob storage. An image can end up with rows but `ingestion_complete = 0`, invisible to every discovery query.
   - `console.log` calls in the progressive path embed raw ANSI escape bytes; keep new logging plain.
+  - Cheetah token allocation is process-local, so `train.js` forces one worker while that backend is selected. Running several independent Cheetah ingestion processes against one database is unsupported.
 
 ### [`src/insert.js`](src/insert.js)
 
@@ -441,12 +470,15 @@ The dataset CLI and the module boundary the HTTP admin routes and the ingest wor
 
 - **Key functions and subparts:**
   - `parseArgs` — minimal `--key=value` parser; bare `--flag` becomes `true`.
-  - `ingestImage(imagePath, discoverIterations, {augmentations})` — resolves the path against `process.cwd()`, picks progressive vs. exhaustive from `settings.training.progressive.enabled`, then either runs discovery or just `ensureStorageCapacity`. **Exported and reused by the worker and the server.**
+  - `ingestImage(imagePath, discoverIterations, {augmentations})` — resolves the path against `process.cwd()`, picks progressive vs. exhaustive from `settings.training.progressive.enabled`, then either runs discovery or just MySQL `ensureStorageCapacity`. With Cheetah it stops after ingestion because the extractor already enforced the Cheetah payload budget and discovery is a later phase. **Exported and reused by the worker and the server.**
   - `removeImage(identifier)` — accepts a numeric `image_id` or an `original_filename`; the `DELETE` cascades to `feature_vectors` → `feature_usage` → `knowledge_nodes`.
   - `runCorrelationDiscovery(iterations)` — wraps `discoverCorrelations` with the per-iteration log line, then enforces the storage budget.
   - `bootstrapCorrelations(iterations)` / `handleBootstrapCommand` — the `bootstrap` subcommand; also called by `train.js --bootstrap` and `POST /discover`.
   - `handleAddCommand` — the only caller of `ensureValueTypeCapacity` on the `add` path.
 - **Common mistakes:** `removeImage` deletes `knowledge_nodes` by cascade (`vector_1_id` `ON DELETE CASCADE`, `vector_2_id` `ON DELETE SET NULL`), which can leave `GROUP` nodes with a null second vector; `fetchConstellationGraph` and `fetchRelatedConstellations` both filter `vector_2_id IS NOT NULL`, so such nodes become invisible dead weight rather than corrupting results.
+- **Cheetah limitation:** `removeImage`, discovery, and bootstrap fail explicitly rather than falling
+  through to MySQL. Image deletion and graph learning have not been ported; automatic feature-row
+  budget pruning is implemented inside `CheetahStore`.
 
 ### [`src/workers/ingestWorker.js`](src/workers/ingestWorker.js)
 
@@ -471,6 +503,10 @@ The primary operator entry point: dataset ingestion, online learning, self-evalu
   - `TrainingSelfEvaluator` — queues the first `TRAINING_SELF_EVAL_MAX_SAMPLES` ingested images and replays `evaluateFilterRun` on each, printing best match / self rank / threshold relaxation.
   - `evaluateDataset` — the `--evaluate` mode: matches files to `images.original_filename` **case-insensitively by basename**, runs each filter × run, prints per-match affinity/cohesion/distance, and summarizes "ranked the original first".
   - `main` — `ensureValueTypeCapacity` → walk+shuffle → pool → summary → optional bootstrap → optional reprobe, with `RealTimePruner`/`TrainingSelfEvaluator` disposal in `finally`.
+- **Cheetah branch:** skips the MySQL schema guard, defaults discovery to zero, forces
+  `maxThreads=1`, and disables MySQL self-evaluation/real-time pruning. Explicit
+  `--discover`, `--bootstrap`, `--reprobe`, or `--evaluate` requests fail with their roadmap phase
+  instead of touching MySQL.
 - **Common mistakes:**
   - `--evaluate` returns **before** `ensureValueTypeCapacity`, so evaluating against a stale schema fails with a raw SQL error rather than a helpful one.
   - `options.shuffle` uses `files.sort(() => Math.random() - 0.5)` — a biased shuffle. Fine for sampling variety, wrong if you ever need a uniform permutation.
@@ -547,10 +583,10 @@ Documentation-sync guardrail run by `npm run maintenance:check`.
 
 ### Progressive ingestion — Shipped (default)
 
-- **Behavior:** each image is ingested in `TRAINING_PROGRESSIVE_CYCLES` (3) short cycles instead of one exhaustive sweep. Cycle 1 draws `TRAINING_PROGRESSIVE_RANDOM_PER_AUG` (300) random ordinals per augmentation; cycles 2+ measure the `TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE` (300) descriptors the knowledge base already values most.
+- **Behavior:** on MySQL, each image is ingested in `TRAINING_PROGRESSIVE_CYCLES` (3) short cycles instead of one exhaustive sweep. Cycle 1 draws `TRAINING_PROGRESSIVE_RANDOM_PER_AUG` (300) random ordinals per augmentation; cycles 2+ measure the `TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE` (300) descriptors the knowledge base already values most. The Phase 2 Cheetah branch currently stores cycle 1 only and says so in its log.
 - **Flow and owners:** `ingestImage` ([`src/insert.js`](src/insert.js)) → `extractAndStoreFeaturesProgressive` ([`src/featureExtractor.js`](src/featureExtractor.js)) → `generateFeaturesForAugmentationOrdinals` / `selectTopDescriptors` + `generateSpecificVector`.
 - **Constraints:** guided descriptors are filtered to the augmentations selected for this run, and measured **one at a time** — a large `guidedPerCycle` is slow because each call re-decodes the image. Disable with `TRAINING_PROGRESSIVE_ENABLED=false` to fall back to the exhaustive path.
-- **Tests and gaps:** none. Guided cycles are silently no-ops until `feature_group_stats` is populated by at least one discovery sweep.
+- **Tests and gaps:** the Cheetah completion/write contract is live-tested; MySQL orchestration is not. Guided cycles are silently no-ops on MySQL until `feature_group_stats` is populated by at least one discovery sweep, and deliberately deferred on Cheetah until graph/statistics storage lands.
 
 ### Augmentation sweep and per-run selection — Shipped
 
@@ -589,10 +625,22 @@ Documentation-sync guardrail run by `npm run maintenance:check`.
 
 ### Storage budget and pruning — Shipped
 
-- **Behavior:** after every ingest/remove/discovery the database size is compared against `system_settings.max_db_size_gb`; the coldest unreferenced vectors are deleted in batches. During training, `RealTimePruner` additionally removes skip-pattern descriptors and stale low-hit `GROUP` nodes.
-- **Flow and owners:** `ensureStorageCapacity` ([`src/lib/storageManager.js`](src/lib/storageManager.js)); `RealTimePruner` ([`src/lib/realTimePruner.js`](src/lib/realTimePruner.js)); tunable at runtime via `POST /settings/max-db-size`.
-- **Constraints:** vectors referenced by any `knowledge_nodes` row are never pruned by the size budget, so a large graph can pin the database above its target indefinitely.
-- **Tests and gaps:** none.
+- **Behavior:** MySQL compares database size against `system_settings.max_db_size_gb` after
+  ingest/remove/discovery and deletes cold unreferenced vectors. Cheetah compares owned payload bytes
+  against `cfg:max_db_size_gb` after each committed ingest and deletes the coldest complete-image
+  feature rows plus their usage records, at most 5,000 per pass. During MySQL training,
+  `RealTimePruner` additionally removes skip-pattern descriptors and stale low-hit `GROUP` nodes.
+- **Flow and owners:** MySQL `ensureStorageCapacity`
+  ([`src/lib/storageManager.js`](src/lib/storageManager.js)); MySQL `RealTimePruner`
+  ([`src/lib/realTimePruner.js`](src/lib/realTimePruner.js)); Cheetah
+  `CheetahStore.ensureStorageCapacity` ([`src/lib/cheetah/store.js`](src/lib/cheetah/store.js)).
+  The HTTP `POST /settings/max-db-size` route still targets MySQL only.
+- **Constraints:** MySQL vectors referenced by `knowledge_nodes` are pinned and can hold the database
+  over target. Cheetah currently has no graph rows; graph-aware pinning is required in Phase 4. Its
+  budget is `PAIR_SUMMARY.total_payload_bytes`, not physical disk bytes, and a badly-over-budget
+  store shrinks across multiple ingests because each pass is bounded.
+- **Tests and gaps:** Cheetah payload accounting and one-row cold pruning are live-tested. MySQL
+  pruning and future Cheetah graph pinning are untested.
 
 ### Original-image blob storage — Experimental / scaffold
 
@@ -701,7 +749,11 @@ Documentation-sync guardrail run by `npm run maintenance:check`.
 
 **Library surfaces most often imported** — `generateSpecificVector` ([`src/lib/vectorGenerators.js`](src/lib/vectorGenerators.js), re-exported by `featureExtractor.js`), `normalizeProbeSpec` + `evaluateFilterRun` ([`src/evaluate.js`](src/evaluate.js)), `createDbConnection` + `discoverCorrelations` ([`src/lib/knowledge.js`](src/lib/knowledge.js)), `collectElasticMatches` ([`src/lib/elasticMatcher.js`](src/lib/elasticMatcher.js)), `createDescriptorKey` ([`src/lib/descriptor.js`](src/lib/descriptor.js)).
 
-**Persistence surface** — tables `images`, `value_types`, `feature_vectors`, `feature_usage`, `skip_patterns`, `system_settings`, `knowledge_nodes`, `feature_group_stats` (all in [`src/setupDatabase.js`](src/setupDatabase.js)), plus `image_blobs` created lazily by [`src/featureExtractor.js`](src/featureExtractor.js).
+**Persistence surface** — MySQL tables `images`, `value_types`, `feature_vectors`, `feature_usage`,
+`skip_patterns`, `system_settings`, `knowledge_nodes`, `feature_group_stats` (all in
+[`src/setupDatabase.js`](src/setupDatabase.js)), plus `image_blobs` created lazily by
+[`src/featureExtractor.js`](src/featureExtractor.js). Cheetah Phase 2 ingestion owns `d:`/`t:`/`r:`/
+`f:`/`i:`/`fn:` plus `use:`/`skip:`/`cfg:` through [`src/lib/cheetah/store.js`](src/lib/cheetah/store.js).
 
 ## Build, Run, Debug, and Release
 
@@ -859,13 +911,16 @@ RESET_DB image_sign pair_bytes=2
 
 ## Test Ownership Map
 
-**A test suite exists, and it covers the Cheetah migration groundwork only.** `npm test` runs `node --test test/*.test.js`; there is still no CI and no lint. Every contract in this document that concerns the **MySQL pipeline** remains unprotected by executable checks.
+**A test suite exists, and it covers the Cheetah protocol/key groundwork plus the Phase 2 storage
+contract.** `npm test` runs `node --test test/*.test.js`; there is still no CI and no lint. Every
+contract in this document that concerns the **MySQL pipeline** remains unprotected by executable
+checks.
 
 | Test file | Owns | Runs by default |
 | --- | --- | --- |
 | [`test/cheetah-protocol.test.js`](test/cheetah-protocol.test.js) | Response parsing (`SUCCESS`/`ERROR`/`PENDING`, `value=` rest-of-line, `items=`, `next_cursor`, `payload=`, `branches=`) and argument encoding, including the `x<HEX>` escape and the `rawArgument` cursor pass-through | yes |
-| [`test/cheetah-keys.test.js`](test/cheetah-keys.test.js) | ROADMAP §3: key round-trip, byte-order == numeric-order via `Buffer.compare`, negative-offset ordering, the ≤2-bucket sweep contract, and a 10⁵-descriptor collision fuzz | yes |
-| [`test/cheetah-integration.test.js`](test/cheetah-integration.test.js) | Live round-trip against a spawned `cheetah-server`: pair set/get, paged scan, summary, graph recall, token vocabulary, pipelining, namespace delete | **no** — gated on `CHEETAH_INTEGRATION=1`, i.e. `npm run test:integration`, because it needs a Go toolchain |
+| [`test/cheetah-keys.test.js`](test/cheetah-keys.test.js) | ROADMAP §3: key round-trip (including fixed-width filename image-id payloads), byte-order == numeric-order via `Buffer.compare`, negative-offset ordering, the ≤2-bucket sweep contract, and a 10⁵-descriptor collision fuzz | yes |
+| [`test/cheetah-integration.test.js`](test/cheetah-integration.test.js) | Live round-trip against a spawned `cheetah-server`: pair set/get, pooled KV, paged scan, summary, graph recall, token vocabulary, storage completion gating/candidate hydration, page measurement, payload-budget accounting and cold-row pruning, usage/skip/settings mutation, pipelining, namespace delete | **no** — gated on `CHEETAH_INTEGRATION=1`, i.e. `npm run test:integration`, because it needs a Go toolchain |
 
 The closest substitutes for the untested MySQL pipeline, and what each actually covers:
 
@@ -907,7 +962,7 @@ The closest substitutes for the untested MySQL pipeline, and what each actually 
 
 ### Experimental / Scaffold
 
-- **Cheetah migration groundwork ([`src/lib/cheetah/`](src/lib/cheetah), Phases 0–1 of [`ROADMAP.md`](ROADMAP.md))** — TCP client + pool, protocol codec, key codec, value/name helpers, token vocabulary, and a dev-server lifecycle helper. Verified by `npm test` (34 tests) and `npm run test:integration` (44), the latter building and driving a real `cheetah-server` at pinned SHA `8ecdf35`. **Nothing in the pipeline calls any of it** — no ingestion, search, evaluation, or training path reads `settings.database.backend`, so `STORAGE_BACKEND=cheetah` changes no behavior. Phase 2 (dual-write ingestion) is the next step and is blocked on the page-size measurement in ROADMAP §7 question 1.
+- **Cheetah migration ([`src/lib/cheetah/`](src/lib/cheetah), Phases 0–2 of [`ROADMAP.md`](ROADMAP.md))** — TCP client + pool, protocol/key/KV codecs, token vocabulary, storage interface, dev-server helper, completion-gated ingestion, and bounded payload-budget pruning. `STORAGE_BACKEND=cheetah` drives exhaustive ingestion and the random progressive cycle; training is serialized to one worker. Verified at pinned Cheetah SHA `8ecdf35` by `npm test` (35 tests), `npm run test:integration` (46), a three-image/18-feature smoke test on port 4469, and the Phase 2 gate on port 4471: 50 real images, 50 complete records, 15,000 features in 209.279 seconds. The 11,860 exact scan pages measured p50=1, p95=2, p99=3, max=5, with none above 500. Owned summaries counted 3,854,640 payload bytes versus 30,482,677 bytes on disk, confirming that the configured cap is a payload budget. No search/evaluation/learning path uses Cheetah yet.
 - `STORE_IMAGE_BLOB` / `image_blobs` — writes only, no reader, table absent from `setupDatabase.js`, and it contradicts the privacy premise.
 - `src/testCorrelations.js` — a seeding utility named like a test.
 - `src/vectorCustom.js` — dead legacy experiment against a table that no longer exists.
@@ -926,16 +981,21 @@ The closest substitutes for the untested MySQL pipeline, and what each actually 
 - **`ANCHOR_SCALE` is hard-coded as `10000`** in the guided-ingestion branch of `featureExtractor.js`.
 - **No `.env.example`** despite `.gitignore` whitelisting one.
 - **Errors are swallowed** around `ingestion_complete`, `feature_usage` seeding, and blob storage.
+- **Cheetah ingestion is single-process and partial.** `train.js` forces one worker because token
+  allocation is only process-safe; independent ingest processes can still race. Guided cycles,
+  image deletion, search, evaluation, graph learning, and graph-aware pruning remain unported.
 
 ### Near-Term Priorities
 
 The Cheetah migration in [`ROADMAP.md`](ROADMAP.md) is the primary direction; these are ordered to serve it rather than to polish the MySQL implementation that is being replaced.
 
-1. **Freeze the Cheetah key layout** ([`ROADMAP.md`](ROADMAP.md) §3) after measuring real page sizes with `PAIR_SUMMARY`. It is the migration's wire format and every later phase depends on it.
-2. **Add the first tests** (Roadmap 0.6) covering `createDescriptorKey`, the three descriptor builders, `normalizeProbeSpec`, `normalizeResolutionLevel`, and the new key codec. All pure, no database, highest risk reduction per line — and the migration needs a parity gate that does not yet exist.
-3. **Build the Cheetah client + key codec** (Roadmap phases 0–1) before touching any storage call site.
-4. **Record misses when porting the knowledge graph** (Roadmap 4.2). Cheetah edges carry a real belief scale, so this stops being a nice-to-have: shipping the graph layer without misses reproduces today's always-`1.0` confidence bug in a new store.
-5. Reconcile [`README.md`](README.md) with the code — remove or relabel the quadtree section and the "Learning on Search"/`feature_group_stats`-question claims as `Planned` — so the migration does not carry false documentation into the new architecture.
+1. **Port evaluation and elastic retrieval** (Phase 3), preserving the nearest-entry fallback and
+   explaining every MySQL/Cheetah parity divergence.
+2. **Add descriptor-builder parity tests** for `createDescriptorKey`, the three builders,
+   `normalizeProbeSpec`, and `normalizeResolutionLevel`; the runner now exists but these older
+   pipeline contracts remain uncovered.
+3. **Record misses when porting the knowledge graph** (Roadmap 4.2). Cheetah edges carry a real belief scale, so this stops being a nice-to-have: shipping the graph layer without misses reproduces today's always-`1.0` confidence bug in a new store.
+4. Reconcile [`README.md`](README.md) with the code — remove or relabel the quadtree section and the "Learning on Search"/`feature_group_stats`-question claims as `Planned` — so the migration does not carry false documentation into the new architecture.
 
 Deferred while the migration is live (fix only if they block it): `ingestion_complete` in the search path, `searchSessions` TTL, `.env.example`. The first is explicitly carried into the new design as Roadmap 2.3.
 

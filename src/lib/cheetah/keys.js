@@ -256,9 +256,22 @@ function reverseTokenKey(token) {
     return `${NAMESPACES.reverseToken}${hex(token, HEX_WIDTH.token, 'token')}`;
 }
 
+/** Fixed-width payload spelling used by `fn:` records. */
+function formatImageId(imageId) {
+    return hex(imageId, HEX_WIDTH.image, 'imageId');
+}
+
+/** Inverse of `formatImageId`. */
+function parseImageId(text) {
+    if (typeof text !== 'string' || text.length !== HEX_WIDTH.image) {
+        throw new TypeError(`image id must be ${HEX_WIDTH.image} hex digits, got ${text}`);
+    }
+    return unhex(text, 'imageId');
+}
+
 /** `i:<imageHex8>` → `{filename, created_at, complete}`. Replaces `images`. */
 function imageKey(imageId) {
-    return `${NAMESPACES.image}${hex(imageId, HEX_WIDTH.image, 'imageId')}`;
+    return `${NAMESPACES.image}${formatImageId(imageId)}`;
 }
 
 /** `fn:<sha1(filename)>` → imageHex8. Replaces `images.original_filename`. */
@@ -521,6 +534,7 @@ module.exports = {
     featureScanPrefix,
     featureScanPrefixes,
     filenameKey,
+    formatImageId,
     imageKey,
     imageNodeId,
     ngramKey,
@@ -528,6 +542,7 @@ module.exports = {
     offsetBucketRange,
     offsetBucketSweep,
     parseFeatureKey,
+    parseImageId,
     parseImageKey,
     parseNgramKey,
     parseNodeId,

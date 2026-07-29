@@ -13,6 +13,7 @@ const { ensureStorageCapacity } = require('./lib/storageManager');
 const { ensureValueTypeCapacity } = require('./lib/schema');
 
 const DB_SCHEMA = settings.database.schema;
+const USE_CHEETAH = settings.database.backend === 'cheetah';
 
 // --- HELPERS ---
 
@@ -38,6 +39,9 @@ function parseArgs(argv) {
 }
 
 async function removeImage(identifier) {
+    if (USE_CHEETAH) {
+        throw new Error('Image removal is not implemented for STORAGE_BACKEND=cheetah yet.');
+    }
     const connection = await createDbConnection();
     try {
         let imageId = null;
@@ -66,6 +70,12 @@ async function removeImage(identifier) {
 
 async function runCorrelationDiscovery(iterations) {
     if (!iterations || iterations <= 0) return;
+    if (USE_CHEETAH) {
+        throw new Error(
+            'Correlation discovery is not implemented for STORAGE_BACKEND=cheetah yet ' +
+            '(ROADMAP Phase 4).'
+        );
+    }
     await discoverCorrelations({
         iterations,
         similarityThreshold: settings.correlation.similarityThreshold,
@@ -107,7 +117,7 @@ async function ingestImage(imagePath, discoverIterations = 0, ingestOptions = {}
 
     if (discoverIterations > 0) {
         await runCorrelationDiscovery(discoverIterations);
-    } else {
+    } else if (!USE_CHEETAH) {
         const db = await createDbConnection();
         try {
             await ensureStorageCapacity(db, DB_SCHEMA);
@@ -129,7 +139,7 @@ async function handleAddCommand(positional, options) {
     const augList = typeof options.augmentations === 'string'
         ? String(options.augmentations).split(',').map((s) => s.trim()).filter(Boolean)
         : undefined;
-    await ensureValueTypeCapacity();
+    if (!USE_CHEETAH) await ensureValueTypeCapacity();
     await ingestImage(imagePath, discoverIterations, { augmentations: augList });
 }
 

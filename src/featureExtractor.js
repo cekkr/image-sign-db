@@ -14,6 +14,7 @@ const { SAMPLES_PER_AUGMENTATION } = require('./lib/constellation');
 const settings = require('./settings');
 const { selectTopDescriptors } = require('./lib/knowledge');
 const { normalizeResolutionLevel } = require('./lib/resolutionLevel');
+const { createCheetahStore } = require('./lib/cheetah/store');
 
 const MAX_OPERATION_RETRIES = parseRetryEnv(process.env.DB_OPERATION_MAX_RETRIES, 4);
 const OPERATION_RETRY_BASE_MS = parseRetryEnv(process.env.DB_OPERATION_RETRY_BASE_MS, 40);
@@ -298,7 +299,7 @@ async function persistFeaturesBatched(dbConnection, imageId, features, valueType
     return inserted;
 }
 
-async function storeFeatures(imagePath, featureBatches) {
+async function storeFeaturesMysql(imagePath, featureBatches) {
     const featureCount = featureBatches.reduce((acc, batch) => acc + batch.allFeatures.length, 0);
     const connection = await mysql.createConnection({
         host: process.env.DB_HOST,
@@ -342,6 +343,45 @@ async function storeFeatures(imagePath, featureBatches) {
     }
 }
 
+async function storeFeaturesCheetah(imagePath, featureBatches) {
+    const store = await createCheetahStore();
+    try {
+        const { imageId } = await store.putImage({ filename: path.basename(imagePath) });
+        let featureCount = 0;
+        for (const batch of featureBatches) {
+            featureCount += await store.putFeatures(imageId, batch.allFeatures);
+        }
+        await store.markComplete(imageId);
+        await enforceCheetahCapacity(store);
+        return { imageId, featureCount };
+    } finally {
+        await store.close();
+    }
+}
+
+async function enforceCheetahCapacity(store) {
+    const capacity = await store.ensureStorageCapacity();
+    if (capacity.pruned > 0) {
+        console.log(
+            `     ↳ Cheetah storage budget pruned ${capacity.pruned} low-usage feature row(s).`
+        );
+    }
+    if (capacity.overLimit) {
+        console.warn(
+            `[cheetah storage] Payloads remain above target after one prune batch ` +
+            `(${capacity.after.totalPayloadBytes} > ${capacity.targetPayloadBytes} bytes).`
+        );
+    }
+    return capacity;
+}
+
+async function storeFeatures(imagePath, featureBatches) {
+    if (settings.database.backend === 'cheetah') {
+        return storeFeaturesCheetah(imagePath, featureBatches);
+    }
+    return storeFeaturesMysql(imagePath, featureBatches);
+}
+
 async function extractFeatures(imagePath, augmentations = AUGMENTATION_ORDER) {
     await fs.access(imagePath);
     const originalImage = sharp(imagePath);
@@ -354,6 +394,10 @@ async function extractFeatures(imagePath, augmentations = AUGMENTATION_ORDER) {
 
 // Progressive multi-cycle ingestion that avoids generating a fixed, large sample
 async function extractAndStoreFeaturesProgressive(imagePath, options = {}) {
+    if (settings.database.backend === 'cheetah') {
+        return extractAndStoreFeaturesProgressiveCheetah(imagePath, options);
+    }
+
     const augmentations = options.augmentations ?? AUGMENTATION_ORDER;
     await fs.access(imagePath);
     const originalImage = sharp(imagePath);
@@ -441,6 +485,54 @@ async function extractAndStoreFeaturesProgressive(imagePath, options = {}) {
         return { imageId, featureCount: totalInserted, totalFeatures: totalInserted };
     } finally {
         try { await connection.end(); } catch {}
+    }
+}
+
+async function extractAndStoreFeaturesProgressiveCheetah(imagePath, options = {}) {
+    const augmentations = options.augmentations ?? AUGMENTATION_ORDER;
+    await fs.access(imagePath);
+    const originalImage = sharp(imagePath);
+    const randomPerAug = Math.max(0, Number(settings?.training?.progressive?.randomPerAug ?? 300));
+    const guidedPerCycle = Math.max(0, Number(settings?.training?.progressive?.guidedPerCycle ?? 300));
+    const cycles = Math.max(1, Number(settings?.training?.progressive?.cycles ?? 3));
+    const store = await createCheetahStore();
+
+    try {
+        const { imageId } = await store.putImage({ filename: path.basename(imagePath) });
+        let totalInserted = 0;
+
+        for (const augmentationName of augmentations) {
+            const ordinals = chooseUniqueOrdinals(
+                randomPerAug,
+                SAMPLES_PER_AUGMENTATION,
+                `${imagePath}:${augmentationName}`
+            );
+            const { allFeatures } = await generateFeaturesForAugmentationOrdinals(
+                originalImage,
+                imagePath,
+                augmentationName,
+                ordinals
+            );
+            if (allFeatures.length === 0) continue;
+            totalInserted += await store.putFeatures(imageId, allFeatures);
+            console.log(`     ↳ Aug '${augmentationName}' Cheetah sample stored: ${allFeatures.length}`);
+        }
+
+        if (cycles > 1 && guidedPerCycle > 0) {
+            console.log(
+                '     ⓘ Cheetah guided ingestion is deferred until descriptor statistics are ported; ' +
+                'this ingest stored the random cycle only.'
+            );
+        }
+        if (settings?.training?.storeImageBlob) {
+            console.warn('[cheetah] STORE_IMAGE_BLOB is ignored; Cheetah ingestion stores descriptors only.');
+        }
+
+        await store.markComplete(imageId);
+        await enforceCheetahCapacity(store);
+        return { imageId, featureCount: totalInserted, totalFeatures: totalInserted };
+    } finally {
+        await store.close();
     }
 }
 

@@ -39,8 +39,11 @@ try {
 // --- HELPERS ---
 
 const VALUE_THRESHOLD = settings.search.valueThreshold;
+const USE_CHEETAH = settings.database.backend === 'cheetah';
 const TRAINING_DEFAULT_OPTIONS = {
-  discover: settings.training.defaults.discover,
+  // Token allocation is process-local during Phase 2. Cheetah training below
+  // is deliberately single-worker and does not run the MySQL graph learner.
+  discover: USE_CHEETAH ? 0 : settings.training.defaults.discover,
   bootstrap: settings.training.defaults.bootstrap,
   reprobe: settings.training.defaults.reprobe,
   shuffle: settings.training.defaults.shuffle,
@@ -1199,16 +1202,31 @@ async function main() {
     process.exit(1);
   }
 
+  if (USE_CHEETAH && options.evaluate) {
+    throw new Error('Cheetah evaluation is not implemented yet (ROADMAP Phase 3).');
+  }
+  if (
+    USE_CHEETAH &&
+    ((options.discover || 0) > 0 || (options.bootstrap || 0) > 0 || (options.reprobe || 0) > 0)
+  ) {
+    throw new Error(
+      'Cheetah correlation discovery, bootstrap, and reprobe are not implemented yet ' +
+      '(ROADMAP Phases 3–4).'
+    );
+  }
+
   if (options.evaluate) {
     await evaluateDataset(dir, options);
     return;
   }
 
   let upgradedColumns = [];
-  try {
-    upgradedColumns = await ensureValueTypeCapacity();
-  } catch (error) {
-    throw new Error(`Unable to prepare database schema: ${error?.message ?? error}`);
+  if (!USE_CHEETAH) {
+    try {
+      upgradedColumns = await ensureValueTypeCapacity();
+    } catch (error) {
+      throw new Error(`Unable to prepare database schema: ${error?.message ?? error}`);
+    }
   }
   if (upgradedColumns.length > 0) {
     console.log(`🔧 Upgraded schema columns: ${upgradedColumns.join(', ')}`);
@@ -1232,16 +1250,23 @@ async function main() {
       })
     : null;
 
-  const maxThreads = options.threads && options.threads > 0 ? options.threads : undefined;
+  const maxThreads = USE_CHEETAH
+    ? 1
+    : options.threads && options.threads > 0
+      ? options.threads
+      : undefined;
   if (maxThreads) {
     console.log(`⚙️  Using up to ${maxThreads} worker thread(s) for ingestion.`);
+    if (USE_CHEETAH) {
+      console.log('   ⓘ Cheetah Phase 2 serializes ingestion because token allocation is process-local.');
+    }
   } else {
     console.log('⚙️  Using adaptive worker pool for ingestion (auto threads).');
   }
 
   const selfEvalConfig = settings.training.selfEvaluation ?? {};
   const selfEvaluator = new TrainingSelfEvaluator({
-    enabled: selfEvalConfig.enabled,
+    enabled: !USE_CHEETAH && selfEvalConfig.enabled,
     maxSamples: selfEvalConfig.maxSamples,
     runsPerFilter: selfEvalConfig.runsPerFilter,
     topMatches: selfEvalConfig.topMatches,
@@ -1255,6 +1280,7 @@ async function main() {
 
   const prunerConfig = {
     ...(settings.training.realTimePruning || {}),
+    enabled: !USE_CHEETAH && Boolean(settings.training.realTimePruning?.enabled),
     skipThresholdOverride: settings.search.skipThreshold,
   };
   const realTimePruner = new RealTimePruner(prunerConfig);

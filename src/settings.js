@@ -53,8 +53,8 @@ const databaseSettings = {
   schema: process.env.DB_NAME || 'image_hypercube_db',
   defaultMaxSizeGb: getNumber('DEFAULT_MAX_DB_SIZE_GB', 10),
   // Which storage engine the pipeline talks to. `mysql` is the only backend
-  // implemented end-to-end today; `cheetah` selects the migration path being
-  // built out in ROADMAP.md and is not yet wired into ingestion or search.
+  // implemented end-to-end today; `cheetah` selects the Phase 2 ingestion path
+  // being built out in ROADMAP.md. Search/evaluation/learning are not wired.
   backend: (function () {
     const raw = String(process.env.STORAGE_BACKEND || 'mysql').trim().toLowerCase();
     return raw === 'cheetah' ? 'cheetah' : 'mysql';

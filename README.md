@@ -330,14 +330,17 @@ Add these (optionally) to your `.env` file:
   - Description: Caps concurrent ingest workers used by `train.js`.
   - Default: unset (auto-scales to CPU, with a safe cap)
 
-Cheetah DB (migration groundwork — see `ROADMAP.md`). These configure the client
-and the development server helper under `src/lib/cheetah/`. **Nothing in the
-ingestion or search pipeline reads them yet**; setting `STORAGE_BACKEND=cheetah`
-today changes no behavior.
+Cheetah DB (migration in progress — see `ROADMAP.md`). These configure the
+client, storage interface, and development server helper under
+`src/lib/cheetah/`. Setting `STORAGE_BACKEND=cheetah` now routes exhaustive
+ingestion and the random first progressive cycle to Cheetah. Search,
+evaluation, knowledge-guided cycles, correlation discovery, and image deletion
+are not ported yet. Storage-budget pruning is implemented for feature rows.
 
 • STORAGE_BACKEND
   - Description: Which storage engine the pipeline talks to, `mysql` or `cheetah`.
-  - Default: `mysql` (the only backend implemented end-to-end)
+  - Default: `mysql` (the only backend implemented end-to-end; `cheetah` currently
+    supports ingestion only)
 
 • CHEETAH_HOST / CHEETAH_PORT
   - Description: Address of the Cheetah TCP listener.
@@ -352,7 +355,8 @@ today changes no behavior.
   - Default: `cheetah_data`
 
 • CHEETAH_POOL_SIZE
-  - Description: Connections in the client pool; size it like the ingest worker pool.
+  - Description: Connections in each client pool. Cheetah training is currently
+    forced to one worker because descriptor-token allocation is process-local.
   - Default: `4`
 
 • CHEETAH_CONNECT_TIMEOUT_MS / CHEETAH_COMMAND_TIMEOUT_MS / CHEETAH_MAX_IN_FLIGHT
@@ -370,6 +374,21 @@ today changes no behavior.
     share a word cross-match in `GRAPH_RECALL`, and the index costs a write on every
     node upsert. Also read by the Go server itself.
   - Default: `false`
+
+Cheetah checks `cfg:max_db_size_gb` after each committed ingest and prunes at
+most 5,000 of the coldest complete-image feature rows per pass, together with
+their usage records. The comparison uses the sum of
+`PAIR_SUMMARY.total_payload_bytes` over Image Sign DB's namespaces. That value
+does not include Cheetah's trie, table, or filesystem overhead, so the setting
+is a deterministic payload-retention budget—not a physical disk quota.
+Incomplete ingests are never pruned. Graph-aware pinning will be added when the
+property graph lands; until then, no Cheetah graph references exist to protect.
+
+The Phase 2 real-data gate ingested 50 images on a non-default port and wrote
+15,000 feature rows. The exact prefixes used by candidate lookup contained
+1 row at p50, 2 at p95, 3 at p99, and 5 at maximum (zero above the 500-row
+target), validating client-side offset filtering for the measured random
+ingestion corpus.
 
 Deprecated (no longer used by ingestion):
 

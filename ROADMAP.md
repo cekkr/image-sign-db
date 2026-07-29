@@ -4,11 +4,12 @@ Authoritative plan for replacing MySQL with [`cheetah`](cheetah) as Image Sign D
 retrieval engine, and for rebuilding recognition around **n-gram probe paths** and a **property
 graph** that resolves a set of measured descriptors into an image ID.
 
-**Status of this document:** Phases 0 and 1 are implemented; Phases 2–6 are still planning. An item is
-`Planned` until it moves to `Shipped` in [`AGENTS.md`](AGENTS.md) with a verification note. Nothing
-under [`src/lib/cheetah/`](src/lib/cheetah) is wired into ingestion or search yet — setting
-`STORAGE_BACKEND=cheetah` today changes no behavior. Do not describe Phase 2+ as current behavior in
-[`README.md`](README.md) or [`TECH_NOTES.md`](TECH_NOTES.md).
+**Status of this document:** Phases 0–2 are implemented and the Phase 2 exit gate has passed.
+`STORAGE_BACKEND=cheetah` selects Cheetah for exhaustive ingestion and for the random first cycle of
+progressive ingestion, preserves the incomplete→complete commit marker, and enforces a bounded
+payload-byte storage budget after each committed ingest. Search, evaluation, guided ingestion,
+correlation discovery, and graph-aware pruning remain on the planned side of the migration. An item
+is `Planned` until it moves to `Shipped` in [`AGENTS.md`](AGENTS.md) with a verification note.
 
 **Scope note:** this is a rewrite of the persistence and retrieval layer, not of the measurement
 layer. [`src/lib/constellation.js`](src/lib/constellation.js),
@@ -175,10 +176,11 @@ the single prefix `f:<tok>/<resB>/<axB>/<ayB>/`, then filter `offset` in Node ov
 The offsets only discriminate within one anchor cell of one descriptor — a handful of rows — so the
 client-side filter is cheap and the scan count drops to **3** (one per resolution bucket).
 
-> **Open decision (blocks §5):** confirm against real data that `f:<tok>/<resB>/<axB>/<ayB>/` yields
-> pages small enough (target: < 500 rows) to filter client-side. Measure with `PAIR_SUMMARY` on a
-> migrated sample before committing to the layout. If pages are too large, promote `<offXB>` into the
-> prefix and accept 9 scans.
+> **Decision: keep offsets below the scan prefix.** A 50-image real-data ingest produced 15 000
+> feature rows across 11 860 `f:<tok>/<resB>/<axB>/<ayB>/` pages: p50=1, p95=2, p99=3, max=5, and
+> zero pages above 500. Client-side offset filtering therefore remains cheap for the measured random
+> ingestion corpus; `<offXB>` is not promoted into the prefix. Re-measure on materially denser
+> ingestion modes, but changing the layout now requires a key-layout version bump and re-ingest.
 
 ### 3.3 Graph shape
 
@@ -312,24 +314,42 @@ Three defects the live round-trip caught that the unit tests could not:
 encoding collisions; 10⁵ draws per toleranced dimension confirm the sweep never misses a row within
 tolerance and never exceeds 2 buckets.
 
-### Phase 2 — Dual-write ingestion
+### Phase 2 — Backend-selected ingestion
 
-- [ ] **2.1** `src/lib/cheetah/store.js` — the storage interface the rest of the code will call:
+- [x] **2.1** `src/lib/cheetah/store.js` — the storage interface the rest of the code will call:
       `ensureDescriptor`, `putFeatures`, `putImage`, `markComplete`, `findCandidates`, `recordUsage`,
-      `saveSkip`, `getSetting`/`setSetting`. Mirrors the MySQL calls one-for-one so callers can switch
-      by config.
-- [ ] **2.2** Teach [`src/featureExtractor.js`](src/featureExtractor.js) to write through
+      `saveSkip`, `getSetting`/`setSetting`. ✅ *Done* — the store also validates
+      `cfg:key_layout_version`, uses random collision-checked uint32 image IDs so worker processes do
+      not share another counter, and hydrates candidate scan payloads with `PAIR_REDUCE
+      continuations`.
+- [x] **2.2** Teach [`src/featureExtractor.js`](src/featureExtractor.js) to write through
       `STORAGE_BACKEND`. Keep the MySQL path byte-identical; add the Cheetah path beside it.
       **Batch aggressively** — one `PAIR_SET` per feature row is a round trip per row; use the
-      pipelined queue and consider a `JOB`-wrapped batch.
-- [ ] **2.3** Preserve the `ingestion_complete` contract: write `i:<img>` with `complete:false`, all
-      features, then rewrite `complete:true`. Every reader filters on it — including, this time, the
-      search path, which is where [`AGENTS.md`](AGENTS.md) records MySQL currently omits it.
-- [ ] **2.4** Storage budget: reimplement `ensureStorageCapacity` on `PAIR_SUMMARY`
-      (`total_payload_bytes` without hydrating) + `DEL pairs prefix=`.
+      pipelined queue and consider a `JOB`-wrapped batch. ✅ *Done* — exhaustive ingestion and the
+      progressive random cycle route through the Cheetah store in bounded pipelined batches.
+      Knowledge-guided cycles are explicitly skipped until their statistics move in Phase 4.
+- [x] **2.3** Preserve the `ingestion_complete` contract: write `i:<img>` with `complete:false`, all
+      features, then rewrite `complete:true`. Every Cheetah reader filters on it. ✅ *Done* — covered
+      by the live store test, which proves an image is absent before `markComplete` and visible after.
+- [x] **2.4** Storage budget: reimplement `ensureStorageCapacity` on `PAIR_SUMMARY`
+      (`total_payload_bytes` without hydrating) + exact `DEL pairs key=` deletes. ✅ *Done* —
+      `CheetahStore` totals every owned namespace without hydrating payloads, ranks complete-image
+      feature rows by usage count/last-use time, and deletes at most 5 000 cold rows per pass plus
+      their usage records. Incomplete images are protected. The cap is explicitly a payload-byte
+      budget, not a physical disk quota; graph-pinned feature protection must be added with Phase 4.
 
-**Exit check:** ingest a 50-image dataset under `STORAGE_BACKEND=cheetah`; `PAIR_SUMMARY f:` reports a
-plausible row count; every `i:` record reads `complete:true`.
+**Verification:** `npm run test:integration` passes 46 tests against an OS-assigned
+non-default port. A direct `src/train.js` smoke test against port 4469 ingested three generated
+images with six features each while an explicit `--threads=4` was safely constrained to one;
+`PAIR_SUMMARY f:` returned 18 and all three `i:` records read `complete:true`.
+
+**Exit check: ✅ passed.** A real 50-image dataset was ingested under
+`STORAGE_BACKEND=cheetah` against port 4471 with an explicit `--threads=8` safely constrained to one.
+All 50 image records read `complete:true`; the run wrote 15 000 feature rows in 209.279 seconds.
+Owned payload accounting reported 3 854 640 bytes across 50 683 records, while the Cheetah data
+directory occupied 30 482 677 bytes. The gap is expected: `PAIR_SUMMARY.total_payload_bytes`
+excludes trie/table overhead, so it is a deterministic retention signal rather than filesystem
+usage. The measured scan-page distribution is recorded in §3.2.
 
 ### Phase 3 — Read path
 
@@ -400,7 +420,7 @@ train → evaluate → search cycle runs against Cheetah alone.
 
 | Risk | Why it bites | Mitigation |
 | --- | --- | --- |
-| **Key layout wrong** | Cheetah keys are the index; a change means a full rebuild, exactly like a descriptor-shape change today | Freeze §3 behind Phase 1 property tests; measure page sizes with `PAIR_SUMMARY` before Phase 2 |
+| **Key layout wrong** | Cheetah keys are the index; a change means a full rebuild, exactly like a descriptor-shape change today | Frozen at layout version 1 after Phase 1 property tests and the Phase 2 real-data page measurement; re-measure dense modes before any version bump |
 | **Round-trip amplification** | One `PAIR_SET` per feature row × ~2400 rows/image × N images | Pipeline on one socket; batch; measure ingest throughput at Phase 2 exit before scaling up |
 | **No transactions** | MySQL gave atomic-ish multi-row writes; Cheetah does not | Keep the `complete` flag protocol (§2.3) as the only consistency contract — it already is, today |
 | **Spurious lexical recall** | Verified: hex IDs sharing a token word cross-match at 0.33 | Bare `n<hex>`/`m<hex>` IDs **and** `CHEETAH_GRAPH_TERM_INDEX=0` (§3.3) |
@@ -413,16 +433,14 @@ train → evaluate → search cycle runs against Cheetah alone.
 
 ## 7. Open questions
 
-1. **Page size** — is `f:<tok>/<resB>/<axB>/<ayB>/` small enough to filter offsets client-side (§3.2)?
-   Blocks the key freeze.
-2. **One database or several?** Features, graph, and n-grams could share one Cheetah database or be
+1. **One database or several?** Features, graph, and n-grams could share one Cheetah database or be
    split (different strides suit different shapes — the graph is sparse, `f:` is wide). Splitting
    costs cross-database coordination in the client.
-3. **Do descriptor values belong in the key?** Quantizing `value` into the key would make the elastic
+2. **Do descriptor values belong in the key?** Quantizing `value` into the key would make the elastic
    distance search a prefix walk too — but it hard-codes the threshold into the layout, and the
    elastic matcher's whole point is a *relaxing* threshold. Probably no. Decide before Phase 3.
-4. **Is `PREDICT_*` a better fit than `g:` n-grams?** Cheetah ships prediction tables with context
+3. **Is `PREDICT_*` a better fit than `g:` n-grams?** Cheetah ships prediction tables with context
    matrices. They may subsume the hand-rolled n-gram store — or be overkill. Evaluate at Phase 5.
-5. **Sequencing** — should the n-gram path model (Phase 5) land before the graph layer (Phase 4)?
+4. **Sequencing** — should the n-gram path model (Phase 5) land before the graph layer (Phase 4)?
    Phase 5 is cheaper and independently measurable; Phase 4 is the bigger architectural win. Current
    order favours the win; reversing is defensible.

@@ -105,6 +105,8 @@ test('the other namespaces round-trip', () => {
     assert.equal(keys.skipKey(descriptorHash), `skip:${descriptorHash}`);
 
     assert.equal(keys.parseReverseTokenKey(keys.reverseTokenKey(70000)), 70000);
+    assert.equal(keys.formatImageId(4242), '00001092');
+    assert.equal(keys.parseImageId(keys.formatImageId(4242)), 4242);
     assert.equal(keys.parseImageKey(keys.imageKey(4242)), 4242);
     assert.deepEqual(keys.parseStatKey(keys.statKey({ token: 9, resolutionLevel: 0.3 })), {
         token: 9,
@@ -132,6 +134,7 @@ test('key builders reject out-of-range and malformed input', () => {
     assert.throws(() => keys.reverseTokenKey(0x1_0000_0000), /does not fit/);
     assert.throws(() => keys.reverseTokenKey(-1), /non-negative/);
     assert.throws(() => keys.imageKey(1.5), /integer/);
+    assert.throws(() => keys.parseImageId('1092'), /8 hex digits/);
     assert.throws(() => keys.ngramKey(3, [1]), /needs 2 context tokens/);
     assert.throws(() => keys.configKey('bad key'), /must match/);
     assert.throws(() => keys.parseFeatureKey('d:abc'), /not a feature key/);

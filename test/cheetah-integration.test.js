@@ -18,10 +18,11 @@ const net = require('node:net');
 const ENABLED = process.env.CHEETAH_INTEGRATION === '1';
 
 const { startServer } = require('../src/lib/cheetah/server');
-const { CheetahClient } = require('../src/lib/cheetah/client');
+const { CheetahClient, CheetahPool } = require('../src/lib/cheetah/client');
 const { decodePayload, numericField } = require('../src/lib/cheetah/protocol');
 const { getJson, putJson, getValue, putValue, scanAll } = require('../src/lib/cheetah/kv');
 const { TokenVocabulary } = require('../src/lib/cheetah/vocabulary');
+const { CheetahStore } = require('../src/lib/cheetah/store');
 const keys = require('../src/lib/cheetah/keys');
 
 /** An ephemeral port the OS just told us is free. */
@@ -79,6 +80,20 @@ test('cheetah round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRATION=1 
         const second = await putValue(client, key, 'a much longer value', { upsert: true });
         assert.equal(first, second, 'EDIT must relocate the bytes without changing the key');
         assert.equal(await getValue(client, key), 'a much longer value');
+    });
+
+    await t.test('the pool exposes the full KV command surface', async (t) => {
+        const pool = new CheetahPool({
+            size: 2,
+            port,
+            database: 'image_sign_db_test',
+            databaseOptions: { pair_bytes: 2 },
+        });
+        t.after(() => pool.close());
+        await pool.connect();
+        const key = keys.configKey('pool_round_trip');
+        await putValue(pool, key, 'pooled');
+        assert.equal(await getValue(pool, key), 'pooled');
     });
 
     await t.test('a UTF-8 payload survives the latin1 wire', async () => {
@@ -179,8 +194,109 @@ test('cheetah round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRATION=1 
 
         // Distinct descriptors resolved concurrently must not share an id.
         const many = Array.from({ length: 16 }, (unused, index) => String(index).padStart(40, 'f'));
-        const tokens = await Promise.all(many.map((hash) => raced.tokenFor(hash)));
+        const tokens = await raced.tokensFor(many);
         assert.equal(new Set(tokens).size, tokens.length, 'the counter raced');
+    });
+
+    await t.test('the Image Sign store commits features behind the complete flag', async () => {
+        const now = new Date('2026-07-29T12:00:00.000Z');
+        const store = new CheetahStore({ pool: client, now: () => now, writeBatchSize: 2 });
+        await store.connect();
+
+        const descriptor = {
+            family: 'delta',
+            channel: 'h',
+            augmentation: 'original',
+            sample_id: 123,
+            anchor_u: 0.4,
+            anchor_v: 0.6,
+            span: 0.2,
+            offset_x: 0.12,
+            offset_y: -0.08,
+        };
+        const feature = {
+            descriptor,
+            resolution_level: 0.2,
+            pos_x: 4000,
+            pos_y: 6000,
+            rel_x: 0.12,
+            rel_y: -0.08,
+            value: 0.33,
+            size: 0.2,
+        };
+        const probe = { ...feature, descriptor };
+
+        const { imageId } = await store.putImage({
+            filename: 'phase-two.jpg',
+            imageId: 501,
+        });
+        assert.equal(imageId, 501);
+        assert.equal((await store.getImage(imageId)).complete, false);
+        assert.equal(await store.putFeatures(imageId, [feature, feature]), 2);
+        assert.deepEqual(
+            await store.findCandidates(probe),
+            [],
+            'incomplete images must never surface'
+        );
+
+        await store.markComplete(imageId);
+        await assert.rejects(
+            store.putFeatures(imageId, [feature]),
+            /cannot attach features to completed image/
+        );
+        const candidates = await store.findCandidates(probe);
+        assert.equal(candidates.length, 2, 'duplicate rows must receive distinct sequence suffixes');
+        assert.ok(candidates.every((row) => row.image_id === imageId));
+        assert.ok(candidates.every((row) => row.original_filename === 'phase-two.jpg'));
+
+        await Promise.all([
+            store.recordUsage([candidates[0].feature_key], 1, 0.25),
+            store.recordUsage([candidates[0].feature_key], 2, 0.5),
+        ]);
+        assert.deepEqual(
+            await getJson(client, keys.usageKey(candidates[0].feature_key)),
+            {
+                feature_key: candidates[0].feature_key,
+                count: 3,
+                last_used: now.toISOString(),
+                last_score: 0.75,
+            }
+        );
+
+        await store.saveSkip(descriptor);
+        await store.saveSkip(descriptor);
+        const descriptorHash = keys.createDescriptorKey(descriptor);
+        const skipped = await getJson(client, keys.skipKey(descriptorHash));
+        assert.equal(skipped.count, 2);
+        assert.deepEqual(skipped.descriptor, descriptor);
+
+        assert.equal(await store.getSetting('max_db_size_gb', 7), 7);
+        assert.equal(await store.setSetting('max_db_size_gb', 9), 9);
+        assert.equal(await store.getSetting('max_db_size_gb'), 9);
+
+        const summary = await store.featureSummary();
+        assert.equal(summary.count, 14);
+        assert.ok(summary.totalPayloadBytes > 0);
+
+        const pages = await store.measureFeaturePages();
+        assert.equal(pages.rowCount, summary.count);
+        assert.ok(pages.prefixCount > 0);
+        assert.ok(pages.max >= 2);
+        assert.equal(pages.over500, 0);
+
+        const storageBefore = await store.storageSummary();
+        const capacity = await store.ensureStorageCapacity({
+            maxBytes: storageBefore.totalPayloadBytes - 1,
+            maxBatchSize: 1,
+        });
+        assert.equal(capacity.pruned, 1);
+        assert.equal(capacity.overLimit, false);
+        assert.ok(capacity.after.totalPayloadBytes < storageBefore.totalPayloadBytes);
+        assert.equal((await store.featureSummary()).count, 13);
+        assert.ok(
+            await getJson(client, keys.usageKey(candidates[0].feature_key)),
+            'the used feature must survive a one-row cold prune'
+        );
     });
 
     await t.test('pipelined commands keep their FIFO order', async () => {

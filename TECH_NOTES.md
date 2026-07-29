@@ -8,7 +8,9 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - The system enforces a server-driven interrogation: clients measure only the descriptors requested by the server, preserving privacy while exploiting the server’s learned knowledge (`src/index.js`, `src/clientAPI.js`).
 
 ## 2. High-Level Architecture
-- **Extraction layer** (Sharp-based) emits descriptor batches per augmentation and persists them to MySQL (`src/featureExtractor.js`).
+- **Extraction layer** (Sharp-based) emits descriptor batches per augmentation and persists them to
+  MySQL or, for the implemented Phase 2 ingestion path, Cheetah (`src/featureExtractor.js`,
+  `src/lib/cheetah/store.js`).
 - **Training & ingestion** orchestrate progressive sampling, online correlation discovery, evaluation, and pruning with adaptive worker threads (`src/train.js`, `src/workers/ingestWorker.js`).
 - **Knowledge graph** records cooperative feature geometry and per-descriptor statistics to guide future probes (`src/lib/knowledge.js`).
 - **Search API** exposes CLI and HTTP flows that rank candidates with an elastic matcher while tracking skip patterns, usage, and constellation accuracy (`src/index.js`, `src/lib/elasticMatcher.js`).
@@ -56,6 +58,11 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
   - Cycle 1: random subset per augmentation (`TRAINING_PROGRESSIVE_RANDOM_PER_AUG`).
   - Cycles 2+: guided descriptors from `selectTopDescriptors` (knowledge-driven) with `TRAINING_PROGRESSIVE_GUIDED_PER_CYCLE` rows per cycle.
 - Optional `STORE_IMAGE_BLOB` persists the source image for future re-vectorization.
+- With `STORAGE_BACKEND=cheetah`, exhaustive ingestion and the progressive random cycle write through
+  `CheetahStore`: `i:` starts with `complete:false`, descriptors/token mappings and `f:` rows are
+  pipelined, then the image record is rewritten with `complete:true` and the Cheetah payload budget
+  is enforced. Cheetah guided cycles and blob storage are skipped pending their roadmap phases;
+  MySQL behavior is unchanged.
 
 ## 8. Training & Ingestion Pipeline (`src/train.js`)
 - CLI options: `--discover`, `--bootstrap`, `--reprobe`, `--shuffle`, `--threads`, plus evaluation flags (`--evaluate`, `--evaluate-filters`, `--evaluate-runs`, `--evaluate-top`) and augmentation controls (`--augmentations`, `--aug-per-pass`, `--aug-seed`).
@@ -63,6 +70,9 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - Adaptive worker pool:
   - Uses Node worker threads (`src/workers/ingestWorker.js`) for ingestion; sizing reacts to CPU load, memory, and queue length.
   - Worker jobs call `insert.js` ingestion path, so all storage safeguards remain consistent.
+  - With `STORAGE_BACKEND=cheetah`, the pool is forced to one worker because token allocation is
+    process-local. MySQL self-evaluation/pruning and the unported discover/bootstrap/reprobe/evaluate
+    paths are disabled or rejected explicitly.
 - Early bootstrapping with shuffled datasets seeds the constellation/pattern probability tree before knowledge-driven probes dominate search requests.
 - Online correlation discovery:
   - `discoverCorrelations` selects discriminators, updates `knowledge_nodes`, `feature_group_stats`, and logs metrics.
@@ -124,23 +134,35 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
   - `server`: `PORT`.
   - `search`: `VALUE_THRESHOLD`, `SKIP_THRESHOLD`, `CLI_MAX_ITERATIONS`.
   - `database`: schema name, default size cap (`DEFAULT_MAX_DB_SIZE_GB`), and `backend`
-    (`STORAGE_BACKEND`, `mysql` | `cheetah`; `mysql` is the only backend implemented
-    end-to-end today).
+    (`STORAGE_BACKEND`, `mysql` | `cheetah`; `cheetah` supports Phase 2 ingestion and
+    feature-row storage-budget pruning, but not search/evaluation/learning yet).
   - `cheetah`: connection and lifecycle settings for the Cheetah migration groundwork —
     `CHEETAH_HOST`, `CHEETAH_PORT`, `CHEETAH_DATABASE`, `CHEETAH_DATA_DIR`,
     `CHEETAH_POOL_SIZE`, `CHEETAH_CONNECT_TIMEOUT_MS`, `CHEETAH_COMMAND_TIMEOUT_MS`,
     `CHEETAH_MAX_IN_FLIGHT`, `CHEETAH_PAIR_INDEX_BYTES`, `CHEETAH_GRAPH_TERM_INDEX`.
-    Read only by `src/lib/cheetah/*`; no pipeline code consumes them yet (see `ROADMAP.md`).
+    Read by `src/lib/cheetah/*` and the Cheetah ingestion branch in `src/featureExtractor.js`
+    (see `ROADMAP.md`).
     `CHEETAH_DATA_DIR`, `CHEETAH_PAIR_INDEX_BYTES` and `CHEETAH_GRAPH_TERM_INDEX` are also
     read by the Go server process itself.
   - `correlation`: similarity thresholds, candidate sample caps, online runner sizing.
   - `training`: defaults for CLI flags, augmentation budgets, progressive ingestion, self-evaluation, real-time pruning, and debug logging.
 - Environment variables in `.env` override defaults; always document new flags here and in this file when adding tunables.
 
-## 13. Storage & Pruning (`src/lib/storageManager.js`, `src/lib/realTimePruner.js`)
-- `ensureStorageCapacity`:
+## 13. Storage & Pruning (`src/lib/storageManager.js`, `src/lib/realTimePruner.js`, `src/lib/cheetah/store.js`)
+- MySQL `ensureStorageCapacity`:
   - Reads `system_settings.max_db_size_gb` or default; prunes low-usage vectors (not part of any knowledge node) when above limit.
   - Warns if DB size remains above target after pruning.
+- Cheetah `CheetahStore.ensureStorageCapacity`:
+  - Reads `cfg:max_db_size_gb` or the same default and totals
+    `PAIR_SUMMARY.total_payload_bytes` across every Image Sign namespace without hydrating values.
+  - Ranks complete-image `f:` rows by usage count, last-use time, and key; removes one bounded batch
+    of at most 5,000 rows with exact `DEL pairs key=` operations and deletes matching `use:` records.
+    Incomplete ingests are never candidates.
+  - The cap measures owned payload bytes, not physical storage. Trie/table/filesystem overhead is
+    excluded: in the 50-image gate, summaries reported 3,854,640 payload bytes while the data
+    directory occupied 30,482,677 bytes.
+  - No Cheetah graph rows exist yet. Phase 4 must protect graph-pinned features before graph learning
+    and budget pruning can run together.
 - Real-time pruning removes:
   - High skip-count descriptors (cleans `feature_vectors`, `value_types`, and `skip_patterns`).
   - Stale GROUP nodes with low hits and age beyond threshold.
@@ -148,12 +170,17 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 
 ## 13½. Tests (`test/`)
 - `npm test` runs `node --test test/*.test.js` — no test dependency is added; the runner is Node's own.
-- Coverage today is the Cheetah migration groundwork only: the wire-protocol parser
-  (`test/cheetah-protocol.test.js`) and the key codec (`test/cheetah-keys.test.js`). The
-  MySQL pipeline remains unprotected by tests; verification there still means running it.
+- Coverage today is the Cheetah protocol/key groundwork plus the live Phase 2 storage contract:
+  incomplete-image gating, feature writes and scans, usage/skip/settings records, payload accounting,
+  bounded cold-row pruning, and pooled KV. The MySQL pipeline remains unprotected by tests;
+  verification there still means running it.
 - `npm run test:integration` additionally builds `cheetah-server` from the submodule, spawns it
   headless on an ephemeral port, and round-trips the client against it. It is skipped by plain
   `npm test` (gated on `CHEETAH_INTEGRATION=1`) so the default suite needs no Go toolchain.
+- The Phase 2 real-data gate ran `src/train.js` over 50 images against Cheetah port 4471. All 50
+  records completed; 15,000 features formed 11,860 candidate-scan prefixes with page sizes p50=1,
+  p95=2, p99=3, max=5, and zero above the 500-row target. This validates the version-1 scan layout
+  for the measured random ingestion corpus; denser future modes should be measured again.
 
 ## 14. Dependencies & Runtime
 - Node.js (CommonJS modules).
