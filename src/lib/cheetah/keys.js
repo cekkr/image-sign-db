@@ -21,14 +21,32 @@
 //   - `<order>` in the n-gram namespace is two hex digits, not a bare number,
 //     so orders stay byte-ordered against each other like every other segment.
 
-const crypto = require('crypto');
+// The spelling primitives — fixed-width hex, sha1, and the integer quantum
+// domain that bucketing divides in — come from the submodule's Node binder
+// (cheetah/binders/nodejs/lib/keys.js). They are generic: every Cheetah client
+// needs them, and getting one of them subtly wrong costs a rebuild. What stays
+// here is the part only this project can own: which namespaces exist, what a
+// segment means, and how wide each one is.
+
 const { CONSTELLATION_CONSTANTS } = require('../constants');
 const {
     RESOLUTION_LEVEL_TOLERANCE,
     normalizeResolutionLevel,
 } = require('../resolutionLevel');
 const { createDescriptorKey } = require('../descriptor');
-const { assertKeySpaceIsOurs } = require('./protocol');
+const {
+    KEY_QUANTUM,
+    QUANTA_PER_UNIT,
+    SEGMENT,
+    assertSha1,
+    assertValidKey,
+    bucketSweep,
+    bucketize,
+    hex,
+    quantize,
+    sha1,
+    unhex,
+} = require('./binder').keys;
 
 const { ANCHOR_SCALE, OFFSET_TOLERANCE, MIN_RELATIVE_SPAN, MAX_RELATIVE_SPAN } = CONSTELLATION_CONSTANTS;
 
@@ -60,8 +78,6 @@ const NAMESPACES = Object.freeze({
     signWord: 'sw:',
 });
 
-const SEGMENT = '/';
-
 const HEX_WIDTH = Object.freeze({
     token: 8,
     image: 8,
@@ -76,21 +92,11 @@ const HEX_WIDTH = Object.freeze({
     constellation: 4,
 });
 
-/**
- * **Bucketing happens in integers, not floats.**
- *
- * Every value that reaches a key is first quantized to `KEY_QUANTUM` (1e-6 —
- * the precision the descriptor builders already round to with
- * `Number(x.toFixed(6))`). Bucketing then divides integers.
- *
- * This is not tidiness. With float division, `(v - tol) / width` lands on
- * `224.99999999999997` where exact arithmetic gives `225`, so the sweep below
- * silently widened to three buckets for roughly half of all probes — the
- * tolerance is an exact multiple of the rounding grid, so boundary alignment is
- * the common case, not the rare one. Integer division removes the whole class.
- */
-const KEY_QUANTUM = 1e-6;
-const QUANTA_PER_UNIT = 1e6;
+// Bucketing happens in integers, not floats: every value that reaches a key is
+// first quantized to `KEY_QUANTUM` (1e-6 — the precision the descriptor
+// builders already round to with `Number(x.toFixed(6))`), and bucketing then
+// divides integers. The binder's `quantize`/`bucketize`/`bucketSweep` own that;
+// the reason it matters is recorded there.
 
 /**
  * Bucket widths are **frozen constants**, expressed in quanta, and not derived
@@ -112,12 +118,6 @@ const OFFSET_BUCKET_WIDTH = OFFSET_BUCKET_UNITS * KEY_QUANTUM;
 /** Offsets are signed; the bias keeps the hex segment byte-ordered. */
 const OFFSET_BUCKET_BIAS = 0x8000;
 
-/** A value in its integer quantum domain. The only entry point to bucketing. */
-function quantize(value) {
-    if (!Number.isFinite(value)) throw new TypeError(`cannot quantize non-finite value ${value}`);
-    return Math.round(value * QUANTA_PER_UNIT);
-}
-
 const RESOLUTION_TOLERANCE_UNITS = quantize(RESOLUTION_LEVEL_TOLERANCE);
 const OFFSET_TOLERANCE_UNITS = quantize(OFFSET_TOLERANCE);
 
@@ -136,65 +136,11 @@ if (OFFSET_BUCKET_UNITS < 2 * OFFSET_TOLERANCE_UNITS) {
     );
 }
 
-const SHA1_HEX = /^[0-9a-f]{40}$/;
 const CONFIG_NAME = /^[A-Za-z0-9_.-]+$/;
-
-function hex(value, width, what) {
-    if (!Number.isInteger(value) || value < 0) {
-        throw new RangeError(`${what} must be a non-negative integer, got ${value}`);
-    }
-    const text = value.toString(16);
-    if (text.length > width) {
-        throw new RangeError(`${what} ${value} does not fit in ${width} hex digits`);
-    }
-    return text.padStart(width, '0');
-}
-
-function unhex(text, what) {
-    if (typeof text !== 'string' || !/^[0-9a-f]+$/.test(text)) {
-        throw new TypeError(`${what} is not lowercase hex: ${text}`);
-    }
-    return Number.parseInt(text, 16);
-}
-
-function assertSha1(value, what) {
-    if (typeof value !== 'string' || !SHA1_HEX.test(value)) {
-        throw new TypeError(`${what} must be a 40-char lowercase sha1 hex string, got ${value}`);
-    }
-    return value;
-}
-
-function sha1(text) {
-    return crypto.createHash('sha1').update(String(text)).digest('hex');
-}
 
 // ---------------------------------------------------------------------------
 // Bucketing (ROADMAP §3.2)
 // ---------------------------------------------------------------------------
-
-/**
- * `floor(quantize(v) / widthUnits)`. Signed; the caller applies any bias.
- * `widthUnits` is a bucket width **in quanta**, never in value units.
- */
-function bucketize(value, widthUnits) {
-    if (!Number.isInteger(widthUnits) || widthUnits <= 0) {
-        throw new RangeError(`bucket width must be a positive integer of quanta, got ${widthUnits}`);
-    }
-    return Math.floor(quantize(value) / widthUnits);
-}
-
-/**
- * The distinct buckets that can hold a row within `toleranceUnits` of `value`.
- * Ordered ascending; length 1 or 2 while `widthUnits >= 2 * toleranceUnits`.
- */
-function bucketSweep(value, widthUnits, toleranceUnits) {
-    const centre = quantize(value);
-    const low = Math.floor((centre - toleranceUnits) / widthUnits);
-    const high = Math.floor((centre + toleranceUnits) / widthUnits);
-    const buckets = [];
-    for (let b = low; b <= high; b += 1) buckets.push(b);
-    return buckets;
-}
 
 function resolutionBucket(resolutionLevel) {
     const level = normalizeResolutionLevel(resolutionLevel);
@@ -609,19 +555,6 @@ function parseWordNodeId(nodeId) {
         throw new TypeError(`not a word node id: ${nodeId}`);
     }
     return unhex(nodeId.slice(1), 'word');
-}
-
-/**
- * Validate any key this module produced against Cheetah's reserved space and
- * the bare-argument rules. Cheap enough to call on every write in tests.
- */
-function assertValidKey(key) {
-    assertKeySpaceIsOurs(key);
-    if (/[\s]/.test(key)) throw new Error(`cheetah key must not contain whitespace: ${key}`);
-    if (key.startsWith('x')) {
-        throw new Error(`cheetah key must not start with 'x' (it would be read as hex): ${key}`);
-    }
-    return key;
 }
 
 module.exports = {

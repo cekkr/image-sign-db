@@ -15,22 +15,24 @@
 //     in order to compare continuous colour fields. The graph knows *that* an
 //     image matched; only the trie knows *which of its signs* did.
 //
+// Like CheetahStore it extends `CheetahDatabase` from the submodule's Node
+// binder, which owns the connection plumbing, the layout guard, `reset`, and id
+// allocation. The two stores share none of *this* file: the namespaces, the
+// posting layout and the graph publishing below are the sign pipeline's alone.
+//
 // The completion protocol is the same as CheetahStore's, and for the same
 // reason: Cheetah has no transaction spanning these writes, so `complete` on the
 // image record is the commit marker and readers ignore anything without it.
 
-const crypto = require('crypto');
 const settings = require('../../settings');
 const { SIGN_LAYOUT_VERSION } = require('../sign/constants');
-const { CheetahPool, CheetahError } = require('./client');
-const { decodeItemPayload } = require('./protocol');
-const graph = require('./graph');
-const { getJson, getValue, putJson, putJsonBatch, putValue, scanPrefix } = require('./kv');
+const binder = require('./binder');
+const { CheetahError } = require('./client');
 const keys = require('./keys');
 
+const { CheetahDatabase, hydrateJson } = binder.database;
 const LAYOUT_KEY = keys.configKey('sign_layout_version');
 const DEFAULT_SCAN_LIMIT = 500;
-const DEFAULT_WRITE_BATCH_SIZE = 256;
 const EDGE_BATCH_SIZE = 250;
 
 /**
@@ -45,45 +47,39 @@ const TF_SATURATION = 3;
 
 const EDGE_TYPE = 'sign';
 
-function timestamp(now) {
-    const value = now();
-    return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
-}
-
-function parseHydratedJson(item) {
-    const bytes = decodeItemPayload(item);
-    if (!bytes) throw new CheetahError(`cheetah scan did not hydrate ${item?.key || '(unknown)'}`);
-    try {
-        return JSON.parse(bytes.toString('utf8'));
-    } catch (error) {
-        throw new CheetahError(`cheetah payload at ${item.key} is not JSON: ${error.message}`);
-    }
-}
-
-class SignStore {
+class SignStore extends CheetahDatabase {
     constructor(options = {}) {
         const configured = settings.cheetah;
-        this.databaseName = options.database ?? configured.database;
-        this.pool = options.pool || new CheetahPool({
-            size: options.poolSize ?? configured.poolSize,
+        super({
+            pool: options.pool,
+            database: options.database ?? configured.database,
+            databaseOptions: {
+                pair_bytes: options.pairIndexBytes ?? configured.pairIndexBytes,
+            },
+            poolSize: options.poolSize ?? configured.poolSize,
             host: options.host ?? configured.host,
             port: options.port ?? configured.port,
-            database: this.databaseName,
-            databaseOptions: { pair_bytes: options.pairIndexBytes ?? configured.pairIndexBytes },
             connectTimeoutMs: options.connectTimeoutMs ?? configured.connectTimeoutMs,
             commandTimeoutMs: options.commandTimeoutMs ?? configured.commandTimeoutMs,
             maxInFlight: options.maxInFlight ?? configured.maxInFlight,
+            // Validated separately from the delta family's
+            // `cfg:key_layout_version`: the two layouts version independently
+            // because the namespaces are disjoint.
+            layout: { key: LAYOUT_KEY, version: SIGN_LAYOUT_VERSION, label: 'sign layout' },
+            now: options.now,
+            randomInt: options.randomInt,
+            writeBatchSize: options.writeBatchSize,
+            scanLimit: DEFAULT_SCAN_LIMIT,
         });
-        this.ownsPool = !options.pool;
-        this.now = options.now || (() => new Date());
-        this.randomInt = options.randomInt || crypto.randomInt;
-        this.writeBatchSize = Math.max(1, Number(options.writeBatchSize) || DEFAULT_WRITE_BATCH_SIZE);
         this.tfSaturation = Math.max(1, Number(options.tfSaturation) || TF_SATURATION);
-        this.connected = false;
         this.imageRecords = new Map();
         // Images the read path surfaces even though their record is still
         // incomplete. See `readWhileIncomplete`.
         this.incompleteReadable = new Set();
+    }
+
+    clearCaches() {
+        this.imageRecords.clear();
     }
 
     /**
@@ -111,105 +107,21 @@ class SignStore {
         return Boolean(record?.complete) || this.incompleteReadable.has(imageId);
     }
 
-    async withConnection(fn) {
-        if (typeof this.pool.withConnection === 'function') return this.pool.withConnection(fn);
-        return fn(this.pool);
-    }
-
-    async connect() {
-        if (this.connected) return this;
-        if (typeof this.pool.connect === 'function') await this.pool.connect();
-        await this.withConnection(async (conn) => {
-            const stored = await getValue(conn, LAYOUT_KEY);
-            if (stored === null) {
-                await putValue(conn, LAYOUT_KEY, String(SIGN_LAYOUT_VERSION), { upsert: true });
-                return;
-            }
-            if (Number.parseInt(stored, 10) !== SIGN_LAYOUT_VERSION) {
-                throw new CheetahError(
-                    `cheetah sign layout ${stored} is incompatible with codec ${SIGN_LAYOUT_VERSION}; ` +
-                    're-ingest into a fresh database'
-                );
-            }
-        });
-        this.connected = true;
-        return this;
-    }
-
-    async close() {
-        if (!this.ownsPool || typeof this.pool.close !== 'function') return;
-        await this.pool.close();
-        this.connected = false;
-    }
-
-    /**
-     * Drop and recreate the database this store is connected to.
-     *
-     * Destructive and immediate: `RESET_DB` recreates the directory, so every
-     * image, posting, graph node and edge in it is gone — which is exactly what
-     * a training run wants when it is establishing a corpus rather than adding
-     * to one.
-     *
-     * Every connection is re-pointed afterwards, not just the one that issued
-     * the reset. That follows from the server's own model rather than from an
-     * observed failure: database selection is per-connection, and
-     * `Engine.ResetDatabase` closes the database and drops it from the engine
-     * registry while `server.go` re-selects the fresh one only for the socket
-     * that ran the command — so the other sockets hold a pointer to a closed
-     * `Database`. Re-pointing them is one round trip each and removes the
-     * question.
-     *
-     * Being precise about what this does **not** claim: a benchmark run failed
-     * with `main_keys.table: file already closed` eleven minutes after a reset,
-     * and removing this re-point does not reproduce it. That failure is still
-     * open and is recorded in AGENTS.md → Known Gaps; do not read this code as
-     * its fix.
-     */
-    async reset() {
-        const name = this.databaseName;
-        await this.withConnection(async (conn) => {
-            const response = await conn.send(`RESET_DB ${name}`);
-            if (!response.ok) {
-                throw new CheetahError(`cheetah RESET_DB ${name} failed: ${response.error || response.raw}`, {
-                    response,
-                });
-            }
-        });
-        if (typeof this.pool.broadcast === 'function') {
-            for (const response of await this.pool.broadcast(`DATABASE ${name}`)) {
-                if (!response.ok) {
-                    throw new CheetahError(
-                        `cheetah could not re-select ${name} after a reset: ${response.error || response.raw}`,
-                        { response }
-                    );
-                }
-            }
-        }
-        // Everything cached described the database that just ceased to exist.
-        this.imageRecords.clear();
-        this.connected = false;
-        return this.connect();
-    }
-
     // -- images -------------------------------------------------------------
 
     async allocateImageId() {
-        for (let attempt = 0; attempt < 64; attempt += 1) {
-            const imageId = this.randomInt(1, 0x100000000);
-            if (await getJson(this.pool, keys.signImageKey(imageId)) === null) return imageId;
-        }
-        throw new CheetahError('unable to allocate a collision-free uint32 image id');
+        return this.allocateRandomId((imageId) => keys.signImageKey(imageId));
     }
 
     async getImage(imageId) {
         if (this.imageRecords.has(imageId)) return this.imageRecords.get(imageId);
-        const record = await getJson(this.pool, keys.signImageKey(imageId));
+        const record = await this.getJson(keys.signImageKey(imageId));
         if (record) this.imageRecords.set(imageId, record);
         return record;
     }
 
     async findImageIdByFilename(filename) {
-        const stored = await getValue(this.pool, keys.signFilenameKey(filename));
+        const stored = await this.getValue(keys.signFilenameKey(filename));
         return stored === null ? null : keys.parseImageId(stored);
     }
 
@@ -223,14 +135,13 @@ class SignStore {
             filename,
             width,
             height,
-            created_at: timestamp(this.now),
+            created_at: this.timestamp(),
             complete: false,
             constellations: 0,
             words: 0,
         };
-        await putJson(this.pool, keys.signImageKey(resolvedId), record, { upsert: true });
-        await putValue(
-            this.pool,
+        await this.putJson(keys.signImageKey(resolvedId), record, { upsert: true });
+        await this.putValue(
             keys.signFilenameKey(filename),
             keys.formatImageId(resolvedId),
             { upsert: true }
@@ -249,10 +160,10 @@ class SignStore {
      */
     async updateImage(imageId, extra = {}, { verb = 'update' } = {}) {
         const key = keys.signImageKey(imageId);
-        const current = this.imageRecords.get(imageId) || await getJson(this.pool, key);
+        const current = this.imageRecords.get(imageId) || await this.getJson(key);
         if (!current) throw new CheetahError(`cannot ${verb} missing sign image ${imageId}`);
         const record = { ...current, ...extra };
-        await putJson(this.pool, key, record, { upsert: true });
+        await this.putJson(key, record, { upsert: true });
         this.imageRecords.set(imageId, record);
         return record;
     }
@@ -264,15 +175,11 @@ class SignStore {
     /** Every complete image record, keyed by image id. */
     async listImages({ includeIncomplete = false } = {}) {
         const images = new Map();
-        for await (const item of scanPrefix(this.pool, keys.NAMESPACES.signImage, {
-            limit: DEFAULT_SCAN_LIMIT,
-            reducer: 'continuations',
-        })) {
+        for await (const { item, value } of this.scanJson(keys.NAMESPACES.signImage)) {
             const imageId = keys.parseImageId(item.key.slice(keys.NAMESPACES.signImage.length));
-            const record = parseHydratedJson(item);
-            if (!includeIncomplete && !this.isReadable(imageId, record)) continue;
-            this.imageRecords.set(imageId, record);
-            images.set(imageId, record);
+            if (!includeIncomplete && !this.isReadable(imageId, value)) continue;
+            this.imageRecords.set(imageId, value);
+            images.set(imageId, value);
         }
         return images;
     }
@@ -306,9 +213,10 @@ class SignStore {
             // measured one bridges the same level edge — so it belongs on
             // whichever side is cheaper, and that was measured, not assumed.
             // Writing all four words of a sweep put ~6 900 postings and ~5 400
-            // graph edges behind one image and cost ~108 s; the sweep is
-            // essentially free on the query side, where it only adds seeds to a
-            // recall that was already being issued.
+            // graph edges behind one image against ~2 400 postings and ~1 700
+            // edges for the primary word alone; the sweep is essentially free on
+            // the query side, where it only adds seeds to a recall that was
+            // already being issued.
             const seen = new Map();
             sign.triples.forEach((triple) => {
                 if (!seen.has(triple.words[0])) seen.set(triple.words[0], triple.index);
@@ -325,9 +233,7 @@ class SignStore {
         // One request per page instead of two per record. Ingestion is the only
         // place in this codebase where the round-trip count, not the payload
         // size, decides how long the work takes.
-        for (let at = 0; at < writes.length; at += this.writeBatchSize) {
-            await putJsonBatch(this.pool, writes.slice(at, at + this.writeBatchSize));
-        }
+        await this.putJsonBatched(writes);
         return { wordCounts, written: writes.length, nextOrdinal: startOrdinal + signs.length };
     }
 
@@ -340,7 +246,7 @@ class SignStore {
      */
     async commitGraph(imageId, filename, wordCounts) {
         const imageNode = keys.imageNodeId(imageId);
-        await graph.setNode(this.pool, {
+        await this.setNode({
             id: imageNode,
             labels: ['sign_image'],
             props: { filename },
@@ -355,7 +261,7 @@ class SignStore {
         let applied = 0;
         for (let at = 0; at < items.length; at += EDGE_BATCH_SIZE) {
             const batch = items.slice(at, at + EDGE_BATCH_SIZE);
-            const result = await graph.setEdgeBatch(this.pool, batch, {
+            const result = await this.setEdgeBatch(batch, {
                 type: EDGE_TYPE,
                 directed: 1,
             });
@@ -382,7 +288,7 @@ class SignStore {
     async wordDegrees(words) {
         const unique = [...new Set(words)];
         const degrees = await Promise.all(unique.map((word) =>
-            graph.degree(this.pool, { id: keys.wordNodeId(word), direction: 'out', type: EDGE_TYPE })
+            this.degree({ id: keys.wordNodeId(word), direction: 'out', type: EDGE_TYPE })
         ));
         return new Map(unique.map((word, index) => [word, degrees[index].degree]));
     }
@@ -395,7 +301,7 @@ class SignStore {
      * is the server's noisy-OR over how many seeds converged.
      */
     async recallImages(words, { limit = 32, minSources = 1, precision = 0.05 } = {}) {
-        const associations = await graph.recallBatched(this.pool, {
+        const associations = await this.recall({
             seeds: words.map((word) => keys.wordNodeId(word)),
             hops: 1,
             decay: 1,
@@ -446,19 +352,19 @@ class SignStore {
      */
     async signsForWord(word, imageId, { limit = 8 } = {}) {
         const found = [];
-        for await (const item of scanPrefix(this.pool, keys.signWordImagePrefix(word, imageId), {
+        for await (const item of this.scan(keys.signWordImagePrefix(word, imageId), {
             limit: Math.min(DEFAULT_SCAN_LIMIT, Math.max(1, limit)),
             maxItems: limit,
             reducer: 'continuations',
         })) {
-            const posting = parseHydratedJson(item);
+            const posting = hydrateJson(item);
             found.push({
                 ordinal: keys.parseSignWordPostingKey(item.key).ordinal,
                 tripleIndex: Number.isInteger(posting?.t) ? posting.t : null,
             });
         }
         const records = await Promise.all(found.map((entry) =>
-            getJson(this.pool, keys.signConstellationKey(imageId, entry.ordinal))
+            this.getSign(imageId, entry.ordinal)
         ));
         return found
             .map((entry, index) => ({ ...entry, record: records[index] }))
@@ -467,7 +373,7 @@ class SignStore {
 
     /** One constellation record by address. */
     async getSign(imageId, ordinal) {
-        return getJson(this.pool, keys.signConstellationKey(imageId, ordinal));
+        return this.getJson(keys.signConstellationKey(imageId, ordinal));
     }
 }
 

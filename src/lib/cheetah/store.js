@@ -5,6 +5,13 @@
 // vectorGenerators.js; callers pass the same feature objects the MySQL path
 // persists today.
 //
+// It extends `CheetahDatabase` from the submodule's Node binder
+// (cheetah/binders/nodejs/lib/database.js), which owns everything that is not
+// about this schema: pool construction, the layout-version guard on connect,
+// `close` that only closes a pool it owns, the per-key mutation chain,
+// collision-checked id allocation and namespace payload accounting. What is
+// left here is what only this project knows.
+//
 // Consistency is deliberately the same completion protocol as MySQL:
 //
 //   putImage(complete:false) -> putFeatures(...) -> markComplete()
@@ -12,31 +19,19 @@
 // Readers hydrate only complete image records. Cheetah has no transaction
 // spanning these writes, so `complete` is the commit marker.
 
-const crypto = require('crypto');
 const settings = require('../../settings');
 const { serializeDescriptor, createDescriptorKey } = require('../descriptor');
 const { RESOLUTION_LEVEL_TOLERANCE, normalizeResolutionLevel } = require('../resolutionLevel');
 const { CONSTELLATION_CONSTANTS } = require('../constants');
-const { CheetahPool, CheetahError } = require('./client');
-const {
-    decodeItemPayload,
-    encodeArgument,
-    numericField,
-} = require('./protocol');
-const {
-    getJson,
-    getValue,
-    putJson,
-    putValue,
-    scanPrefix,
-} = require('./kv');
+const binder = require('./binder');
+const { CheetahError } = require('./client');
 const { TokenVocabulary } = require('./vocabulary');
 const keys = require('./keys');
 
+const { CheetahDatabase, hydrateJson } = binder.database;
 const { OFFSET_TOLERANCE } = CONSTELLATION_CONSTANTS;
 const LAYOUT_KEY = keys.configKey('key_layout_version');
 const DEFAULT_SCAN_LIMIT = 500;
-const DEFAULT_WRITE_BATCH_SIZE = 256;
 const DEFAULT_PRUNE_BATCH_SIZE = 5000;
 const BYTES_PER_GIB = 1024 ** 3;
 
@@ -48,23 +43,6 @@ function finiteNumber(value, name) {
     return number;
 }
 
-function timestamp(now) {
-    const value = now();
-    return value instanceof Date ? value.toISOString() : new Date(value).toISOString();
-}
-
-function parseHydratedJson(item) {
-    const bytes = decodeItemPayload(item);
-    if (!bytes) {
-        throw new CheetahError(`cheetah feature scan did not hydrate ${item?.key || '(unknown key)'}`);
-    }
-    try {
-        return JSON.parse(bytes.toString('utf8'));
-    } catch (error) {
-        throw new CheetahError(`cheetah feature payload at ${item.key} is not JSON: ${error.message}`);
-    }
-}
-
 function percentile(sortedValues, fraction) {
     if (sortedValues.length === 0) return 0;
     const index = Math.min(
@@ -74,30 +52,31 @@ function percentile(sortedValues, fraction) {
     return sortedValues[index];
 }
 
-class CheetahStore {
+class CheetahStore extends CheetahDatabase {
     constructor(options = {}) {
         const configured = settings.cheetah;
-        this.pool = options.pool || new CheetahPool({
-            size: options.poolSize ?? configured.poolSize,
-            host: options.host ?? configured.host,
-            port: options.port ?? configured.port,
+        super({
+            pool: options.pool,
             database: options.database ?? configured.database,
             databaseOptions: {
                 pair_bytes: options.pairIndexBytes ?? configured.pairIndexBytes,
             },
+            poolSize: options.poolSize ?? configured.poolSize,
+            host: options.host ?? configured.host,
+            port: options.port ?? configured.port,
             connectTimeoutMs: options.connectTimeoutMs ?? configured.connectTimeoutMs,
             commandTimeoutMs: options.commandTimeoutMs ?? configured.commandTimeoutMs,
             maxInFlight: options.maxInFlight ?? configured.maxInFlight,
+            // A mismatch fails loudly on connect: the key layout is not
+            // self-describing, so an older database would otherwise read as a
+            // set of keys that simply match nothing.
+            layout: { key: LAYOUT_KEY, version: keys.KEY_LAYOUT_VERSION, label: 'key layout' },
+            now: options.now,
+            randomInt: options.randomInt,
+            writeBatchSize: options.writeBatchSize,
+            scanLimit: DEFAULT_SCAN_LIMIT,
         });
-        this.ownsPool = !options.pool;
         this.vocabulary = options.vocabulary || new TokenVocabulary(this.pool);
-        this.now = options.now || (() => new Date());
-        this.randomInt = options.randomInt || crypto.randomInt;
-        this.writeBatchSize = Math.max(
-            1,
-            Number(options.writeBatchSize) || DEFAULT_WRITE_BATCH_SIZE
-        );
-        this.connected = false;
         this.ensuredDescriptors = new Set();
         this.pendingDescriptors = new Map();
         this.imageRecords = new Map();
@@ -105,41 +84,12 @@ class CheetahStore {
         // This state only lives until markComplete; interrupted ingests remain
         // incomplete and are intentionally not resumed in place.
         this.featureSequences = new Map();
-        this.mutationChains = new Map();
     }
 
-    async withConnection(fn) {
-        if (typeof this.pool.withConnection === 'function') {
-            return this.pool.withConnection(fn);
-        }
-        return fn(this.pool);
-    }
-
-    async connect() {
-        if (this.connected) return this;
-        if (typeof this.pool.connect === 'function') await this.pool.connect();
-        await this.withConnection(async (conn) => {
-            const stored = await getValue(conn, LAYOUT_KEY);
-            if (stored === null) {
-                await putValue(conn, LAYOUT_KEY, String(keys.KEY_LAYOUT_VERSION), { upsert: true });
-                return;
-            }
-            const version = Number.parseInt(stored, 10);
-            if (version !== keys.KEY_LAYOUT_VERSION) {
-                throw new CheetahError(
-                    `cheetah key layout ${version} is incompatible with codec ${keys.KEY_LAYOUT_VERSION}; ` +
-                    're-ingest into a fresh database'
-                );
-            }
-        });
-        this.connected = true;
-        return this;
-    }
-
-    async close() {
-        if (!this.ownsPool || typeof this.pool.close !== 'function') return;
-        await this.pool.close();
-        this.connected = false;
+    clearCaches() {
+        this.ensuredDescriptors.clear();
+        this.imageRecords.clear();
+        this.featureSequences.clear();
     }
 
     async ensureDescriptor(descriptor) {
@@ -151,8 +101,7 @@ class CheetahStore {
         if (!this.ensuredDescriptors.has(descriptorHash)) {
             let pending = this.pendingDescriptors.get(descriptorHash);
             if (!pending) {
-                pending = putValue(
-                    this.pool,
+                pending = this.putValue(
                     keys.descriptorKey(descriptorHash),
                     serializeDescriptor(descriptor),
                     { upsert: true }
@@ -168,14 +117,12 @@ class CheetahStore {
         return { descriptorKey: descriptorHash, token };
     }
 
+    /**
+     * Random allocation is process-independent. A sequential `cfg:` counter
+     * would race across the worker-thread stores.
+     */
     async allocateImageId() {
-        for (let attempt = 0; attempt < 64; attempt += 1) {
-            // Random allocation is process-independent. A sequential cfg:
-            // counter would race across the worker-thread stores.
-            const imageId = this.randomInt(1, 0x100000000);
-            if (await getJson(this.pool, keys.imageKey(imageId)) === null) return imageId;
-        }
-        throw new CheetahError('unable to allocate a collision-free uint32 image id');
+        return this.allocateRandomId((imageId) => keys.imageKey(imageId));
     }
 
     async putImage({ filename, imageId = null, createdAt = null } = {}) {
@@ -183,17 +130,16 @@ class CheetahStore {
             throw new TypeError('filename must be a non-empty string');
         }
         const resolvedId = imageId === null ? await this.allocateImageId() : Number(imageId);
-        if (imageId !== null && await getJson(this.pool, keys.imageKey(resolvedId)) !== null) {
+        if (imageId !== null && await this.getJson(keys.imageKey(resolvedId)) !== null) {
             throw new CheetahError(`image id ${resolvedId} already exists`);
         }
         const record = {
             filename,
-            created_at: createdAt || timestamp(this.now),
+            created_at: createdAt || this.timestamp(),
             complete: false,
         };
-        await putJson(this.pool, keys.imageKey(resolvedId), record, { upsert: true });
-        await putValue(
-            this.pool,
+        await this.putJson(keys.imageKey(resolvedId), record, { upsert: true });
+        await this.putValue(
             keys.filenameKey(filename),
             keys.formatImageId(resolvedId),
             { upsert: true }
@@ -269,17 +215,17 @@ class CheetahStore {
             const batch = prepared.slice(at, at + this.writeBatchSize);
             // Each put is INSERT -> PAIR_SET, but all rows in this batch enter
             // the pool together so its bounded FIFO queues keep the sockets full.
-            await Promise.all(batch.map(({ key, payload }) => putJson(this.pool, key, payload)));
+            await Promise.all(batch.map(({ key, payload }) => this.putJson(key, payload)));
         }
         return prepared.length;
     }
 
     async markComplete(imageId) {
         const key = keys.imageKey(imageId);
-        const current = this.imageRecords.get(imageId) || await getJson(this.pool, key);
+        const current = this.imageRecords.get(imageId) || await this.getJson(key);
         if (!current) throw new CheetahError(`cannot complete missing image ${imageId}`);
         const record = { ...current, complete: true };
-        await putJson(this.pool, key, record, { upsert: true });
+        await this.putJson(key, record, { upsert: true });
         this.imageRecords.set(imageId, record);
         this.featureSequences.delete(imageId);
         return record;
@@ -287,7 +233,7 @@ class CheetahStore {
 
     async getImage(imageId) {
         if (this.imageRecords.has(imageId)) return this.imageRecords.get(imageId);
-        const record = await getJson(this.pool, keys.imageKey(imageId));
+        const record = await this.getJson(keys.imageKey(imageId));
         if (record) this.imageRecords.set(imageId, record);
         return record;
     }
@@ -324,13 +270,13 @@ class CheetahStore {
         for (const prefix of keys.featureScanPrefixes(prefixArgs)) {
             const remaining = Number.isFinite(maxRows) ? Math.max(0, maxRows - rows.length) : Infinity;
             if (remaining === 0) break;
-            for await (const item of scanPrefix(this.pool, prefix, {
+            for await (const item of this.scan(prefix, {
                 limit: pageSize,
                 maxItems: remaining,
                 reducer: 'continuations',
             })) {
                 const parsedKey = keys.parseFeatureKey(item.key);
-                const feature = parseHydratedJson(item);
+                const feature = hydrateJson(item);
                 const size = normalizeResolutionLevel(feature.size);
                 if (Math.abs(size - resolutionLevel) > RESOLUTION_LEVEL_TOLERANCE) continue;
                 if (Math.abs(Number(feature.rel_x) - relX) > OFFSET_TOLERANCE) continue;
@@ -358,22 +304,6 @@ class CheetahStore {
         return rows;
     }
 
-    async mutateJson(key, fallback, mutate) {
-        const previous = this.mutationChains.get(key) || Promise.resolve();
-        const run = previous.then(() => this.withConnection(async (conn) => {
-            const current = await getJson(conn, key);
-            const next = mutate(current || { ...fallback });
-            await putJson(conn, key, next, { upsert: true });
-            return next;
-        }));
-        const tail = run.then(() => undefined, () => undefined);
-        this.mutationChains.set(key, tail);
-        void tail.then(() => {
-            if (this.mutationChains.get(key) === tail) this.mutationChains.delete(key);
-        });
-        return run;
-    }
-
     async recordUsage(featureKeys, increment = 1, scoreDelta = 0) {
         if (!Array.isArray(featureKeys) || featureKeys.length === 0) return;
         await Promise.all(featureKeys.map((featureKey) => {
@@ -381,7 +311,7 @@ class CheetahStore {
             return this.mutateJson(key, { count: 0, last_used: null, last_score: 0 }, (record) => ({
                 feature_key: featureKey,
                 count: Number(record.count || 0) + Number(increment || 0),
-                last_used: timestamp(this.now),
+                last_used: this.timestamp(),
                 last_score: Number(record.last_score || 0) + Number(scoreDelta || 0),
             }));
         }));
@@ -395,7 +325,7 @@ class CheetahStore {
             { count: 0, last_used: null, descriptor: null },
             (record) => ({
                 count: Number(record.count || 0) + 1,
-                last_used: timestamp(this.now),
+                last_used: this.timestamp(),
                 descriptor,
             })
         );
@@ -403,7 +333,7 @@ class CheetahStore {
 
     async getSetting(name, defaultValue = null) {
         const key = keys.configKey(name);
-        const raw = await getValue(this.pool, key);
+        const raw = await this.getValue(key);
         if (raw !== null) {
             const numeric = Number(raw);
             return Number.isNaN(numeric) ? raw : numeric;
@@ -413,21 +343,16 @@ class CheetahStore {
     }
 
     async setSetting(name, value) {
-        await putValue(this.pool, keys.configKey(name), String(value), { upsert: true });
+        await this.putValue(keys.configKey(name), String(value), { upsert: true });
         return value;
     }
 
     async featureSummary(depth = 1) {
-        const response = await this.pool.command('PAIR_SUMMARY', keys.NAMESPACES.feature, depth);
-        if (!response.ok) {
-            throw new CheetahError(`cheetah feature summary failed: ${response.error || response.raw}`, {
-                response,
-            });
-        }
+        const summary = await this.pairSummary(keys.NAMESPACES.feature, depth);
         return {
-            count: numericField(response.fields, 'count'),
-            totalPayloadBytes: numericField(response.fields, 'total_payload_bytes'),
-            response,
+            count: summary.count,
+            totalPayloadBytes: summary.payloadBytes,
+            response: summary.response,
         };
     }
 
@@ -439,26 +364,7 @@ class CheetahStore {
      * a stable pruning signal rather than an on-disk directory-size claim.
      */
     async storageSummary() {
-        const namespaces = [...new Set(Object.values(keys.NAMESPACES))];
-        const responses = await Promise.all(namespaces.map(async (prefix) => {
-            const response = await this.pool.command('PAIR_SUMMARY', prefix, 1);
-            if (!response.ok) {
-                throw new CheetahError(
-                    `cheetah storage summary for ${prefix} failed: ${response.error || response.raw}`,
-                    { response }
-                );
-            }
-            return {
-                prefix,
-                count: numericField(response.fields, 'count', 0),
-                payloadBytes: numericField(response.fields, 'total_payload_bytes', 0),
-            };
-        }));
-        return {
-            totalRecords: responses.reduce((sum, entry) => sum + entry.count, 0),
-            totalPayloadBytes: responses.reduce((sum, entry) => sum + entry.payloadBytes, 0),
-            namespaces: Object.fromEntries(responses.map((entry) => [entry.prefix, entry])),
-        };
+        return this.namespaceSummary(Object.values(keys.NAMESPACES));
     }
 
     /**
@@ -468,7 +374,7 @@ class CheetahStore {
     async measureFeaturePages({ pageSize = DEFAULT_SCAN_LIMIT, maxRows = Infinity } = {}) {
         const counts = new Map();
         let rowCount = 0;
-        for await (const item of scanPrefix(this.pool, keys.NAMESPACES.feature, {
+        for await (const item of this.scan(keys.NAMESPACES.feature, {
             limit: pageSize,
             maxItems: maxRows,
         })) {
@@ -500,14 +406,13 @@ class CheetahStore {
 
     async usageByFeatureKey() {
         const usage = new Map();
-        for await (const item of scanPrefix(this.pool, keys.NAMESPACES.usage, {
+        // The `use:` key is a sha1 of the feature key and therefore not
+        // invertible, so the payload carries `feature_key` and this map is
+        // keyed from it.
+        for await (const { value } of this.scanJson(keys.NAMESPACES.usage, {
             limit: DEFAULT_SCAN_LIMIT,
-            reducer: 'continuations',
         })) {
-            const record = parseHydratedJson(item);
-            if (typeof record.feature_key === 'string') {
-                usage.set(record.feature_key, record);
-            }
+            if (typeof value.feature_key === 'string') usage.set(value.feature_key, value);
         }
         return usage;
     }
@@ -515,7 +420,7 @@ class CheetahStore {
     async prunableFeatures() {
         const usage = await this.usageByFeatureKey();
         const candidates = [];
-        for await (const item of scanPrefix(this.pool, keys.NAMESPACES.feature, {
+        for await (const item of this.scan(keys.NAMESPACES.feature, {
             limit: DEFAULT_SCAN_LIMIT,
         })) {
             const parsed = keys.parseFeatureKey(item.key);
@@ -536,15 +441,6 @@ class CheetahStore {
             left.key.localeCompare(right.key)
         );
         return candidates;
-    }
-
-    async deletePair(key) {
-        const response = await this.pool.send(`DEL pairs key=${encodeArgument(key)}`);
-        if (response.ok) return numericField(response.fields, 'deleted', 1);
-        if (response.error && /not_found/.test(response.error)) return 0;
-        throw new CheetahError(`cheetah DEL pairs ${key} failed: ${response.error || response.raw}`, {
-            response,
-        });
     }
 
     async pruneLowValueFeatures(targetPayloadBytes, {

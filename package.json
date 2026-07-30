@@ -15,7 +15,8 @@
   "type": "commonjs",
   "main": "src/index.js",
   "scripts": {
-    "test": "node --test test/*.test.js",
+    "test": "node --test test/*.test.js && npm run test:binder",
+    "test:binder": "node --test cheetah/binders/nodejs/test/*.test.js",
     "test:integration": "CHEETAH_INTEGRATION=1 node --test test/*.test.js",
     "maintenance:check": "node scripts/check-maintenance.js"
   },

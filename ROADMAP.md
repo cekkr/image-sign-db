@@ -283,6 +283,13 @@ across callers: [`kv.js`](src/lib/cheetah/kv.js) owns the two-step `INSERT`+`PAI
 `PAIR_GET`+`READ` read, and cursor paging; [`vocabulary.js`](src/lib/cheetah/vocabulary.js) is
 item 1.2.
 
+**Since then, the generic half of 0.2–0.4 moved upstream** into Cheetah's own Node binder
+([`cheetah/binders/nodejs/`](cheetah/binders/nodejs)), and the paths above are re-exports or thin
+project-defaults wrappers over it; `store.js` and `signStore.js` subclass its `CheetahDatabase`.
+Nothing in this phase changed behaviour — the same code, owned by the repository whose protocol it
+speaks, so a server change and its client change land together. See
+[`AGENTS.md`](AGENTS.md#srclibcheetah--the-migrations-storage-layer).
+
 **Exit check: ✅ passed.** `npm run test:integration` builds and spawns a server on an ephemeral port
 and round-trips `PAIR_SET`/`PAIR_GET`/`PAIR_SCAN` (with paging)/`PAIR_SUMMARY`/`GRAPH_NODE_SET`/
 `GRAPH_EDGE_SET`/`GRAPH_RECALL`/`DEL pairs`; `npm test` is green at 34 tests.
