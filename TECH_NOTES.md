@@ -151,10 +151,52 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   commit-marker protocol as `CheetahStore`. Soft assignment lives on the **query** side: ingestion
   stores only the primary word of each triple. The choice is symmetric in effect and was decided by
   measurement — storing all four words of a sweep put ~6 900 postings and ~5 400 graph edges behind
-  one image and cost ~108 s per image; storing the primary only is ~2 400 postings, ~1 700 edges and
-  **28 s**, with accuracy unchanged, while a query-side variant costs one extra seed on a recall that
-  was happening anyway. Of that 28 s, `commitGraph` is ~19 s: graph edge upserts, not pair writes,
-  are what ingestion time is made of.
+  one image against ~2 400 postings and ~1 700 edges for the primary only (at 600 constellations),
+  with accuracy unchanged, while a query-side variant costs one extra seed on a recall that was
+  happening anyway. `commitGraph` remains the larger half of the cost: graph edge upserts, not pair
+  writes, are what ingestion time is made of.
+  **Ingestion is Cheetah-bound, not CPU-bound, and the constant moved.** Profiled at 2 048
+  constellations on one image: drawing and measuring the whole constellation set — geometry,
+  HSV patches, records, vocabulary — is **32 ms**; everything else is the database. Against the
+  submodule as pinned before 2026-07-30 that was `putSigns` 29.3 s + `commitGraph` 66.0 s = **95 s**
+  per image. The cause was in Cheetah's jump store, which reopened `jumps.bin`/`index.bin` on every
+  trie hop (`open(2)` alone was 53% of server CPU); with the handles held it is `putSigns` 2.2 s +
+  `commitGraph` 4.5 s = **6.7 s** into an empty corpus, and ~15 s into a 49-image one — the cost
+  grows with the corpus because the trie deepens. Any timing quoted here is against a submodule at
+  or after that fix; re-measure rather than trusting an older figure.
+- **Adaptive ingestion (`trainImageAdaptive`, `SIGN_TRAIN_ADAPTIVE`, default off).** With it on,
+  `SIGN_CONSTELLATIONS_PER_IMAGE` is a **ceiling**,
+  not a quota: signs are written in `SIGN_TRAIN_CHECK_EVERY` chunks and, between chunks, the image
+  being written is searched for `SIGN_TRAIN_PROBES` times against the corpus already stored. A run
+  continues only while a checkpoint beats the best so far by `SIGN_TRAIN_MIN_GAIN` in accuracy
+  (hit rate + margin over the best competitor) **or** in search effort. Three constraints hold it
+  together: the probes redraw their own constellations (never the trained ones) so a checkpoint
+  measures recall and not memorisation; their seeds are fixed per image so consecutive checkpoints
+  ask the *same* questions of a better-trained image, without which checkpoint-to-checkpoint noise
+  alone keeps a run alive; and a corpus below `SIGN_TRAIN_MIN_CORPUS` cannot measure
+  discriminability at all, so the ceiling is trained in full (`reason: 'corpus-too-small'`).
+  A fourth guard covers the failure the first three do not: the stop rule is inert until
+  `SIGN_TRAIN_STOP_MIN_HIT_RATE` of the probes actually find the image. On a near-duplicate corpus an
+  image's margin measures exactly −1 (it is not among the candidates at all) for its first ~1000
+  constellations and only then climbs — −1.00 at 1024, −0.34 at 1536, positive at 1792 — so a flat
+  early checkpoint is "not findable yet", not "trained enough", and reading it as convergence stops
+  the image at the bottom of its curve.
+  **What the loop actually found is the opposite of what it was built to find.** It was written to
+  cut training time; on `sample_images/` it almost never stops, because the checkpoint curves say
+  2048 constellations is at or below where these images become findable, not above it. Probing every
+  256 against 28 images: `020.jpg` is absent from the candidate list until 1024 and first reaches a
+  perfect hit rate at 1536; `022.jpg` reaches one probe in three at 1792; `021.jpg` never appears at
+  all through 1792. So `reason: 'exhausted'` is a **diagnosis** — "still improving when the budget
+  ran out" — and `SIGN_TRAIN_EXTEND_TO` (default `0`, off) is the knob that follows from it: it lets
+  a still-improving image continue past the nominal count to a hard cap, spending training time to
+  buy recall. With nothing converging the probes are pure overhead — paired over 35 images, identical
+  2048 constellations written, 21.1 s against 13.1 s per image (+62%), exactly its 3 checkpoints ×
+  3 probes × ~0.9 s — which is why `SIGN_TRAIN_ADAPTIVE` ships **off** and is enabled per run with
+  `--adaptive`.
+  Chunking needs two things from the store: `SignStore.readWhileIncomplete(imageId)` exempts exactly
+  the image being written from the completion filter — the marker itself still flips once, at the
+  end — and `commitGraph` is called with **cumulative** per-word counts, since an edge weight is a
+  function of how often the word was seen in the whole image, not in one chunk.
 - **Search.** Measure a batch of constellations → drop unknown and too-common words
   (`GRAPH_DEGREE`) → seed `GRAPH_RECALL` with the rarest survivors (`hops=1`, `decay=1`,
   `direction=out`, `type=sign`, batched at the server's 32-seed cap) → fold each hit's *per-seed*
@@ -211,9 +253,12 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
     `CHEETAH_DATA_DIR`, `CHEETAH_PAIR_INDEX_BYTES` and `CHEETAH_GRAPH_TERM_INDEX` are also
     read by the Go server process itself.
   - `sign`: operational knobs of the Cheetah-native sign pipeline (§10½) —
-    `SIGN_CONSTELLATIONS_PER_IMAGE` (600), `SIGN_POINT_COUNT` (5, must be odd),
+    `SIGN_CONSTELLATIONS_PER_IMAGE` (2048), `SIGN_POINT_COUNT` (5, must be odd),
     `SIGN_POINT_PATCH_REL` (0.004; `0` reads exactly one pixel), `SIGN_WORKING_MAX_SIDE` (1024),
-    `SIGN_WITH_CENTRE_POSITION` (false), and under `search`: `SIGN_SEARCH_BATCH` (12),
+    `SIGN_WITH_CENTRE_POSITION` (false); under `train` (adaptive ingestion, which makes
+    `SIGN_CONSTELLATIONS_PER_IMAGE` a ceiling rather than a quota): `SIGN_TRAIN_ADAPTIVE` (true),
+    `SIGN_TRAIN_CHECK_EVERY` (512), `SIGN_TRAIN_PROBES` (3), `SIGN_TRAIN_MIN_GAIN` (0.01),
+    `SIGN_TRAIN_MIN_CORPUS` (4), `SIGN_TRAIN_PROBE_MAX` (96); and under `search`: `SIGN_SEARCH_BATCH` (12),
     `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (240),
     `SIGN_SEARCH_STOPWORD_RATIO` (0.6), `SIGN_SEARCH_SEEDS_PER_ROUND` (96),
     `SIGN_SEARCH_LENGTH_SLOPE` (0), `SIGN_SEARCH_CONFIDENCE_MULTIPLE` (2),

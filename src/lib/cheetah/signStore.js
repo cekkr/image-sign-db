@@ -81,6 +81,34 @@ class SignStore {
         this.tfSaturation = Math.max(1, Number(options.tfSaturation) || TF_SATURATION);
         this.connected = false;
         this.imageRecords = new Map();
+        // Images the read path surfaces even though their record is still
+        // incomplete. See `readWhileIncomplete`.
+        this.incompleteReadable = new Set();
+    }
+
+    /**
+     * Let the read path see one image that has not been completed yet.
+     *
+     * The completion marker exists because Cheetah has no transaction spanning
+     * an image's writes, so a reader must ignore anything half-written. Adaptive
+     * training is the one caller for which that rule is wrong about itself: it
+     * interrogates the image it is in the middle of writing, to decide whether
+     * writing more of it is still buying anything.
+     *
+     * Scoped to an explicit id rather than an `includeIncomplete` flag, so a
+     * concurrent ingest's half-written image stays invisible — the exemption is
+     * "this image, which I am writing", not "incomplete images in general". The
+     * completion marker itself is untouched: it still flips once, at the end, so
+     * an interrupted run leaves nothing that any other reader will rank on.
+     */
+    readWhileIncomplete(imageId) {
+        this.incompleteReadable.add(imageId);
+        return () => this.incompleteReadable.delete(imageId);
+    }
+
+    /** Is this image's record readable — complete, or exempted above? */
+    isReadable(imageId, record) {
+        return Boolean(record?.complete) || this.incompleteReadable.has(imageId);
     }
 
     async withConnection(fn) {
@@ -211,14 +239,26 @@ class SignStore {
         return { imageId: resolvedId, record };
     }
 
-    async markComplete(imageId, extra = {}) {
+    /**
+     * Merge fields into an image record without touching its completion state.
+     *
+     * Adaptive training uses it to keep `constellations`/`words` truthful at
+     * every checkpoint: the probe searches read those counts back, and a record
+     * still claiming zero would misreport the corpus it is being measured
+     * against.
+     */
+    async updateImage(imageId, extra = {}, { verb = 'update' } = {}) {
         const key = keys.signImageKey(imageId);
         const current = this.imageRecords.get(imageId) || await getJson(this.pool, key);
-        if (!current) throw new CheetahError(`cannot complete missing sign image ${imageId}`);
-        const record = { ...current, ...extra, complete: true };
+        if (!current) throw new CheetahError(`cannot ${verb} missing sign image ${imageId}`);
+        const record = { ...current, ...extra };
         await putJson(this.pool, key, record, { upsert: true });
         this.imageRecords.set(imageId, record);
         return record;
+    }
+
+    async markComplete(imageId, extra = {}) {
+        return this.updateImage(imageId, { ...extra, complete: true }, { verb: 'complete' });
     }
 
     /** Every complete image record, keyed by image id. */
@@ -230,7 +270,7 @@ class SignStore {
         })) {
             const imageId = keys.parseImageId(item.key.slice(keys.NAMESPACES.signImage.length));
             const record = parseHydratedJson(item);
-            if (!includeIncomplete && !record.complete) continue;
+            if (!includeIncomplete && !this.isReadable(imageId, record)) continue;
             this.imageRecords.set(imageId, record);
             images.set(imageId, record);
         }
@@ -376,7 +416,7 @@ class SignStore {
                 continue;
             }
             const image = await this.getImage(imageId);
-            if (!image?.complete) continue;
+            if (!this.isReadable(imageId, image)) continue;
             const seeds = [];
             for (const [nodeId, activation] of association.sources) {
                 try {

@@ -364,6 +364,66 @@ refuses it rather than deleting the corpus it was about to query.
 query constellations are never the trained ones — and reports rank-1 accuracy for both the graph
 recall and the field rerank. Add `--report <file>` to also write the whole run as JSON.
 
+### Adaptive training (`--adaptive`, off by default)
+
+With `--adaptive`, `--constellations` becomes a ceiling rather than a quota: the trainer writes
+`SIGN_TRAIN_CHECK_EVERY` constellations at a time and, between chunks, runs three fresh searches for
+the image it is writing against the corpus already stored. When a checkpoint no longer beats the best
+one so far — in accuracy or in how much a search had to measure — the remaining chunks would be paid
+for nothing, and the run stops.
+
+**It is off by default because it was measured, not because it is unfinished.** It only pays when
+images converge before the ceiling; on `sample_images/` they do not. Paired over 35 images at the
+same corpus position it wrote the identical 2048 constellations and cost **21.1 s against 13.1 s per
+image (+62%)** — precisely the three checkpoints × three probes × ~0.9 s it spends measuring. Turn it
+on for a corpus whose images separate early, where that same measurement is what lets a flat image
+stop at 512 instead of 2048.
+
+Three things make the measurement mean what it says:
+
+- **The probes never replay the training draw.** They redraw from the image with their own seeds,
+  exactly as `evaluate` does, so a checkpoint measures recall rather than memorisation.
+- **The probe seeds are fixed per image**, so consecutive checkpoints re-ask the *same* three
+  questions of a better-trained image. Redrawing them each time makes the difference between two
+  checkpoints a mix of "we learned something" and "we asked something else", and the second term is
+  large enough on its own to keep a run going indefinitely.
+- **A corpus with fewer than `SIGN_TRAIN_MIN_CORPUS` images cannot answer the question at all** —
+  there is nothing to be confused with, every probe reports a perfect margin, and a stop rule reading
+  those would stop at the first checkpoint. Below that threshold the ceiling is trained in full and
+  the run reports `corpus-too-small`.
+- **The stop rule may only fire from a state of success** (`SIGN_TRAIN_STOP_MIN_HIT_RATE`). Until
+  every probe finds the image, a flat checkpoint means it is not retrievable *yet*, which is the
+  opposite of "trained enough". Measured on a near-duplicate corpus, an image's margin sits at
+  exactly −1 — absent from the candidate list — for its first ~1000 constellations and only then
+  climbs (−1.00 at 1024, −0.34 at 1536, positive at 1792). Without this gate the run stopped those
+  images at 1024, at the bottom of the curve, and called it convergence.
+
+Each image ends with one of three reasons: `converged` (the stop rule fired), `exhausted` (it was
+still improving when it hit the ceiling), or `corpus-too-small`.
+
+#### What it measured on `sample_images/`, which was not what it was built to find
+
+The loop was written to cut training time by stopping early. On this corpus it almost never stops,
+and the checkpoint curves say that is the correct answer rather than a broken rule: **2048
+constellations is at or below the point where these images become reliably findable, not above it.**
+Probing every 256 against a 28-image corpus:
+
+| Image | 256–1024 | 1280 | 1536 | 1792 |
+| --- | --- | --- | --- | --- |
+| `020.jpg` | never in the candidate list | margin −0.11 | **first perfect hit rate** | margin +0.14 |
+| `022.jpg` | never in the candidate list | margin −0.16 | margin −0.09 | 1 probe of 3 hits |
+| `021.jpg` | never in the candidate list | — | — | **still never in the candidate list** |
+
+So the useful output here is not a saving, it is a **diagnosis**: `exhausted` means "this image was
+still getting better when the budget ran out", and an image like `021.jpg` is telling you it is not
+retrievable at any density you have tried. That is what `SIGN_TRAIN_EXTEND_TO` is for — it lets an
+image that is still climbing keep going past the nominal count, up to a hard cap. It is **off by
+default** because it spends training time to buy recall, which is a decision to take deliberately.
+
+The cost of the loop is honest too: with nothing converging, the probes are pure overhead — three
+searches per checkpoint, at `SIGN_TRAIN_PROBE_MAX` constellations each. `--no-adaptive` turns the
+whole thing off and writes the flat count.
+
 ### Benchmarking
 
 `./benchmark.sh` trains, validates, and records the scores. Each *(training density × search
@@ -395,11 +455,19 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SIGN_CONSTELLATIONS_PER_IMAGE` | `600` | Signs drawn per image at training time. |
+| `SIGN_CONSTELLATIONS_PER_IMAGE` | `2048` | Signs drawn per image at training time. A **ceiling** when adaptive training is on. |
 | `SIGN_POINT_COUNT` | `5` | Points per constellation. Must be odd. |
 | `SIGN_POINT_PATCH_REL` | `0.004` | Side of the square averaged per point, as a fraction of the shorter side. `0` reads exactly one pixel. |
 | `SIGN_WORKING_MAX_SIDE` | `1024` | Longest side the sampler decodes to. |
 | `SIGN_WITH_CENTRE_POSITION` | `false` | Record where the constellation centre sits in the frame. |
+| `SIGN_TRAIN_ADAPTIVE` | `false` | Train in chunks and stop when more constellations stop improving recall. Off because on `sample_images/` it costs +62% and saves nothing — see below. `--adaptive` / `--no-adaptive` override it per run. |
+| `SIGN_TRAIN_CHECK_EVERY` | `512` | Constellations between two self-probes. |
+| `SIGN_TRAIN_PROBES` | `3` | Searches per checkpoint. Their seeds are fixed per image, so consecutive checkpoints re-ask the same questions. |
+| `SIGN_TRAIN_MIN_GAIN` | `0.01` | A checkpoint must beat the best so far by this much, in accuracy **or** in search effort, or the run stops. |
+| `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of the probes finds the image. Below it, a flat checkpoint means "not findable yet", not "trained enough". |
+| `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so the ceiling is trained in full. |
+| `SIGN_TRAIN_PROBE_MAX` | `96` | Ceiling on one probe search. Probes also run with the reranker off. |
+| `SIGN_TRAIN_EXTEND_TO` | `0` (off) | How far an image still improving at `SIGN_CONSTELLATIONS_PER_IMAGE` may keep training. Buys recall with training time. |
 | `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
 | `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |
 | `SIGN_SEARCH_MAX_CONSTELLATIONS` | `240` | Ceiling on one search. |

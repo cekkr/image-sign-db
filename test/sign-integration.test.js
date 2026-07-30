@@ -24,7 +24,7 @@ const { startServer } = require('../src/lib/cheetah/server');
 const { SignStore } = require('../src/lib/cheetah/signStore');
 const keys = require('../src/lib/cheetah/keys');
 const { scanAll } = require('../src/lib/cheetah/kv');
-const { searchImage, trainImage } = require('../src/signPipeline');
+const { searchImage, trainImage, trainImageAdaptive } = require('../src/signPipeline');
 const { mulberry32 } = require('../src/lib/sign/rng');
 
 function freePort() {
@@ -267,5 +267,126 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         const listed = await store.listImages();
         assert.equal(listed.has(imageId), false);
         assert.equal((await store.listImages({ includeIncomplete: true })).has(imageId), true);
+    });
+
+    // The exemption adaptive training needs, and its limits: one named image
+    // becomes readable, the exemption is revocable, and it never widens to other
+    // half-written images.
+    await t.test('readWhileIncomplete exempts exactly one image', async () => {
+        const mine = await store.putImage({ filename: 'in-progress.png' });
+        const other = await store.putImage({ filename: 'someone-elses.png' });
+
+        const release = store.readWhileIncomplete(mine.imageId);
+        const during = await store.listImages();
+        assert.equal(during.has(mine.imageId), true, 'the exempted image must be readable');
+        assert.equal(during.has(other.imageId), false, 'the exemption must not widen');
+
+        release();
+        assert.equal((await store.listImages()).has(mine.imageId), false);
+    });
+
+    await t.test('adaptive training writes in chunks and never exceeds its ceiling', async () => {
+        const file = files[0];
+        // The callbacks are passed on purpose: `onProgress?.(…)` does not
+        // evaluate its argument when no callback is given, so a run without them
+        // cannot catch a mistake in what they report.
+        const progress = [];
+        const checkpointsSeen = [];
+        const result = await trainImageAdaptive(store, file, {
+            count: 400,
+            checkEvery: 100,
+            probes: 2,
+            minCorpus: 1,
+            probeMaxConstellations: 48,
+            seed: 'adaptive',
+            onProgress: (event) => progress.push(event),
+            onCheckpoint: (event) => checkpointsSeen.push(event),
+        });
+
+        const chunks = progress.filter((event) => event.stage === 'chunk');
+        const completed = progress.filter((event) => event.stage === 'complete');
+        assert.ok(chunks.length >= 1, 'a chunked run must report its chunks');
+        assert.equal(completed.length, 1);
+        assert.equal(completed[0].edges, result.edges);
+        assert.equal(completed[0].imageId, result.imageId);
+        assert.equal(chunks[chunks.length - 1].signs, result.signs);
+        assert.equal(checkpointsSeen.length, result.checkpoints.length);
+
+        assert.ok(result.signs > 0 && result.signs <= 400, `wrote ${result.signs} signs`);
+        assert.equal(result.signs % 100, 0, 'a run stops on a chunk boundary');
+        assert.equal(result.record.complete, true, 'the image must end up complete');
+        assert.equal(result.record.constellations, result.signs);
+        assert.equal(result.edges, result.words, 'one edge per distinct word');
+        assert.ok(result.edgeWrites >= result.edges, 'a republished word costs an extra write');
+        assert.ok(['converged', 'exhausted'].includes(result.reason), result.reason);
+
+        // Every checkpoint is a real measurement of a real corpus.
+        for (const checkpoint of result.checkpoints) {
+            assert.ok(checkpoint.constellations > 0 && checkpoint.constellations < 400);
+            assert.ok(checkpoint.hitRate >= 0 && checkpoint.hitRate <= 1);
+            assert.ok(checkpoint.margin >= -1 && checkpoint.margin <= 1);
+            assert.equal(checkpoint.probes, 2);
+        }
+
+        // The constellations really are addressable, all the way to the last
+        // chunk — a chunked write that mis-tracked its ordinal would leave holes.
+        const stored = await scanAll(store.pool, keys.signConstellationPrefix(result.imageId));
+        assert.equal(stored.length, result.signs);
+        assert.ok(await store.getSign(result.imageId, result.signs - 1) !== null);
+    });
+
+    // `extendTo` is off by default, so the default path must never write more
+    // than it was asked for; when it is on, a still-improving image may.
+    await t.test('extendTo is inert by default and raises the ceiling when set', async () => {
+        const base = await trainImageAdaptive(store, files[2], {
+            count: 200,
+            checkEvery: 100,
+            probes: 1,
+            minCorpus: 1,
+            probeMaxConstellations: 36,
+            seed: 'no-extend',
+        });
+        assert.equal(base.ceiling, 200, 'the default ceiling is the requested count');
+        assert.ok(base.signs <= 200);
+        assert.equal(base.extended, false);
+
+        const extended = await trainImageAdaptive(store, files[1], {
+            count: 100,
+            extendTo: 300,
+            checkEvery: 100,
+            probes: 1,
+            // Never satisfied, so the run always has a reason to keep going and
+            // the ceiling is what has to stop it.
+            minGain: -Infinity,
+            stopMinHitRate: 2,
+            minCorpus: 1,
+            probeMaxConstellations: 36,
+            seed: 'extend',
+        });
+        assert.equal(extended.ceiling, 300);
+        assert.equal(extended.signs, 300, 'a still-improving image should use the extension');
+        assert.equal(extended.extended, true);
+        assert.equal(extended.record.constellations, 300);
+    });
+
+    // A corpus with nothing to be confused with cannot measure discriminability,
+    // so the stop rule must not fire on it.
+    await t.test('adaptive training writes the full ceiling on a corpus too small to probe', async () => {
+        const solo = new SignStore({ port, database: 'sign_db_solo_test' });
+        try {
+            await solo.connect();
+            const result = await trainImageAdaptive(solo, files[0], {
+                count: 200,
+                checkEvery: 50,
+                minCorpus: 4,
+                seed: 'solo',
+            });
+            assert.equal(result.reason, 'corpus-too-small');
+            assert.equal(result.signs, 200);
+            assert.equal(result.checkpoints.length, 0);
+            assert.equal(result.record.training, 'fixed');
+        } finally {
+            await solo.close();
+        }
     });
 });

@@ -16,7 +16,7 @@ const settings = require('./settings');
 const { SIGN_LAYOUT_VERSION, WORD_CARDINALITY } = require('./lib/sign/constants');
 const { createSignStore } = require('./lib/cheetah/signStore');
 const { startServer } = require('./lib/cheetah/server');
-const { searchImage, trainImage } = require('./signPipeline');
+const { searchImage, trainImage, trainImageAdaptive } = require('./signPipeline');
 
 const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.bmp', '.gif']);
 
@@ -80,6 +80,11 @@ async function withStore(flags, run) {
 
 async function commandTrain(store, targets, flags) {
     const count = numberFlag(flags, 'constellations', settings.sign.constellationsPerImage);
+    // `--adaptive` / `--no-adaptive` both override the configured default, so a
+    // run can go either way without touching the environment.
+    const adaptive = flags.get('no-adaptive') === 'true'
+        ? false
+        : (flags.get('adaptive') === 'true' || settings.sign.train.adaptive);
     const images = targets.flatMap(collectImages);
     if (images.length === 0) throw new Error('no images found');
 
@@ -93,30 +98,47 @@ async function commandTrain(store, targets, flags) {
         );
         await store.reset();
     }
-    console.log(`Training ${images.length} image(s) with ${count} constellations each`);
+    console.log(
+        adaptive
+            ? `Training ${images.length} image(s), up to ${count} constellations each, ` +
+              `probing every ${settings.sign.train.checkEvery}`
+            : `Training ${images.length} image(s) with ${count} constellations each`
+    );
 
     const startedAll = Date.now();
     const results = [];
     for (const image of images) {
         const started = Date.now();
-        const result = await trainImage(store, image, { count });
+        const result = adaptive
+            ? await trainImageAdaptive(store, image, { count })
+            : await trainImage(store, image, { count });
         const seconds = (Date.now() - started) / 1000;
         results.push({ ...result, seconds });
         console.log(
             `  ✓ ${result.filename}  ${result.signs} signs, ${result.words} words, ` +
-            `${result.edges} edges  (${seconds.toFixed(1)}s)`
+            `${result.edges} edges  (${seconds.toFixed(1)}s)` +
+            (result.reason ? `  [${result.reason}]` : '')
         );
     }
+
+    const signs = results.reduce((sum, result) => sum + result.signs, 0);
     return {
         constellationsPerImage: count,
+        adaptive,
         images: results.length,
         seconds: (Date.now() - startedAll) / 1000,
+        // What adaptive training actually bought: the share of the ceiling it
+        // did not need to write.
+        meanConstellations: signs / results.length,
+        constellationsSaved: adaptive ? 1 - signs / (count * results.length) : 0,
         perImage: results.map((result) => ({
             filename: result.filename,
             signs: result.signs,
             words: result.words,
             edges: result.edges,
             seconds: result.seconds,
+            reason: result.reason ?? null,
+            checkpoints: result.checkpoints ?? null,
         })),
     };
 }
@@ -376,7 +398,14 @@ async function main() {
                 '                        (default from CHEETAH_DATABASE; --database is an alias)',
                 '  --reset               training only: drop the database first, so the run',
                 '                        establishes the corpus instead of adding to it',
-                '  --constellations <n>  signs per image at training time',
+                '  --constellations <n>  signs per image at training time (a ceiling when',
+                '                        adaptive training is on)',
+                '  --adaptive            train in chunks and stop when more constellations stop',
+                '                        improving recall. Off by default: it only pays when images',
+                '                        converge before the ceiling, and on sample_images/ they do',
+                '                        not (+62% for the same output). SIGN_TRAIN_EXTEND_TO lets a',
+                '                        still-improving image go past the ceiling instead.',
+                '  --no-adaptive         force the flat count when the default is adaptive',
                 '  --max <n>             ceiling on constellations measured per search',
                 '  --spawn               start the vendored cheetah-server for this command',
                 '  --data-dir <path>     data directory for --spawn',

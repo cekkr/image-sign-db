@@ -89,6 +89,269 @@ async function trainImage(store, imagePath, {
 }
 
 /**
+ * Ingest one image, stopping as soon as more constellations stop paying.
+ *
+ * The fixed-count trainer above writes the same density onto every image, which
+ * is the wrong shape for two reasons that pull in opposite directions: a busy
+ * photograph is still gaining discriminability at 2048 signs, and a flat one was
+ * done by 512 — but both cost the same. This trains in chunks and, between them,
+ * *asks the corpus the question the corpus will actually be asked*: three fresh
+ * searches for this image, against every image already stored. Once a checkpoint
+ * stops beating the best one so far, the remaining chunks are bought and paid
+ * for nothing, so the run stops.
+ *
+ * Four properties this depends on, none of them incidental:
+ *
+ *   - **The probes never reuse trained constellations.** They redraw from the
+ *     image with their own seeds, exactly as `evaluate` does. A checkpoint that
+ *     replayed the training draw would measure memorisation and would always say
+ *     "keep going".
+ *   - **The image is readable but not complete** while it is being probed
+ *     (`readWhileIncomplete`). It has to be visible to its own search or the
+ *     probe measures nothing; it must not be *complete*, or an interrupted run
+ *     would leave a half-trained image that every other reader trusts.
+ *   - **There must be something to be confused with.** Discriminability is not
+ *     defined against an empty corpus: with fewer than `minCorpus` images
+ *     stored, every probe trivially reports a perfect margin and the run would
+ *     stop at the first checkpoint. Below that threshold this trains the full
+ *     count and says so (`reason: 'corpus-too-small'`).
+ *   - **The stop rule only fires from a state of success** (`stopMinHitRate`).
+ *     A flat checkpoint on an image the probes cannot even find yet means
+ *     "not there yet", not "done"; see the comment on the rule itself for the
+ *     measurement that makes this the difference between working and useless.
+ */
+async function trainImageAdaptive(store, imagePath, {
+    count = settings.sign.constellationsPerImage,
+    seed = null,
+    onProgress = null,
+    onCheckpoint = null,
+    checkEvery = settings.sign.train.checkEvery,
+    probes = settings.sign.train.probes,
+    minGain = settings.sign.train.minGain,
+    minCorpus = settings.sign.train.minCorpus,
+    probeMaxConstellations = settings.sign.train.probeMaxConstellations,
+    stopMinHitRate = settings.sign.train.stopMinHitRate,
+    extendTo = settings.sign.train.extendTo,
+    ...overrides
+} = {}) {
+    const options = samplerOptions(overrides);
+    const filename = path.basename(imagePath);
+    const { rawPixels, meta, source } = await loadImagePixels(imagePath, options);
+    const random = createRandom(seed);
+
+    const corpusBefore = await store.listImages();
+    const canProbe = corpusBefore.size >= minCorpus && checkEvery > 0 && probes > 0;
+
+    const { imageId } = await store.putImage({
+        filename,
+        width: source.width,
+        height: source.height,
+    });
+    const releaseProbeAccess = store.readWhileIncomplete(imageId);
+
+    // Cumulative across chunks: an edge weight is a function of how often the
+    // word was observed in the *whole* image, so a chunk that re-observes a word
+    // must republish the running total, not its own count.
+    const cumulativeWords = new Map();
+    const checkpoints = [];
+    let written = 0;
+    let signCount = 0;
+    let edgeWrites = 0;
+    let best = null;
+    let reason = canProbe ? 'exhausted' : 'corpus-too-small';
+
+    // `count` is where an image stops being *asked* to improve; `extendTo` is
+    // how far it may go when it is still visibly improving there. They are
+    // separate because the measurement says they should be: on this corpus most
+    // images are still climbing steeply at the ceiling — one only became
+    // findable at all at 1536 of 2048 — so a run that stops at `count` is not
+    // stopping because it is done. Off by default (`extendTo: 0`), because
+    // turning it on trades training time for recall and that is a decision, not
+    // a default.
+    const ceiling = canProbe ? Math.max(count, extendTo || 0) : count;
+
+    try {
+        const chunkSize = canProbe ? Math.min(checkEvery, count) : count;
+        while (signCount < ceiling) {
+            const wanted = Math.min(chunkSize, ceiling - signCount);
+            const signs = sampleSigns({ rawPixels, meta, count: wanted, random, ...options });
+            if (signs.length === 0) {
+                if (signCount === 0) {
+                    throw new Error(
+                        `no constellation could be placed on ${filename} (${meta.width}x${meta.height})`
+                    );
+                }
+                break;
+            }
+
+            const chunk = await store.putSigns(imageId, signs, { startOrdinal: signCount });
+            const touched = new Map();
+            for (const [word, observations] of chunk.wordCounts) {
+                const total = (cumulativeWords.get(word) || 0) + observations;
+                cumulativeWords.set(word, total);
+                touched.set(word, total);
+            }
+            const published = await store.commitGraph(imageId, filename, touched);
+
+            signCount += signs.length;
+            written += chunk.written;
+            edgeWrites += published.edges;
+            await store.updateImage(imageId, {
+                constellations: signCount,
+                words: cumulativeWords.size,
+            });
+            onProgress?.({
+                stage: 'chunk',
+                filename,
+                signs: signCount,
+                words: cumulativeWords.size,
+            });
+
+            if (!canProbe || signCount >= ceiling) continue;
+
+            // The probe seeds do not depend on how much has been written, so
+            // consecutive checkpoints re-ask the *same* three questions of a
+            // better-trained image. Redrawing them each time would make the
+            // difference between two checkpoints a mix of "we learned something"
+            // and "we asked something else", and the second term is large enough
+            // to keep a run alive on noise alone.
+            const quality = await probeQuality(store, imagePath, {
+                imageId,
+                probes,
+                seedPrefix: `probe:${filename}`,
+                maxConstellations: probeMaxConstellations,
+            });
+            const checkpoint = {
+                constellations: signCount,
+                ...quality,
+                accuracyGain: best ? quality.accuracy - best.accuracy : null,
+                // Search effort is reported as a *fall* in the constellations a
+                // search needed, so both numbers mean "improvement" when positive.
+                effortGain: best ? (best.effort - quality.effort) : null,
+            };
+            checkpoints.push(checkpoint);
+            onCheckpoint?.({ filename, ...checkpoint });
+
+            // "Leave it as it is" presupposes that it is already good. Until
+            // every probe finds the image, a flat checkpoint means the image is
+            // not yet retrievable at all — not that more constellations would
+            // not help — and stopping there is the one unrecoverable mistake
+            // this loop can make.
+            //
+            // This is not hypothetical. Measured on a corpus of near-duplicates,
+            // the margin sits at exactly -1 (the image does not appear among the
+            // candidates at all) for the first ~1000 constellations and only then
+            // climbs: -1.00 at 1024, -0.34 at 1536, +0.01 with two probes of
+            // three hitting at 1792. A rule that only compared consecutive
+            // checkpoints stopped those images at 1024, at the bottom of the
+            // curve, and called it convergence.
+            if (best && quality.hitRate >= stopMinHitRate) {
+                // Measured against the best checkpoint so far, not the previous
+                // one: comparing only with the previous lets a run that dipped
+                // and recovered read its recovery as progress and keep going.
+                const gained = checkpoint.accuracyGain >= minGain || checkpoint.effortGain >= minGain;
+                if (!gained) {
+                    reason = 'converged';
+                    break;
+                }
+            }
+            best = {
+                accuracy: Math.max(quality.accuracy, best?.accuracy ?? -Infinity),
+                effort: Math.min(quality.effort, best?.effort ?? Infinity),
+            };
+        }
+    } finally {
+        releaseProbeAccess();
+    }
+
+    const record = await store.markComplete(imageId, {
+        constellations: signCount,
+        words: cumulativeWords.size,
+        working_width: meta.width,
+        working_height: meta.height,
+        training: canProbe ? 'adaptive' : 'fixed',
+    });
+    onProgress?.({ stage: 'complete', filename, imageId, edges: cumulativeWords.size });
+
+    return {
+        imageId,
+        filename,
+        signs: signCount,
+        words: cumulativeWords.size,
+        // One edge per distinct word, as in the one-shot trainer. `edgeWrites`
+        // is the larger number: a word observed in more than one chunk has its
+        // edge republished with the new running total each time.
+        edges: cumulativeWords.size,
+        edgeWrites,
+        written,
+        record,
+        reason,
+        checkpoints,
+        // What the run would have written without the stop rule, so a caller can
+        // report the saving without re-deriving it from settings.
+        budget: count,
+        ceiling,
+        extended: signCount > count,
+    };
+}
+
+/**
+ * How well the corpus currently tells this image apart, from `probes` fresh
+ * draws off the image itself.
+ *
+ * Two numbers come back, because "is it improving?" has two answers that do not
+ * move together:
+ *
+ *   - **`accuracy`** — hit rate plus mean margin, in `[-1, 2]`. Hit rate alone
+ *     saturates at 1 almost immediately and then reports nothing; the margin
+ *     `(mine - best other) / (mine + best other)` keeps moving after that, which
+ *     is what makes "still improving" measurable on a corpus of near-duplicates
+ *     where the runner-up is a crop of the same photograph.
+ *   - **`effort`** — the share of its ceiling a search had to spend before it
+ *     was confident. More training makes a search *cheaper*, and that is a real
+ *     gain even in a checkpoint where the ranking did not change.
+ *
+ * The probes deliberately run with the reranker off: it hydrates candidate signs
+ * to compare colour fields, costs more than the rest of the search together, and
+ * never reorders the ranking these numbers are read from.
+ */
+async function probeQuality(store, imagePath, {
+    imageId,
+    probes,
+    seedPrefix,
+    maxConstellations,
+}) {
+    const runs = [];
+    for (let index = 0; index < probes; index += 1) {
+        const result = await searchImage(store, imagePath, {
+            maxConstellations,
+            rerank: false,
+            seed: `${seedPrefix}:${index}`,
+        });
+        const mine = result.candidates.find((candidate) => candidate.imageId === imageId);
+        const other = result.candidates.find((candidate) => candidate.imageId !== imageId);
+        const mineMass = mine?.mass ?? 0;
+        const otherMass = other?.mass ?? 0;
+        const total = mineMass + otherMass;
+        runs.push({
+            hit: result.candidates[0]?.imageId === imageId ? 1 : 0,
+            margin: total > 0 ? (mineMass - otherMass) / total : 0,
+            effort: result.constellations / Math.max(1, maxConstellations),
+        });
+    }
+    const average = (key) => runs.reduce((sum, run) => sum + run[key], 0) / runs.length;
+    const hitRate = average('hit');
+    const margin = average('margin');
+    return {
+        probes: runs.length,
+        hitRate,
+        margin,
+        accuracy: hitRate + margin,
+        effort: average('effort'),
+    };
+}
+
+/**
  * Inverse document frequency of a word: how surprising it is that an image
  * produced it. A word every image produces separates nothing and must not
  * count as much as one only two images ever produced.
@@ -394,9 +657,11 @@ async function searchImage(store, imagePath, {
 module.exports = {
     Evidence,
     inverseDocumentFrequency,
+    probeQuality,
     rerankWithField,
     samplerOptions,
     searchImage,
     selectSeeds,
     trainImage,
+    trainImageAdaptive,
 };

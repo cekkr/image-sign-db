@@ -1,5 +1,10 @@
 // Centralised configuration for editable project settings.
-require('dotenv').config();
+//
+// `quiet` because dotenv v17 prints a banner to stdout on load, and this module
+// is required by one-liners whose stdout is captured: benchmark.sh reads the
+// search ceiling with `node -e '…process.stdout.write(…)'`, and the banner ended
+// up inside the run label and from there into benchmarks/scores.csv.
+require('dotenv').config({ quiet: true });
 
 function getNumber(envKey, fallback) {
   const raw = process.env[envKey];
@@ -90,7 +95,7 @@ const cheetahSettings = {
 // env var that repartitions the vocabulary would silently invalidate every
 // stored graph edge.
 const signSettings = {
-  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 2400),
+  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 2048),
   pointCount: getNumber('SIGN_POINT_COUNT', 5),
   pointPatchRelative: getNumber('SIGN_POINT_PATCH_REL', 0.004),
   workingMaxSide: getNumber('SIGN_WORKING_MAX_SIDE', 1024),
@@ -98,6 +103,42 @@ const signSettings = {
   // the same subject at another aspect ratio, because the half-diagonal unit
   // rescales differently per axis.
   withCentrePosition: getBoolean('SIGN_WITH_CENTRE_POSITION', false),
+  // Adaptive ingestion: train in chunks and stop when more constellations stop
+  // buying discriminability (src/signPipeline.js → trainImageAdaptive).
+  // `constellationsPerImage` becomes a ceiling rather than a quota.
+  train: {
+    // **Off by default, on measurement, not on principle.** The loop only pays
+    // when images converge before the ceiling, and on sample_images/ they do
+    // not: paired over 35 images it wrote the identical 2 048 constellations and
+    // cost 21.1 s against 13.1 s per image (+62%), which is exactly the 3
+    // checkpoints x 3 probes x ~0.9 s it spends measuring. Turn it on with
+    // `--adaptive` for a corpus whose images separate early, where the same
+    // measurement is what lets a flat image stop at 512.
+    adaptive: getBoolean('SIGN_TRAIN_ADAPTIVE', false),
+    // Constellations between two self-probes. Small enough to stop early on a
+    // flat image, large enough that a checkpoint costs less than the chunk.
+    checkEvery: getNumber('SIGN_TRAIN_CHECK_EVERY', 512),
+    probes: getNumber('SIGN_TRAIN_PROBES', 3),
+    // Improvement below this in *both* accuracy and search effort ends the run.
+    minGain: getNumber('SIGN_TRAIN_MIN_GAIN', 0.01),
+    // The stop rule may only fire once this share of the probes finds the image.
+    // A flat checkpoint below it means "not findable yet", which is the opposite
+    // of "trained enough": on a near-duplicate corpus an image can sit at the
+    // floor for a thousand constellations and then climb.
+    stopMinHitRate: getNumber('SIGN_TRAIN_STOP_MIN_HIT_RATE', 1),
+    // Below this many stored images there is nothing to be confused with, so a
+    // probe cannot measure discriminability and the ceiling is trained in full.
+    minCorpus: getNumber('SIGN_TRAIN_MIN_CORPUS', 4),
+    // A probe is a cost, not a deliverable: it runs to a lower ceiling than a
+    // real search and with the reranker off.
+    probeMaxConstellations: getNumber('SIGN_TRAIN_PROBE_MAX', 96),
+    // How far an image that is *still improving* at `constellationsPerImage`
+    // may keep going. `0` disables it, which is the shipped default: extending
+    // buys recall with training time and that is a decision, not a default.
+    // Measured on sample_images/, most images are still climbing steeply at
+    // 2048, so this is the knob the data actually asks for — see README.
+    extendTo: getNumber('SIGN_TRAIN_EXTEND_TO', 0),
+  },
   search: {
     batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
     minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 24),
@@ -141,7 +182,7 @@ const signSettings = {
 
 const correlationSettings = {
   similarityThreshold: getNumber('CORRELATION_SIMILARITY_THRESHOLD', 0.2),
-  maxCandidateSample: getNumber('CORRELATION_MAX_CANDIDATE_SAMPLE', 256),
+  maxCandidateSample: getNumber('CORRELATION_MAX_CANDIDATE_SAMPLE', 512),
   minAffinity: getNumber('CORRELATION_MIN_AFFINITY', 0.45),
   minCohesion: getNumber(
     'CORRELATION_MIN_COHESION',
