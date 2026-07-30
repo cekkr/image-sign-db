@@ -379,6 +379,36 @@ class CheetahPool {
         }
     }
 
+    /**
+     * Send one line on **every** connection, sequentially.
+     *
+     * For commands that change a connection's own server-side state rather than
+     * the data. The case this exists for is `RESET_DB`: database selection is
+     * per-connection, `Engine.ResetDatabase` closes that database and drops it
+     * from the engine's registry, and `server.go` re-selects it only for the
+     * socket that issued the command. The other connections keep a pointer to a
+     * closed `Database` whose per-database `FileManager` has been shut down.
+     *
+     * Broadcasting `DATABASE <name>` after a reset re-points them at the live
+     * database. This is reasoning from the server's model, not from a reproduced
+     * failure — stale connections are hard to catch in a test because
+     * `ManagedFile.acquireHandle` opens with `O_CREATE`, so a read on one lands
+     * on the same path and answers plausibly rather than erroring.
+     *
+     * The caller must have the pool quiesced: this makes no attempt to order
+     * itself against in-flight work, because there is no correct order for
+     * "the database you were using no longer exists".
+     */
+    async broadcast(line) {
+        if (this.closing) throw new CheetahError('cheetah pool is closed', { command: line });
+        const responses = [];
+        for (const client of this.clients) {
+            await client.connect();
+            responses.push(await client.send(line));
+        }
+        return responses;
+    }
+
     async close() {
         this.closing = true;
         for (const waiter of this.leaseQueue.splice(0)) {

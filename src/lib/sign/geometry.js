@@ -215,6 +215,45 @@ function localFromLinks(links, centreIndex) {
     return local;
 }
 
+/**
+ * Re-express a local frame so that one triple of points sits in a canonical
+ * place: its middle point at the origin, its first hop along +x.
+ *
+ * This is what makes two independently sampled constellations comparable at
+ * all. Each one's own frame is centred on *its* seed pixel, so a query's points
+ * land wherever its own draw put them — nowhere near the candidate's
+ * observations — and a colour field evaluated across the two is answering from
+ * pure extrapolation. Measured: reordering candidates that way scored at or
+ * below chance.
+ *
+ * Aligning on the triple whose vocabulary word matched fixes that. The matched
+ * triple agrees on hop-length band and turn angle by construction, so after
+ * alignment those three points nearly coincide in both frames — and the points
+ * *outside* the triple, which is where the two signs are free to disagree, are
+ * then measured against a field that actually has observations under them.
+ *
+ * There is no reflection ambiguity to resolve: the turn angle is signed and is
+ * part of the word, so a mirrored triple is a different word.
+ */
+function alignToTriple(local, tripleIndex) {
+    if (!Number.isInteger(tripleIndex) || tripleIndex < 0 || tripleIndex + 2 >= local.length) {
+        throw new RangeError(
+            `triple index ${tripleIndex} needs points ${tripleIndex}..${tripleIndex + 2} of ${local.length}`
+        );
+    }
+    const anchor = local[tripleIndex + 1];
+    const from = local[tripleIndex];
+    const theta = Math.atan2(anchor.y - from.y, anchor.x - from.x);
+    const cos = Math.cos(theta);
+    const sin = Math.sin(theta);
+    return local.map((point) => {
+        const dx = point.x - anchor.x;
+        const dy = point.y - anchor.y;
+        // Rotation by -theta, so the first hop of the triple ends up along +x.
+        return { x: dx * cos + dy * sin, y: -dx * sin + dy * cos };
+    });
+}
+
 /** Chain-forward hop lengths and bearings derived from a local frame. */
 function edgesFromLocal(local) {
     const edges = [];
@@ -228,6 +267,7 @@ function edgesFromLocal(local) {
 
 module.exports = {
     TWO_PI,
+    alignToTriple,
     assertPointCount,
     edgesFromLocal,
     hopFrom,

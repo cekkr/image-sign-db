@@ -106,14 +106,34 @@ const signSettings = {
     // is not worth a recall seed.
     stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 0.6),
     seedsPerRound: getNumber('SIGN_SEARCH_SEEDS_PER_ROUND', 96),
-    // "Confidence" is the leader's share of the mass across every candidate the
-    // recall has surfaced, so it does not approach 1 the way a posterior over a
-    // closed set would — on an 11-image corpus the true match leads with
-    // 15-28%. These two defaults were measured, not guessed: at 0.25/1.5 the
-    // sample_images run keeps 11/11 rank-1 while five of eleven searches stop
-    // after 24-36 constellations instead of running to the ceiling.
-    confidenceTarget: getNumber('SIGN_SEARCH_CONFIDENCE', 0.25),
-    separationTarget: getNumber('SIGN_SEARCH_SEPARATION', 1.5),
+    // Pivoted length normalisation: 0 ignores how many words an image
+    // published, 1 divides its evidence in full proportion to them.
+    //
+    // The default is 0 because correcting for length made things monotonically
+    // worse, which was not the expected result. Measured on a 20-image corpus,
+    // rank-1 went 80% (0), 80% (0.25), 60% (0.5), 50% (0.75), 35% (1.0). Idf
+    // weighting already handles selectivity, and an image with few distinct
+    // words already accumulates less raw mass because it has fewer words to be
+    // matched on — dividing again double-counts that and let four flat images
+    // (261-280 words against a corpus mean near 1300) win other images'
+    // searches. The knob stays for a corpus whose vocabulary sizes are uniform.
+    lengthSlope: getNumber('SIGN_SEARCH_LENGTH_SLOPE', 0),
+    // How far ahead of an even split the leader must be before a search stops,
+    // as a **multiple of the uniform share** `1/corpus`.
+    //
+    // This is deliberately not an absolute share, which is what it used to be
+    // and which cannot work: the leader's share of the mass falls as the corpus
+    // grows because more candidates divide it. The same searches that led with
+    // 15-28% on an 11-image corpus lead with ~10% on a 20-image one, so a fixed
+    // 0.25 stopped firing entirely the moment the corpus doubled. Measured as a
+    // multiple, both corpora sit near 2.1-2.4x uniform.
+    confidenceMultiple: getNumber('SIGN_SEARCH_CONFIDENCE_MULTIPLE', 2),
+    // The safety brake, and the criterion that actually carries the signal: how
+    // far ahead of the runner-up the leader is. It is why a corpus containing
+    // near-duplicates keeps measuring — on sample_images the true match often
+    // leads the second place by only ~1.1, and stopping there would be stopping
+    // on a coin flip.
+    separationTarget: getNumber('SIGN_SEARCH_SEPARATION', 1.35),
     rerankTop: getNumber('SIGN_SEARCH_RERANK_TOP', 5),
     rerankSigns: getNumber('SIGN_SEARCH_RERANK_SIGNS', 12),
   },

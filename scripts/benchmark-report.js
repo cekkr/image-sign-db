@@ -47,6 +47,9 @@ const COLUMNS = [
     ['mean_search_seconds', (report) => report.scores.meanSearchSeconds],
     ['train_seconds_per_image', (report) => report.scores.trainSecondsPerImage],
     ['mean_words_per_image', (report) => report.scores.meanWordsPerImage],
+    // Appended, not inserted: scores.csv is added to across sessions, so a new
+    // column in the middle would shift every historical row.
+    ['rank1_triple_features', (report) => report.scores.rank1ByTripleFeatures],
 ];
 
 function readReport(file) {
@@ -64,11 +67,97 @@ function csvField(value) {
     return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+/** Split one CSV line, honouring the quoting `csvField` produces. */
+function splitCsvLine(line) {
+    const fields = [];
+    let current = '';
+    let quoted = false;
+    for (let at = 0; at < line.length; at += 1) {
+        const character = line[at];
+        if (quoted) {
+            if (character === '"' && line[at + 1] === '"') { current += '"'; at += 1; continue; }
+            if (character === '"') { quoted = false; continue; }
+            current += character;
+            continue;
+        }
+        if (character === '"') { quoted = true; continue; }
+        if (character === ',') { fields.push(current); current = ''; continue; }
+        current += character;
+    }
+    fields.push(current);
+    return fields;
+}
+
+/**
+ * Bring an existing `scores.csv` up to the current column list.
+ *
+ * Appending a column leaves the **header** describing fewer fields than the new
+ * rows carry, and a reader that maps by header then silently drops or misreads
+ * the new one. Since columns may only ever be appended, the old header must be a
+ * prefix of the current one — if it is, the file is rewritten with the new header
+ * and every historical row padded, which is lossless. If it is not, something was
+ * renamed or reordered and the right answer is to say so rather than to guess
+ * which column is which.
+ */
+function migrateCsv(resolved, names) {
+    const existing = fs.readFileSync(resolved, 'utf8').replace(/\n$/, '');
+    if (existing === '') return;
+    const rows = existing.split('\n');
+    const header = splitCsvLine(rows[0]);
+    const headerMatches = header.length === names.length &&
+        header.every((name, index) => name === names[index]);
+    // A matching header is not on its own enough to skip the pass: rows can be
+    // the wrong width underneath it, which is exactly what a bad earlier
+    // migration leaves behind.
+    if (headerMatches && rows.slice(1).every((row) => (
+        row === '' || splitCsvLine(row).length === names.length
+    ))) {
+        return;
+    }
+
+    const isPrefix = header.length <= names.length &&
+        header.every((name, index) => name === names[index]);
+    if (!isPrefix) {
+        throw new Error(
+            `${path.basename(resolved)} has columns this reporter cannot extend ` +
+            `(found ${header.length}, expected the first ${header.length} of ${names.length} to match). ` +
+            'Columns may only be appended — move the old file aside rather than mixing layouts.'
+        );
+    }
+    // Pad each row to the full width **individually**. A fixed delta looks
+    // right and is wrong: a file can already hold rows of more than one width
+    // (rows written after a column was added, before the header caught up), and
+    // widening those again pushes them past the header. Splitting and re-emitting
+    // is lossless because `splitCsvLine` and `csvField` round-trip.
+    const migrated = [names.join(',')];
+    for (const row of rows.slice(1)) {
+        if (row === '') continue;
+        const fields = splitCsvLine(row);
+        // Trailing blanks on an over-wide row are padding, not data — drop them.
+        // Anything else would lose a measurement, so refuse instead of guessing.
+        while (fields.length > names.length && fields[fields.length - 1] === '') fields.pop();
+        if (fields.length > names.length) {
+            throw new Error(
+                `${path.basename(resolved)} has a row of ${fields.length} populated fields against ` +
+                `${names.length} columns; it was not written by this reporter. Move it aside.`
+            );
+        }
+        while (fields.length < names.length) fields.push('');
+        migrated.push(fields.map(csvField).join(','));
+    }
+    fs.writeFileSync(resolved, `${migrated.join('\n')}\n`);
+}
+
 function appendCsv(csvFile, files) {
     const resolved = path.resolve(csvFile);
     fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    const names = COLUMNS.map(([name]) => name);
     const lines = [];
-    if (!fs.existsSync(resolved)) lines.push(COLUMNS.map(([name]) => name).join(','));
+    if (fs.existsSync(resolved)) {
+        migrateCsv(resolved, names);
+    } else {
+        lines.push(names.join(','));
+    }
     for (const file of files) {
         const report = readReport(file);
         lines.push(COLUMNS.map(([, read]) => csvField(read(report, file))).join(','));
@@ -151,4 +240,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { COLUMNS, appendCsv, csvField, renderTable };
+module.exports = { COLUMNS, appendCsv, csvField, migrateCsv, renderTable, splitCsvLine };

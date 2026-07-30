@@ -52,9 +52,14 @@ function numberFlag(flags, name, fallback) {
     return Number.isFinite(value) ? value : fallback;
 }
 
+/** The Cheetah database a command addresses. `--database` is the older spelling. */
+function databaseName(flags) {
+    return flags.get('db-name') || flags.get('database') || settings.cheetah.database;
+}
+
 /** Open a store, optionally against a server this process owns. */
 async function withStore(flags, run) {
-    const database = flags.get('database') || settings.cheetah.database;
+    const database = databaseName(flags);
     let server = null;
     if (flags.get('spawn') === 'true') {
         server = await startServer({ dataDir: flags.get('data-dir') || undefined });
@@ -77,6 +82,17 @@ async function commandTrain(store, targets, flags) {
     const count = numberFlag(flags, 'constellations', settings.sign.constellationsPerImage);
     const images = targets.flatMap(collectImages);
     if (images.length === 0) throw new Error('no images found');
+
+    // Training only. `--reset` on a search would delete the corpus it was about
+    // to interrogate, so `find` does not accept it.
+    if (flags.get('reset') === 'true') {
+        const existing = await store.listImages({ includeIncomplete: true });
+        console.log(
+            `Resetting ${store.databaseName} ` +
+            `(dropping ${existing.size} image record(s) and their words)`
+        );
+        await store.reset();
+    }
     console.log(`Training ${images.length} image(s) with ${count} constellations each`);
 
     const startedAll = Date.now();
@@ -115,7 +131,8 @@ function reportCandidates(result) {
         console.log(
             `  ${index === 0 ? '▶' : ' '} ${(candidate.confidence * 100).toFixed(1).padStart(5)}%  ` +
             `mass ${candidate.mass.toFixed(3).padStart(8)}  sources ${String(candidate.sources).padStart(4)}  ` +
-            `obs ${score(candidate.fieldScore)}  desc ${score(candidate.descriptorScore)}  ${candidate.filename}`
+            `obs ${score(candidate.fieldScore)}  desc ${score(candidate.descriptorScore)}  ` +
+            `tri ${score(candidate.tripleScore)}  ${candidate.filename}`
         );
     });
 }
@@ -212,6 +229,7 @@ async function commandEvaluate(store, targets, flags) {
             seconds,
             byFieldObservations: bestBy(result.candidates, 'fieldScore')?.filename ?? null,
             byFieldDescriptor: bestBy(result.candidates, 'descriptorScore')?.filename ?? null,
+            byTripleFeatures: bestBy(result.candidates, 'tripleScore')?.filename ?? null,
             candidates: result.candidates.map((candidate) => ({
                 filename: candidate.filename,
                 confidence: candidate.confidence,
@@ -240,6 +258,7 @@ async function commandEvaluate(store, targets, flags) {
         meanReciprocalRank: mean(rows.map((row) => (row.rank ? 1 / row.rank : 0))),
         rank1ByFieldObservations: count((row) => row.byFieldObservations === row.expected),
         rank1ByFieldDescriptor: count((row) => row.byFieldDescriptor === row.expected),
+        rank1ByTripleFeatures: count((row) => row.byTripleFeatures === row.expected),
         meanConstellations: mean(rows.map((row) => row.constellations)),
         medianConstellations: median(rows.map((row) => row.constellations)),
         meanSeeds: mean(rows.map((row) => row.seeds)),
@@ -256,7 +275,8 @@ async function commandEvaluate(store, targets, flags) {
     console.log(`\nRank-1 by graph recall:        ${share(scores.rank1)}`);
     console.log(`Rank-1 by field observations: ${share(scores.rank1ByFieldObservations)}`);
     console.log(`Rank-1 by field descriptor:   ${share(scores.rank1ByFieldDescriptor)}`);
-    console.log('(the last two reorder only the graph\'s top candidates, so they cannot beat it)');
+    console.log(`Rank-1 by triple features:    ${share(scores.rank1ByTripleFeatures)}`);
+    console.log('(the last three only reorder the graph\'s top candidates, so recall@k bounds them)');
     console.log(
         `Corpus ${scores.corpus}   ` +
         `Recall@${settings.sign.search.rerankTop}: ${share(scores.inCandidates)}   ` +
@@ -273,7 +293,7 @@ async function commandEvaluate(store, targets, flags) {
         config: {
             sign_layout_version: SIGN_LAYOUT_VERSION,
             word_cardinality: WORD_CARDINALITY,
-            database: flags.get('database') || settings.cheetah.database,
+            database: databaseName(flags),
             constellations_per_image: training ? training.constellationsPerImage : corpusDensity,
             trained_this_run: !skipTrain,
             point_count: settings.sign.pointCount,
@@ -317,6 +337,13 @@ async function main() {
     const { positional, flags } = parseArgs(process.argv.slice(2));
     const [command, ...targets] = positional;
 
+    // Refuse rather than ignore: a --reset that was silently dropped on a search
+    // reads as "the corpus was kept" when the user asked for the opposite, and
+    // one that was honoured would delete what the search is about to query.
+    if (flags.get('reset') === 'true' && !['train', 'evaluate'].includes(command)) {
+        throw new Error(`--reset applies to training only, not to '${command || '(no command)'}'`);
+    }
+
     switch (command) {
         case 'train':
             await withStore(flags, (store) => commandTrain(store, targets, flags));
@@ -345,9 +372,12 @@ async function main() {
                 '  stats                 list what is stored',
                 '',
                 'options:',
+                '  --db-name <name>      Cheetah database, for training and for search',
+                '                        (default from CHEETAH_DATABASE; --database is an alias)',
+                '  --reset               training only: drop the database first, so the run',
+                '                        establishes the corpus instead of adding to it',
                 '  --constellations <n>  signs per image at training time',
                 '  --max <n>             ceiling on constellations measured per search',
-                '  --database <name>     Cheetah database (default from CHEETAH_DATABASE)',
                 '  --spawn               start the vendored cheetah-server for this command',
                 '  --data-dir <path>     data directory for --spawn',
                 '  --skip-train          evaluate against an already-trained corpus',

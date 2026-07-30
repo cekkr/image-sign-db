@@ -328,21 +328,37 @@ quantised into one integer **word** out of a frozen vocabulary of 73 728. Words 
 - The result is reweighted by word rarity and image vocabulary size, folded into a running belief,
   and the search stops as soon as one image is both dominant and clearly separated — or keeps
   measuring until the ceiling. This is the "as much as needed for a good confidence" loop.
-- The surviving candidates are reranked with a **continuous colour field**: the constellation's three
-  delta magnitudes as a smooth Gaussian-RBF function of position in its own local frame, scored with
-  the Gaussian-process confidence penalty from
-  [`studies/continuous_colors_function.md`](studies/continuous_colors_function.md). Agreeing where
-  the candidate has real observations is cheap; agreeing only by extrapolation is not.
+- The surviving candidates are scored with a **continuous colour field**: the constellation's three
+  delta magnitudes as a smooth Gaussian-RBF function of position, with the Gaussian-process
+  confidence penalty from
+  [`studies/continuous_colors_function.md`](studies/continuous_colors_function.md). Both signs are
+  first aligned on the triple whose word matched, without which the comparison is meaningless —
+  each constellation's frame is centred on its own seed pixel.
+
+  **These scores are reported, not applied.** Measured on the 20-image corpus, reordering the
+  graph's shortlist by any of them does *worse* than leaving it alone (5/20, 6/20 and 8/20 against
+  the graph's 16/20). The reason is structural: after alignment only two of five points say anything
+  the vocabulary did not already capture, and they sit where the candidate's field has no
+  observation. Notably the crudest of the three — comparing the matched triple's raw continuous
+  features, no field involved — scores best, which says the useful signal is the sub-cell precision
+  the coarse vocabulary discarded rather than the interpolation itself.
 
 ### Running it
 
     # start (and build, if needed) the vendored server for the duration of the command
-    node src/sign.js train sample_images/ --constellations 600 --spawn
+    node src/sign.js train sample_images/ --constellations 600 --reset --spawn
     node src/sign.js find sample_images/IMG_3355.jpg --spawn
     node src/sign.js evaluate sample_images/ --spawn
 
-    # or against a server you already run
-    node src/sign.js stats
+    # any command can name the database; training can also start from empty
+    node src/sign.js train sample_images/ --db-name my_corpus --reset
+    node src/sign.js find photo.jpg --db-name my_corpus
+    node src/sign.js stats --db-name my_corpus
+
+`--db-name` selects the Cheetah database for both training and search (`--database` is an older
+alias, and `CHEETAH_DATABASE` sets the default). `--reset` drops that database before ingesting, so
+a training run establishes the corpus rather than adding to it; it is **training only** and `find`
+refuses it rather than deleting the corpus it was about to query.
 
 `evaluate` trains the corpus and then re-identifies every image from a **fresh** random draw — the
 query constellations are never the trained ones — and reports rank-1 accuracy for both the graph
@@ -389,8 +405,9 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 | `SIGN_SEARCH_MAX_CONSTELLATIONS` | `240` | Ceiling on one search. |
 | `SIGN_SEARCH_STOPWORD_RATIO` | `0.6` | A word carried by more than this share of the corpus is not worth a seed. |
 | `SIGN_SEARCH_SEEDS_PER_ROUND` | `96` | Recall seeds per round, rarest first. |
-| `SIGN_SEARCH_CONFIDENCE` | `0.25` | Share of belief the leader needs to stop the search. Not a posterior over a closed set — on 11 images the true match leads with 15–28%. |
-| `SIGN_SEARCH_SEPARATION` | `1.5` | How far ahead of the runner-up the leader must be. |
+| `SIGN_SEARCH_LENGTH_SLOPE` | `0` | Pivoted correction for how many words an image published. `0` ignores it, `1` is fully proportional. Measured: correcting made accuracy monotonically worse. |
+| `SIGN_SEARCH_CONFIDENCE_MULTIPLE` | `2` | How far above an even split (`1/corpus`) the leader must be to stop. A multiple, not a share — a share cannot survive a change of corpus size. |
+| `SIGN_SEARCH_SEPARATION` | `1.35` | How far ahead of the runner-up the leader must be. The criterion that actually carries the signal. |
 | `SIGN_SEARCH_RERANK_TOP` | `5` | Candidates passed to the field rerank. |
 | `SIGN_SEARCH_RERANK_SIGNS` | `12` | Measured signs used by the rerank. |
 

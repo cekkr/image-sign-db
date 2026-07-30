@@ -21,7 +21,7 @@ const path = require('path');
 const settings = require('./settings');
 const { createRandom } = require('./lib/sign/rng');
 const { loadImagePixels, sampleSigns } = require('./lib/sign/sampler');
-const { primaryWords } = require('./lib/sign/words');
+const { allWords, tripleFeatureDistance, tripleFeatures } = require('./lib/sign/words');
 const {
     compareConstellations,
     constellationDescriptor,
@@ -106,18 +106,33 @@ function inverseDocumentFrequency(documentFrequency, corpusSize) {
  *   - **Rarity.** A converging seed is worth its idf, not one vote. Without it
  *     a search is decided by whichever words happen to be common.
  *   - **Length.** An image that published many distinct words is more likely to
- *     be hit by *any* query word, so its raw mass is divided by the square root
- *     of its vocabulary size. This is the document-norm half of a cosine, using
- *     the vocabulary count as the stand-in for the true norm — the exact norm
- *     would cost a full scan of the image's postings on every search.
+ *     be hit by *any* query word, so its raw mass is divided by a length norm.
+ *
+ * The length norm is **pivoted**, not `sqrt(vocabulary)`, and that is a fix for
+ * a measured failure rather than a preference. Vocabulary size across a real
+ * corpus is not smooth: on `sample_images/` four flat images publish 261-280
+ * words while the rest publish 788-1696, a 6.5x spread. Dividing by `sqrt` hands
+ * the small end a ~2.5x advantage, and those four images were involved in six of
+ * eight rank-1 failures — three of them won searches belonging to other images
+ * outright. Pivoted normalisation interpolates between "no correction" and
+ * "fully proportional" with a slope, which is the standard remedy for exactly
+ * this over-correction.
  */
 class Evidence {
-    constructor({ corpusSize }) {
+    constructor({ corpusSize, averageWords = 1, lengthSlope = settings.sign.search.lengthSlope }) {
         this.corpusSize = corpusSize;
+        this.averageWords = averageWords > 0 ? averageWords : 1;
+        this.lengthSlope = Math.min(1, Math.max(0, lengthSlope));
         this.byImage = new Map();
         this.rounds = 0;
         this.constellations = 0;
         this.seeds = 0;
+    }
+
+    /** `(1 - s) + s * |d| / avg|d|`: s = 0 ignores length, s = 1 is proportional. */
+    lengthNorm(words) {
+        const relative = (Number(words) || 0) / this.averageWords;
+        return Math.max(1e-6, (1 - this.lengthSlope) + this.lengthSlope * relative);
     }
 
     fold(results, degrees) {
@@ -145,7 +160,7 @@ class Evidence {
         const entries = [...this.byImage.values()]
             .map((entry) => ({
                 ...entry,
-                mass: entry.rawMass / Math.sqrt(Math.max(1, entry.words)),
+                mass: entry.rawMass / this.lengthNorm(entry.words),
             }))
             .sort((left, right) => right.mass - left.mass);
         const total = entries.reduce((sum, entry) => sum + entry.mass, 0);
@@ -191,19 +206,22 @@ function mean(values) {
  * own constellations that share a word with a measured one and compare the two
  * colour fields.
  *
+ * **Both signs are first put in a common frame**, aligned on the triple whose
+ * word matched (`alignToTriple`). Skipping that step is what made an earlier
+ * version of this useless: each constellation's frame is centred on its own seed
+ * pixel, so the query's points landed nowhere near the candidate's observations
+ * and both scores below were reporting how far apart two unrelated draws
+ * happened to fall.
+ *
  * The study gives two comparison rules and both are computed, because they
- * measure genuinely different things and only measurement can say which is
- * worth trusting on a given corpus:
+ * measure different things and only measurement can say which is worth trusting
+ * on a given corpus:
  *
  *   - `observationScore` — its "comparing arbitrary query points": evaluate the
- *     candidate's field at the query's own point positions with the
- *     `C·E + β(1−C)` penalty. Frame-dependent: the two constellations were
- *     sampled at unrelated places, so most query points fall where the
- *     candidate has no observation and the uncertainty term dominates.
+ *     candidate's field at the query's point positions with the `C·E + β(1−C)`
+ *     penalty.
  *   - `descriptorScore` — its "making the function searchable in a database":
- *     evaluate both fields on the same **fixed** probe grid and compare the
- *     resulting vectors. Frame-independent, which is exactly the property the
- *     first one lacks.
+ *     evaluate both fields on the same fixed probe grid and compare the vectors.
  *
  * Both are lower-is-better. Neither reorders the candidates: the ranking stays
  * the graph's, and these ride along as evidence about it.
@@ -214,38 +232,58 @@ async function rerankWithField(store, evidence, querySigns, {
     rerankMatchesPerWord = 4,
 } = {}) {
     const ranked = evidence.ranked().slice(0, rerankTop);
-    const parsedQueries = querySigns.slice(-rerankSigns).map((sign) => {
-        const parsed = parseConstellationRecord(sign.record);
-        return { parsed, descriptor: constellationDescriptor(parsed), words: primaryWords(sign.triples) };
-    });
+    const parsedQueries = querySigns.slice(-rerankSigns).map((sign) => ({
+        parsed: parseConstellationRecord(sign.record),
+        // Kept as triples, not as a flat word list: the comparison needs to know
+        // which triple produced the word it matched on.
+        triples: sign.triples,
+    }));
 
     return Promise.all(ranked.map(async (candidate) => {
         const observationScores = [];
         const descriptorScores = [];
+        const tripleScores = [];
         for (const query of parsedQueries) {
             let bestObservation = Infinity;
             let bestDescriptor = Infinity;
-            for (const word of query.words) {
-                const matches = await store.signsForWord(word, candidate.imageId, {
+            let bestTriple = Infinity;
+            for (const triple of query.triples) {
+                const matches = await store.signsForWord(triple.words[0], candidate.imageId, {
                     limit: rerankMatchesPerWord,
                 });
+                const queryDescriptor = constellationDescriptor(query.parsed, triple.index);
+                const queryFeatures = tripleFeatures(
+                    query.parsed.edges,
+                    query.parsed.edgeDeltas,
+                    triple.index
+                );
                 for (const match of matches) {
+                    if (match.tripleIndex === null) continue;
                     const parsed = parseConstellationRecord(match.record);
-                    bestObservation = Math.min(bestObservation, compareConstellations(parsed, query.parsed));
+                    bestObservation = Math.min(bestObservation, compareConstellations(parsed, query.parsed, {
+                        candidateTriple: match.tripleIndex,
+                        queryTriple: triple.index,
+                    }));
                     bestDescriptor = Math.min(bestDescriptor, descriptorDistance(
-                        constellationDescriptor(parsed),
-                        query.descriptor
+                        constellationDescriptor(parsed, match.tripleIndex),
+                        queryDescriptor
+                    ));
+                    bestTriple = Math.min(bestTriple, tripleFeatureDistance(
+                        tripleFeatures(parsed.edges, parsed.edgeDeltas, match.tripleIndex),
+                        queryFeatures
                     ));
                 }
                 if (Number.isFinite(bestObservation)) break;
             }
             if (Number.isFinite(bestObservation)) observationScores.push(bestObservation);
             if (Number.isFinite(bestDescriptor)) descriptorScores.push(bestDescriptor);
+            if (Number.isFinite(bestTriple)) tripleScores.push(bestTriple);
         }
         return {
             ...candidate,
             fieldScore: mean(observationScores),
             descriptorScore: mean(descriptorScores),
+            tripleScore: mean(tripleScores),
             fieldSamples: observationScores.length,
         };
     }));
@@ -271,7 +309,13 @@ async function searchImage(store, imagePath, {
     const corpus = await store.listImages();
     if (corpus.size === 0) throw new Error('the sign corpus is empty; train some images first');
 
-    const evidence = new Evidence({ corpusSize: corpus.size });
+    const corpusRecords = [...corpus.values()];
+    const evidence = new Evidence({
+        corpusSize: corpus.size,
+        averageWords: corpusRecords.reduce((sum, record) => sum + (Number(record.words) || 0), 0) /
+            Math.max(1, corpusRecords.length),
+        lengthSlope: search.lengthSlope,
+    });
     const degreeCache = new Map();
     const querySigns = [];
     let reason = 'exhausted';
@@ -289,10 +333,13 @@ async function searchImage(store, imagePath, {
         evidence.constellations += batch.length;
         evidence.rounds += 1;
 
-        // Only the cell each triple actually fell in. The sweep to neighbouring
-        // cells was already spent at ingestion time, so asking for it again
-        // here would widen the match by two cells instead of one.
-        const words = [...new Set(batch.flatMap((sign) => primaryWords(sign.triples)))];
+        // Every word of the sweep, including the neighbouring cells a
+        // measurement close to a level edge could equally have fallen in.
+        // Ingestion stores only the primary word, so this is the side that
+        // bridges the edge — and it is the cheap side: a variant costs one more
+        // seed on a recall that is happening anyway, where at ingestion time it
+        // cost a stored posting and a graph edge, permanently.
+        const words = allWords(batch.flatMap((sign) => sign.triples));
         const unknown = words.filter((word) => !degreeCache.has(word));
         if (unknown.length > 0) {
             const degrees = await store.wordDegrees(unknown);
@@ -320,7 +367,11 @@ async function searchImage(store, imagePath, {
         const separation = ranked.length > 1
             ? ranked[0].mass / Math.max(ranked[1].mass, Number.EPSILON)
             : Infinity;
-        if (ranked[0].confidence >= search.confidenceTarget && separation >= search.separationTarget) {
+        // Scale-free: what matters is how far the leader is above an even split,
+        // not the raw share, which shrinks as the corpus grows.
+        const uniformShare = 1 / Math.max(1, corpus.size);
+        const lead = ranked[0].confidence / uniformShare;
+        if (lead >= search.confidenceMultiple && separation >= search.separationTarget) {
             reason = 'confident';
             break;
         }

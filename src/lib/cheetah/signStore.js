@@ -25,7 +25,7 @@ const { SIGN_LAYOUT_VERSION } = require('../sign/constants');
 const { CheetahPool, CheetahError } = require('./client');
 const { decodeItemPayload } = require('./protocol');
 const graph = require('./graph');
-const { getJson, getValue, putJson, putValue, scanPrefix } = require('./kv');
+const { getJson, getValue, putJson, putJsonBatch, putValue, scanPrefix } = require('./kv');
 const keys = require('./keys');
 
 const LAYOUT_KEY = keys.configKey('sign_layout_version');
@@ -63,11 +63,12 @@ function parseHydratedJson(item) {
 class SignStore {
     constructor(options = {}) {
         const configured = settings.cheetah;
+        this.databaseName = options.database ?? configured.database;
         this.pool = options.pool || new CheetahPool({
             size: options.poolSize ?? configured.poolSize,
             host: options.host ?? configured.host,
             port: options.port ?? configured.port,
-            database: options.database ?? configured.database,
+            database: this.databaseName,
             databaseOptions: { pair_bytes: options.pairIndexBytes ?? configured.pairIndexBytes },
             connectTimeoutMs: options.connectTimeoutMs ?? configured.connectTimeoutMs,
             commandTimeoutMs: options.commandTimeoutMs ?? configured.commandTimeoutMs,
@@ -111,6 +112,55 @@ class SignStore {
         if (!this.ownsPool || typeof this.pool.close !== 'function') return;
         await this.pool.close();
         this.connected = false;
+    }
+
+    /**
+     * Drop and recreate the database this store is connected to.
+     *
+     * Destructive and immediate: `RESET_DB` recreates the directory, so every
+     * image, posting, graph node and edge in it is gone — which is exactly what
+     * a training run wants when it is establishing a corpus rather than adding
+     * to one.
+     *
+     * Every connection is re-pointed afterwards, not just the one that issued
+     * the reset. That follows from the server's own model rather than from an
+     * observed failure: database selection is per-connection, and
+     * `Engine.ResetDatabase` closes the database and drops it from the engine
+     * registry while `server.go` re-selects the fresh one only for the socket
+     * that ran the command — so the other sockets hold a pointer to a closed
+     * `Database`. Re-pointing them is one round trip each and removes the
+     * question.
+     *
+     * Being precise about what this does **not** claim: a benchmark run failed
+     * with `main_keys.table: file already closed` eleven minutes after a reset,
+     * and removing this re-point does not reproduce it. That failure is still
+     * open and is recorded in AGENTS.md → Known Gaps; do not read this code as
+     * its fix.
+     */
+    async reset() {
+        const name = this.databaseName;
+        await this.withConnection(async (conn) => {
+            const response = await conn.send(`RESET_DB ${name}`);
+            if (!response.ok) {
+                throw new CheetahError(`cheetah RESET_DB ${name} failed: ${response.error || response.raw}`, {
+                    response,
+                });
+            }
+        });
+        if (typeof this.pool.broadcast === 'function') {
+            for (const response of await this.pool.broadcast(`DATABASE ${name}`)) {
+                if (!response.ok) {
+                    throw new CheetahError(
+                        `cheetah could not re-select ${name} after a reset: ${response.error || response.raw}`,
+                        { response }
+                    );
+                }
+            }
+        }
+        // Everything cached described the database that just ceased to exist.
+        this.imageRecords.clear();
+        this.connected = false;
+        return this.connect();
     }
 
     // -- images -------------------------------------------------------------
@@ -210,16 +260,18 @@ class SignStore {
                 key: keys.signConstellationKey(imageId, ordinal),
                 payload: sign.record,
             });
-            // Soft assignment is applied here, on the ingestion side: a triple
-            // is written under every word of its sweep, so a measurement that
-            // later lands a thousandth across a level edge still finds it. The
-            // query then only has to ask for the cell it actually fell in,
-            // which keeps a search's seed count — and its recall budget — small.
+            // Only the cell each triple actually fell in.
+            //
+            // Soft assignment is symmetric — sweeping the stored triple or the
+            // measured one bridges the same level edge — so it belongs on
+            // whichever side is cheaper, and that was measured, not assumed.
+            // Writing all four words of a sweep put ~6 900 postings and ~5 400
+            // graph edges behind one image and cost ~108 s; the sweep is
+            // essentially free on the query side, where it only adds seeds to a
+            // recall that was already being issued.
             const seen = new Map();
             sign.triples.forEach((triple) => {
-                for (const word of triple.words) {
-                    if (!seen.has(word)) seen.set(word, triple.index);
-                }
+                if (!seen.has(triple.words[0])) seen.set(triple.words[0], triple.index);
             });
             for (const [word, tripleIndex] of seen) {
                 wordCounts.set(word, (wordCounts.get(word) || 0) + 1);
@@ -230,9 +282,11 @@ class SignStore {
             }
         });
 
+        // One request per page instead of two per record. Ingestion is the only
+        // place in this codebase where the round-trip count, not the payload
+        // size, decides how long the work takes.
         for (let at = 0; at < writes.length; at += this.writeBatchSize) {
-            const batch = writes.slice(at, at + this.writeBatchSize);
-            await Promise.all(batch.map(({ key, payload }) => putJson(this.pool, key, payload)));
+            await putJsonBatch(this.pool, writes.slice(at, at + this.writeBatchSize));
         }
         return { wordCounts, written: writes.length, nextOrdinal: startOrdinal + signs.length };
     }
@@ -341,20 +395,33 @@ class SignStore {
         return results;
     }
 
-    /** The signs of one image that carry one word, hydrated. */
+    /**
+     * The signs of one image that carry one word, hydrated.
+     *
+     * The posting payload carries **which triple** of that sign produced the
+     * word, and it has to come back with the record: it is what lets a caller
+     * put the two constellations in a common frame before comparing their colour
+     * fields. Hydrating the payload during the scan (rather than reading each
+     * posting back) is why the sweep uses the `continuations` reducer.
+     */
     async signsForWord(word, imageId, { limit = 8 } = {}) {
         const found = [];
         for await (const item of scanPrefix(this.pool, keys.signWordImagePrefix(word, imageId), {
             limit: Math.min(DEFAULT_SCAN_LIMIT, Math.max(1, limit)),
             maxItems: limit,
+            reducer: 'continuations',
         })) {
-            found.push(keys.parseSignWordPostingKey(item.key).ordinal);
+            const posting = parseHydratedJson(item);
+            found.push({
+                ordinal: keys.parseSignWordPostingKey(item.key).ordinal,
+                tripleIndex: Number.isInteger(posting?.t) ? posting.t : null,
+            });
         }
-        const records = await Promise.all(found.map((ordinal) =>
-            getJson(this.pool, keys.signConstellationKey(imageId, ordinal))
+        const records = await Promise.all(found.map((entry) =>
+            getJson(this.pool, keys.signConstellationKey(imageId, entry.ordinal))
         ));
         return found
-            .map((ordinal, index) => ({ ordinal, record: records[index] }))
+            .map((entry, index) => ({ ...entry, record: records[index] }))
             .filter((entry) => entry.record !== null);
     }
 

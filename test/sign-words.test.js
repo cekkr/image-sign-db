@@ -22,6 +22,8 @@ const {
     packWord,
     primaryWords,
     tripleDimensions,
+    tripleFeatureDistance,
+    tripleFeatures,
     tripleWords,
     turnLevelWithNeighbour,
 } = require('../src/lib/sign/words');
@@ -141,6 +143,44 @@ test('the sweep is capped even when everything sits on an edge', () => {
         onEdge
     );
     assert.equal(words.length, MAX_WORD_VARIANTS);
+});
+
+test('the continuous triple features are what the word threw away', () => {
+    const first = edge(0.08, 0);
+    const second = edge(0.12, Math.PI / 3);
+    const deltaA = [0.30, 0.40, 0.50];
+    const deltaB = [0.60, 0.70, 0.80];
+
+    const features = tripleFeatures([first, second], [deltaA, deltaB], 0);
+    assert.equal(features.length, 8, 'scale, turn, and six colour deltas');
+    assert.ok(Math.abs(features[0] - 0.10) < 1e-12, 'scale is the mean hop length');
+    assert.ok(Math.abs(features[1] - Math.PI / 3) < 1e-12, 'turn is the signed angle between hops');
+    assert.deepEqual(features.slice(2), [...deltaA, ...deltaB]);
+
+    // The point of these: two triples can share a word and still be far apart,
+    // because the top colour level alone spans [0.25, 1].
+    const low = [0.26, 0.26, 0.26];
+    const high = [0.99, 0.99, 0.99];
+    assert.equal(
+        tripleWords(first, second, low, low)[0],
+        tripleWords(first, second, high, high)[0],
+        'these must share a word for the rest of the assertion to mean anything'
+    );
+    assert.ok(tripleFeatureDistance(
+        tripleFeatures([first, second], [low, low], 0),
+        tripleFeatures([first, second], [high, high], 0)
+    ) > 0.2, 'and the continuous distance must still separate them');
+});
+
+test('triple distance is zero on itself and wraps the turn angle', () => {
+    const features = tripleFeatures([edge(0.1, 0), edge(0.1, 1)], [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], 0);
+    assert.equal(tripleFeatureDistance(features, features), 0);
+    assert.equal(tripleFeatureDistance(features, [1, 2, 3]), Infinity);
+
+    // -pi and +pi are the same turn: the distance must not read 2*pi apart.
+    const left = tripleFeatures([edge(0.1, 0), edge(0.1, Math.PI - 1e-9)], [[0, 0, 0], [0, 0, 0]], 0);
+    const right = tripleFeatures([edge(0.1, 0), edge(0.1, -Math.PI + 1e-9)], [[0, 0, 0], [0, 0, 0]], 0);
+    assert.ok(tripleFeatureDistance(left, right) < 1e-6, 'the turn difference must be wrapped');
 });
 
 test('a constellation yields one triple per pair of consecutive hops', () => {

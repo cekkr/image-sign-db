@@ -225,6 +225,43 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         assert.equal(result.candidates[0].filename, path.basename(files[1]));
     });
 
+    // `--reset` is destructive and runs mid-session against a pool, so what has
+    // to hold is that the database is *usable* afterwards: the old corpus gone,
+    // and a write made after the reset readable on every connection.
+    //
+    // Note what this test cannot do. It does not distinguish a correctly
+    // re-pointed pool from a stale one, because a stale connection re-opens the
+    // same path with `O_CREATE` and answers plausibly instead of failing. It
+    // passes with and without the re-point in `SignStore.reset`, so treat it as a
+    // usability check, not as cover for that reasoning.
+    await t.test('the database a reset recreated is usable on every connection', async () => {
+        const store = new SignStore({ port, database: 'sign_db_reset_test', poolSize: 4 });
+        try {
+            await store.connect();
+            await trainImage(store, files[0], { count: 20, seed: 'pre-reset' });
+            await store.reset();
+
+            const after = await trainImage(store, files[1], { count: 20, seed: 'post-reset' });
+            assert.equal((await store.listImages()).size, 1, 'the reset must have dropped the old corpus');
+
+            // More reads than connections, so every socket is exercised. A stale
+            // one reads an empty recreated file and answers null.
+            for (let attempt = 0; attempt < 16; attempt += 1) {
+                assert.equal(
+                    await store.findImageIdByFilename(after.filename),
+                    after.imageId,
+                    `read ${attempt} did not see the post-reset write`
+                );
+                assert.ok(
+                    (await store.getSign(after.imageId, attempt % 20)) !== null,
+                    `read ${attempt} did not see the post-reset constellation`
+                );
+            }
+        } finally {
+            await store.close();
+        }
+    });
+
     await t.test('an incomplete image is invisible to search', async () => {
         const { imageId } = await store.putImage({ filename: 'never-completed.png' });
         const listed = await store.listImages();

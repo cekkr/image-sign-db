@@ -15,6 +15,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+    alignToTriple,
     edgesFromLocal,
     imageScale,
     layoutFromPoints,
@@ -123,6 +124,88 @@ test('an even or too-small point count is refused', () => {
         );
     }
     assert.ok(sampleConstellation({ width: 200, height: 200, pointCount: 7 }) !== null);
+});
+
+test('aligning on a triple puts it in a canonical place', () => {
+    const random = createRandom('align');
+    for (let trial = 0; trial < 200; trial += 1) {
+        const layout = sampleConstellation({ width: 900, height: 700, random });
+        if (layout === null) continue;
+
+        for (let triple = 0; triple + 2 < layout.pointCount; triple += 1) {
+            const aligned = alignToTriple(layout.local, triple);
+
+            // The middle point of the triple is the origin...
+            assert.ok(Math.hypot(aligned[triple + 1].x, aligned[triple + 1].y) < 1e-12);
+            // ...and the first hop runs along +x, so the first point sits on the
+            // negative x axis at exactly its own hop length.
+            const hop = layout.edges[triple].length;
+            assert.ok(Math.abs(aligned[triple].x + hop) < 1e-9, `x was ${aligned[triple].x}, want ${-hop}`);
+            assert.ok(Math.abs(aligned[triple].y) < 1e-9, `y was ${aligned[triple].y}, want 0`);
+
+            // Alignment is a rigid motion: every pairwise distance survives it.
+            for (let i = 0; i < layout.pointCount; i += 1) {
+                for (let j = i + 1; j < layout.pointCount; j += 1) {
+                    const before = Math.hypot(
+                        layout.local[i].x - layout.local[j].x,
+                        layout.local[i].y - layout.local[j].y
+                    );
+                    const after = Math.hypot(
+                        aligned[i].x - aligned[j].x,
+                        aligned[i].y - aligned[j].y
+                    );
+                    assert.ok(Math.abs(before - after) < 1e-9, `distance ${i}-${j} changed`);
+                }
+            }
+        }
+    }
+});
+
+test('two constellations sharing a triple land on top of each other', () => {
+    // The same three points, reached by different routes and at a different
+    // place and orientation in the frame. This is the property the rerank
+    // depends on: after alignment the matched triple coincides, so the *other*
+    // points are what the comparison is actually testing.
+    const scale = imageScale(1000, 1000);
+    const left = layoutFromPoints(
+        [{ x: 100, y: 100 }, { x: 200, y: 140 }, { x: 300, y: 260 }, { x: 380, y: 120 }, { x: 460, y: 300 }],
+        2,
+        scale
+    );
+    // Rotate the same triple by 90 degrees about its middle point and translate.
+    const right = layoutFromPoints(
+        [{ x: 700, y: 500 }, { x: 660, y: 600 }, { x: 540, y: 700 }, { x: 620, y: 800 }, { x: 500, y: 850 }],
+        2,
+        scale
+    );
+
+    const alignedLeft = alignToTriple(left.local, 0);
+    const alignedRight = alignToTriple(right.local, 0);
+    for (let index = 0; index < 3; index += 1) {
+        assert.ok(
+            Math.hypot(
+                alignedLeft[index].x - alignedRight[index].x,
+                alignedLeft[index].y - alignedRight[index].y
+            ) < 1e-9,
+            `triple point ${index} did not coincide after alignment`
+        );
+    }
+    // And the fourth point, which the two do not share, must not coincide —
+    // otherwise the alignment would be washing out the discriminating signal.
+    assert.ok(Math.hypot(
+        alignedLeft[3].x - alignedRight[3].x,
+        alignedLeft[3].y - alignedRight[3].y
+    ) > 1e-3);
+});
+
+test('an out-of-range triple index is refused', () => {
+    const local = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 2, y: 1 }, { x: 2, y: 2 }];
+    for (const triple of [-1, 3, 4, 9, 1.5]) {
+        assert.throws(() => alignToTriple(local, triple), RangeError, `triple ${triple}`);
+    }
+    for (const triple of [0, 1, 2]) {
+        assert.equal(alignToTriple(local, triple).length, local.length);
+    }
 });
 
 test('angle helpers agree on the two conventions', () => {

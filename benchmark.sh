@@ -162,8 +162,12 @@ for density in "${DENSITIES[@]}"; do
         # corpus it built, which is why --skip-train appears only after one
         # successful pass.
         if [ "$trained" -eq 0 ]; then
+            # --reset makes the run reproducible even against a data directory
+            # that a previous benchmark left behind: the corpus is established
+            # here, not added to.
             node src/sign.js evaluate "$IMAGES" \
-                --database "$database" \
+                --db-name "$database" \
+                --reset \
                 --constellations "$density" \
                 --max "$ceiling" \
                 --label "$name" \
@@ -174,7 +178,7 @@ for density in "${DENSITIES[@]}"; do
             # run, the report reads the corpus's real density back out of the
             # store rather than believing a flag.
             node src/sign.js evaluate "$IMAGES" \
-                --database "$database" \
+                --db-name "$database" \
                 --skip-train \
                 --max "$ceiling" \
                 --label "$name" \

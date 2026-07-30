@@ -166,6 +166,45 @@ function constellationWordsFromLocal(local, edgeDeltas) {
     return constellationWords({ edges: edgesFromLocal(local), edgeDeltas });
 }
 
+/**
+ * The eight **continuous** features of one triple, before quantisation.
+ *
+ * A word says only which cell a triple fell into, and the cells are coarse on
+ * purpose — the top colour-delta level spans `[0.25, 1]`, so two triples sharing
+ * a word can still differ by 0.6 in a channel. These are the values the word
+ * threw away, and they are what lets a rerank distinguish two candidates that
+ * the vocabulary cannot.
+ *
+ * Order matches `tripleDimensions`, so the two can be read side by side.
+ */
+function tripleFeatures(edges, edgeDeltas, index) {
+    const first = edges[index];
+    const second = edges[index + 1];
+    return [
+        (first.length + second.length) / 2,
+        wrapAngle(second.direction - first.direction),
+        ...edgeDeltas[index],
+        ...edgeDeltas[index + 1],
+    ];
+}
+
+/**
+ * Distance between two triples in that continuous space, lower is better.
+ *
+ * Each dimension is divided by its own natural range before being squared, or
+ * the turn angle (spanning 2*pi) would drown out six colour deltas spanning 1.
+ * The turn difference is wrapped first: -pi and +pi are the same turn.
+ */
+function tripleFeatureDistance(left, right, { scaleRange = 0.2 } = {}) {
+    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return Infinity;
+    let total = (left[0] - right[0]) ** 2 / scaleRange ** 2;
+    total += (wrapAngle(left[1] - right[1]) / Math.PI) ** 2;
+    for (let index = 2; index < left.length; index += 1) {
+        total += (left[index] - right[index]) ** 2;
+    }
+    return Math.sqrt(total / left.length);
+}
+
 /** The primary word of every triple — what ingestion writes. */
 function primaryWords(triples) {
     return triples.map((triple) => triple.words[0]);
@@ -185,6 +224,8 @@ module.exports = {
     packWord,
     primaryWords,
     tripleDimensions,
+    tripleFeatureDistance,
+    tripleFeatures,
     tripleWords,
     turnLevelWithNeighbour,
 };

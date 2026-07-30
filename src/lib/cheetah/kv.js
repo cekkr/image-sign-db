@@ -98,6 +98,67 @@ async function putValue(conn, key, payload, { upsert = false } = {}) {
     return absKey;
 }
 
+/**
+ * Bind many keys in **one** round trip.
+ *
+ * `putValue` is two requests per record — INSERT then PAIR_SET — which is the
+ * right separation but the wrong cost for a bulk ingest: ~7,800 records became
+ * ~15,600 requests, with the Cheetah process idling at about a quarter of a core
+ * while the client waited on latency. `PAIR_PUT_BATCH` does both server-side for
+ * a whole page of records.
+ *
+ * It is **not** a transaction. Items are independent and applied in order, so a
+ * failure part-way leaves the earlier ones written; the server reports
+ * `applied`/`failed` and this throws on any failure rather than returning a
+ * count nobody checks. A half-written batch is an index with holes in it.
+ *
+ * `hexEncodeItems` exists because the items travel as JSON inside a
+ * whitespace-split `key=value` token: a payload containing a newline, or bytes
+ * that are not valid UTF-8, has to go as `x<hex>`. Keys and JSON payloads from
+ * this codebase are neither, so the default is off and the wire stays readable.
+ */
+async function putValuesBatch(conn, entries, { hidden = false, hexEncodeItems = false } = {}) {
+    if (!Array.isArray(entries) || entries.length === 0) return 0;
+    const items = entries.map(({ key, payload }) => {
+        const value = assertSingleLine(toWire(payload));
+        return hexEncodeItems
+            ? {
+                k: `x${Buffer.from(String(key), 'latin1').toString('hex')}`,
+                v: `x${Buffer.from(value, 'latin1').toString('hex')}`,
+            }
+            : { k: String(key), v: value };
+    });
+    const encoded = Buffer.from(JSON.stringify(items), 'latin1').toString('base64');
+    const response = await conn.send(
+        `PAIR_PUT_BATCH items=${encoded}${hidden ? ' hidden=1' : ''}`
+    );
+    if (!response.ok) {
+        throw new CheetahError(
+            `cheetah PAIR_PUT_BATCH of ${items.length} failed: ${response.error || response.raw}`,
+            { response }
+        );
+    }
+    const applied = Number.parseInt(response.fields.applied, 10);
+    const failed = Number.parseInt(response.fields.failed, 10);
+    if (!(applied === items.length) || failed > 0) {
+        throw new CheetahError(
+            `cheetah PAIR_PUT_BATCH applied ${applied}/${items.length} (failed=${failed}): ` +
+            `${response.fields.first_error || 'no reason reported'}`,
+            { response }
+        );
+    }
+    return applied;
+}
+
+/** `putValuesBatch` for JSON payloads. */
+async function putJsonBatch(conn, entries, options) {
+    return putValuesBatch(
+        conn,
+        entries.map(({ key, payload }) => ({ key, payload: JSON.stringify(payload) })),
+        options
+    );
+}
+
 /** Read the payload bound to `key`, or null when the name is unbound. */
 async function getValue(conn, key) {
     const absKey = await getAbsoluteKey(conn, key);
@@ -176,7 +237,9 @@ module.exports = {
     getJson,
     getValue,
     putJson,
+    putJsonBatch,
     putValue,
+    putValuesBatch,
     readAbsoluteKey,
     scanAll,
     scanPage,

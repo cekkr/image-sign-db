@@ -17,7 +17,7 @@
 
 const { RadialBasisField, canonicalDescriptor, descriptorDistance, scoreObservations } = require('./field');
 const { SIGN_LAYOUT_VERSION } = require('./constants');
-const { edgesFromLocal, localFromLinks } = require('./geometry');
+const { alignToTriple, edgesFromLocal, localFromLinks } = require('./geometry');
 const { edgeDeltasFromPointDeltas } = require('./measure');
 
 /** Payload precision. 1e-5 of a half diagonal is sub-pixel on a 4K image. */
@@ -74,28 +74,53 @@ function parseConstellationRecord(record) {
 
 /**
  * The continuous colour field of this sign: the three delta magnitudes as a
- * smooth function of position in the constellation's own local frame.
+ * smooth function of position.
+ *
+ * `tripleIndex` selects the frame. Omitted, the field lives in the
+ * constellation's own frame (centre at the origin) — right for describing one
+ * sign in isolation. Given, the frame is aligned on that triple, which is the
+ * only way two independently sampled signs can be compared: see
+ * `alignToTriple`.
  */
-function constellationField(parsed) {
-    return new RadialBasisField(parsed.local, parsed.pointDeltas);
+function constellationField(parsed, tripleIndex = null) {
+    const points = tripleIndex === null ? parsed.local : alignToTriple(parsed.local, tripleIndex);
+    return new RadialBasisField(points, parsed.pointDeltas);
 }
 
-/** The fixed-grid canonical descriptor, for cheap first-pass reranking. */
-function constellationDescriptor(parsed) {
-    return canonicalDescriptor(constellationField(parsed));
+/**
+ * The fixed-grid canonical descriptor.
+ *
+ * Only comparable between two signs when both were built on an aligned frame:
+ * the grid is fixed, so an unaligned descriptor encodes where the sampler
+ * happened to put the points as much as what the colours do.
+ */
+function constellationDescriptor(parsed, tripleIndex = null) {
+    return canonicalDescriptor(constellationField(parsed, tripleIndex));
 }
 
 /**
  * How well a stored sign explains a measured one, lower is better.
  *
- * The candidate's field is evaluated at the query's own point positions and
- * compared against the query's own deltas, with the study's confidence penalty:
- * agreeing where the candidate actually has observations is cheap, agreeing
- * only by extrapolation is not.
+ * Both are re-expressed in the frame of the triple whose word matched, then the
+ * candidate's field is evaluated at the query's point positions and compared
+ * against the query's deltas with the study's confidence penalty: agreeing where
+ * the candidate actually has observations is cheap, agreeing only by
+ * extrapolation is not.
+ *
+ * The triple indices are not optional in practice. Without them the two frames
+ * share nothing but the fact that each is centred on its own seed pixel, and the
+ * score degenerates into a measure of how far apart two unrelated draws landed.
  */
-function compareConstellations(candidateParsed, queryParsed, options) {
-    const field = constellationField(candidateParsed);
-    const observations = queryParsed.local.map((point, index) => ({
+function compareConstellations(candidateParsed, queryParsed, {
+    candidateTriple = null,
+    queryTriple = null,
+    ...options
+} = {}) {
+    const field = constellationField(candidateParsed, candidateTriple);
+    const queryPoints = queryTriple === null
+        ? queryParsed.local
+        : alignToTriple(queryParsed.local, queryTriple);
+    const observations = queryPoints.map((point, index) => ({
         point,
         delta: queryParsed.pointDeltas[index],
     }));

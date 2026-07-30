@@ -15,7 +15,13 @@ const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { COLUMNS, appendCsv, csvField, renderTable } = require('../scripts/benchmark-report');
+const {
+    COLUMNS,
+    appendCsv,
+    csvField,
+    renderTable,
+    splitCsvLine,
+} = require('../scripts/benchmark-report');
 
 function makeReport(overrides = {}) {
     // `scores` is merged, not replaced: a test that wants one null score should
@@ -51,6 +57,7 @@ function makeReport(overrides = {}) {
             meanReciprocalRank: 1,
             rank1ByFieldObservations: 3,
             rank1ByFieldDescriptor: 1,
+            rank1ByTripleFeatures: 8,
             meanConstellations: 120,
             medianConstellations: 96,
             meanSeeds: 300,
@@ -119,6 +126,81 @@ test('a missing score is an empty field, never a zero', () => {
         assert.equal(fields[header.indexOf('mean_separation')], '');
         assert.equal(fields[header.indexOf('rank1_rate')], '1');
     });
+});
+
+test('appending a column migrates the header and pads history', () => {
+    withTempDir((dir) => {
+        const csv = path.join(dir, 'scores.csv');
+        const names = COLUMNS.map(([name]) => name);
+
+        // A file written across a column addition: a stale header, one row of
+        // the old width, and one row already carrying the newer column. Rows of
+        // mixed width in one file is the case a fixed padding delta gets wrong.
+        const oldNames = names.slice(0, names.length - 2);
+        const shortRow = oldNames.map((_, index) => (index === 0 ? '"run,one"' : String(index)));
+        const widerRow = names.slice(0, names.length - 1).map((_, index) => (
+            index === 0 ? 'run-two' : String(index)
+        ));
+        fs.writeFileSync(csv, [oldNames.join(','), shortRow.join(','), widerRow.join(',')].join('\n') + '\n');
+
+        appendCsv(csv, [writeReport(dir, 'new', makeReport({ label: 'new' }))]);
+        const lines = fs.readFileSync(csv, 'utf8').trim().split('\n');
+
+        assert.equal(lines[0], names.join(','), 'the header must describe the current columns');
+        for (const line of lines) {
+            assert.equal(splitCsvLine(line).length, names.length, line);
+        }
+        // Both historical rows keep their values, quoting intact, and gain blanks.
+        const historical = splitCsvLine(lines[1]);
+        assert.equal(historical[0], 'run,one');
+        assert.equal(historical[1], '1');
+        assert.equal(historical[names.length - 1], '');
+        assert.equal(splitCsvLine(lines[2])[0], 'run-two');
+        assert.equal(splitCsvLine(lines[2])[names.length - 1], '');
+        assert.equal(splitCsvLine(lines[3])[0], 'new');
+    });
+});
+
+test('an over-wide row is trimmed when the extra field is blank, refused when it is not', () => {
+    withTempDir((dir) => {
+        const names = COLUMNS.map(([name]) => name);
+        const row = (extra) => [...names.map((_, index) => String(index)), extra].join(',');
+
+        // Trailing blank: padding written by a bad migration, safe to drop.
+        const trimmable = path.join(dir, 'trimmable.csv');
+        fs.writeFileSync(trimmable, `${names.join(',')}\n${row('')}\n`);
+        appendCsv(trimmable, [writeReport(dir, 'ok', makeReport())]);
+        for (const line of fs.readFileSync(trimmable, 'utf8').trim().split('\n')) {
+            assert.equal(splitCsvLine(line).length, names.length, line);
+        }
+
+        // Trailing value: dropping it would lose a measurement.
+        const corrupt = path.join(dir, 'corrupt.csv');
+        fs.writeFileSync(corrupt, `${names.join(',')}\n${row('99')}\n`);
+        assert.throws(
+            () => appendCsv(corrupt, [writeReport(dir, 'bad', makeReport())]),
+            /populated fields against/
+        );
+    });
+});
+
+test('a reordered or renamed column is refused, not guessed at', () => {
+    withTempDir((dir) => {
+        const csv = path.join(dir, 'scores.csv');
+        const names = COLUMNS.map(([name]) => name);
+        const scrambled = [names[1], names[0], ...names.slice(2)];
+        fs.writeFileSync(csv, `${scrambled.join(',')}\n`);
+
+        assert.throws(
+            () => appendCsv(csv, [writeReport(dir, 'x', makeReport())]),
+            /columns this reporter cannot extend/
+        );
+    });
+});
+
+test('splitCsvLine round-trips what csvField produces', () => {
+    const values = ['plain', 'a,b', 'say "hi"', 'two\nlines', '', '0.5'];
+    assert.deepEqual(splitCsvLine(values.map(csvField).join(',')), values);
 });
 
 test('csvField escapes anything that would break the row', () => {

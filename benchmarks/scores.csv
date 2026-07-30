@@ -1,4 +1,7 @@
-run,finished_at,corpus,images,constellations_per_image,max_constellations,point_count,working_max_side,layout_version,rank1,rank1_rate,recall_at_k,mrr,rank1_field_observations,rank1_field_descriptor,median_constellations,mean_constellations,mean_seeds,early_stop_rate,mean_top_confidence,mean_separation,mean_search_seconds,train_seconds_per_image,mean_words_per_image
-sample-c600-m60,2026-07-30T08:39:19.996Z,11,11,600,60,5,1024,1,10,0.909091,1,0.954545,2,3,60,51.272727,98.636364,0.363636,0.268662,3.40421,0.709,91.284545,3947
-sample-c600-m120,2026-07-30T08:39:31.389Z,11,11,600,120,5,1024,1,10,0.909091,1,0.954545,4,5,120,89.454545,165.454545,0.363636,0.271109,3.432468,0.978818,,3947
-sample-c600-m240,2026-07-30T08:39:50.142Z,11,11,600,240,5,1024,1,11,1,1,1,2,3,240,157.090909,291.909091,0.454545,0.269329,3.481626,1.696818,,3947
+run,finished_at,corpus,images,constellations_per_image,max_constellations,point_count,working_max_side,layout_version,rank1,rank1_rate,recall_at_k,mrr,rank1_field_observations,rank1_field_descriptor,median_constellations,mean_constellations,mean_seeds,early_stop_rate,mean_top_confidence,mean_separation,mean_search_seconds,train_seconds_per_image,mean_words_per_image,rank1_triple_features
+sample-c600-m60,2026-07-30T08:39:19.996Z,11,11,600,60,5,1024,1,10,0.909091,1,0.954545,2,3,60,51.272727,98.636364,0.363636,0.268662,3.40421,0.709,91.284545,3947,
+sample-c600-m120,2026-07-30T08:39:31.389Z,11,11,600,120,5,1024,1,10,0.909091,1,0.954545,4,5,120,89.454545,165.454545,0.363636,0.271109,3.432468,0.978818,,3947,
+sample-c600-m240,2026-07-30T08:39:50.142Z,11,11,600,240,5,1024,1,11,1,1,1,2,3,240,157.090909,291.909091,0.454545,0.269329,3.481626,1.696818,,3947,
+s20-c600-m60,2026-07-30T10:29:30.265Z,20,20,600,60,5,1024,1,15,0.75,1,0.841667,3,4,60,51,266.95,0.35,0.152267,1.232499,1.5439,32.81385,1236.6,5
+s20-c600-m240,2026-07-30T10:31:00.631Z,20,20,600,240,5,1024,1,15,0.75,1,0.854167,4,5,240,168,891.4,0.35,0.150415,1.230934,4.51235,,1236.6,9
+s20-c600-m240,2026-07-30T10:31:00.631Z,20,20,600,240,5,1024,1,15,0.75,1,0.854167,4,5,240,168,891.4,0.35,0.150415,1.230934,4.51235,,1236.6,9

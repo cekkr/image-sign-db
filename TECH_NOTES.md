@@ -148,9 +148,13 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   weight into `[0,1]` before using it as activation, so saturating explicitly is what keeps "seen
   once" distinct from "seen repeatedly".
 - **Ingestion.** `putImage(complete:false)` → `putSigns` → `commitGraph` → `markComplete`, the same
-  commit-marker protocol as `CheetahStore`. Soft assignment is applied on the ingestion side: a
-  triple is written under every word of its edge sweep (at most 4), so a query only has to ask for
-  the cell it actually fell in.
+  commit-marker protocol as `CheetahStore`. Soft assignment lives on the **query** side: ingestion
+  stores only the primary word of each triple. The choice is symmetric in effect and was decided by
+  measurement — storing all four words of a sweep put ~6 900 postings and ~5 400 graph edges behind
+  one image and cost ~108 s per image; storing the primary only is ~2 400 postings, ~1 700 edges and
+  **28 s**, with accuracy unchanged, while a query-side variant costs one extra seed on a recall that
+  was happening anyway. Of that 28 s, `commitGraph` is ~19 s: graph edge upserts, not pair writes,
+  are what ingestion time is made of.
 - **Search.** Measure a batch of constellations → drop unknown and too-common words
   (`GRAPH_DEGREE`) → seed `GRAPH_RECALL` with the rarest survivors (`hops=1`, `decay=1`,
   `direction=out`, `type=sign`, batched at the server's 32-seed cap) → fold each hit's *per-seed*
@@ -158,14 +162,20 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   stop when the leader holds `SIGN_SEARCH_CONFIDENCE` of the belief and leads by
   `SIGN_SEARCH_SEPARATION`. Evidence is accumulated in Node rather than by one large recall because
   the server's noisy-OR saturates: right *inside* a batch, wrong *across* batches.
-- **Rerank.** Candidates are scored with the study's continuous colour field — a Gaussian-RBF
-  interpolator over the constellation's own local frame with a Gaussian-process posterior variance
-  read as confidence, and the `C·E + β(1−C)` scoring rule. Hue's circular encoding from the study's
-  §1 is deliberately **not** implemented: the field interpolates delta magnitudes, which are not
-  circular.
+- **Rerank — reported, never applied.** Candidates are scored three ways: the study's `C·E + β(1−C)`
+  rule over observations, its canonical-descriptor distance, and a plain distance between the matched
+  triple's continuous features. All three first align both signs on the triple whose word matched
+  (`alignToTriple`); without that the two frames share nothing but each being centred on its own seed
+  pixel. Hue's circular encoding from the study's §1 is deliberately **not** implemented — the field
+  interpolates delta magnitudes, which are not circular.
+  Measured on the 20-image corpus, all three score *below* the graph they would reorder (5/20, 6/20,
+  8/20 against 16/20), the crudest of them highest, and raising the sample from 12 signs to 60 changes
+  nothing. Diagnosis and the direction a next attempt should take are in `AGENTS.md` → Known Gaps.
 - **CLI.** `node src/sign.js train|find|evaluate|stats`, `--spawn` to run the vendored server for
-  the command's duration. `evaluate` re-identifies each trained image from a fresh random draw, and
-  `--report <file>` writes the run as JSON.
+  the command's duration. `--db-name` selects the Cheetah database for training and for search
+  (`--database` is an older alias); `--reset` drops it first and is **training only** — `find` and
+  `stats` refuse it rather than deleting the corpus they were about to read. `evaluate` re-identifies
+  each trained image from a fresh random draw, and `--report <file>` writes the run as JSON.
 - **Benchmarking.** `./benchmark.sh` sweeps `(training density × search ceiling)`, one run each,
   building `cheetah-server` if needed and holding one instance for the whole session so start-up
   cost stays out of the timings. Each density gets a fresh Cheetah database. Reports land in
@@ -206,11 +216,15 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
     `SIGN_WITH_CENTRE_POSITION` (false), and under `search`: `SIGN_SEARCH_BATCH` (12),
     `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (240),
     `SIGN_SEARCH_STOPWORD_RATIO` (0.6), `SIGN_SEARCH_SEEDS_PER_ROUND` (96),
-    `SIGN_SEARCH_CONFIDENCE` (0.25), `SIGN_SEARCH_SEPARATION` (1.5),
-    `SIGN_SEARCH_RERANK_TOP` (5), `SIGN_SEARCH_RERANK_SIGNS` (12).
-    The two stopping thresholds were measured on `sample_images/`, not guessed: `confidence` is the
-    leader's share of mass across every candidate the recall surfaced, so it does not approach 1 —
-    on 11 images the true match leads with 15-28%.
+    `SIGN_SEARCH_LENGTH_SLOPE` (0), `SIGN_SEARCH_CONFIDENCE_MULTIPLE` (2),
+    `SIGN_SEARCH_SEPARATION` (1.35), `SIGN_SEARCH_RERANK_TOP` (5), `SIGN_SEARCH_RERANK_SIGNS` (12).
+    Every one of these was measured on `sample_images/`, and three are counter-intuitive:
+    `CONFIDENCE_MULTIPLE` is a multiple of the uniform share `1/corpus` because an absolute share
+    stops firing when the corpus grows (the leader led with 15-28% on 11 images and ~10% on 20);
+    `LENGTH_SLOPE` defaults to 0 because correcting for vocabulary size made rank-1 monotonically
+    worse (80/80/60/50/35% at 0/0.25/0.5/0.75/1.0); `SEPARATION` is the criterion that carries the
+    signal, and 1.35 stops 8 of 20 searches early at no accuracy cost while 1.15 stops 14 and costs
+    three of them.
     The vocabulary quantisation tables are **not** here: they are frozen in
     `src/lib/sign/constants.js` behind `SIGN_LAYOUT_VERSION`, because an environment variable that
     repartitioned the vocabulary would invalidate every stored graph edge without saying so.
@@ -250,24 +264,21 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
 - The sign pipeline (§10½) adds `test/sign-geometry`, `sign-field`, `sign-words` and `sign-keys`
   (28 pure tests, run by default) plus `test/sign-integration` (ingestion → postings → graph →
   search against a live server, gated the same way). Whole suite: 82 green.
-- The sign real-data gate ran `node src/sign.js evaluate sample_images/`: 11 images × 600
-  constellations ingested in 17 m 19 s, then each re-identified from a **fresh** random draw at
-  11/11 rank-1. With `SIGN_SEARCH_CONFIDENCE=0.25` / `SIGN_SEARCH_SEPARATION=1.5` (now the
-  defaults) the same 11/11 holds while five of eleven searches stop after 24–36 constellations
-  instead of the 240 ceiling. Reordering the graph's top five by either of the study's field rules
-  scored 3/11 (observations) and 1/11 (canonical descriptor) — at or below chance, which is why the
-  rerank is reported and never applied.
-- `./benchmark.sh -c 600 -m 60,120,240` over the same corpus gives the cost/accuracy curve
-  (`benchmarks/scores.csv`):
-
-  | ceiling | rank-1 | MRR | recall@5 | early stops | mean search |
-  | --- | --- | --- | --- | --- | --- |
-  | 60 | 10/11 (90.9%) | 0.955 | 11/11 | 36.4% | 0.71 s |
-  | 120 | 10/11 (90.9%) | 0.955 | 11/11 | 36.4% | 0.98 s |
-  | 240 | 11/11 (100%) | 1.000 | 11/11 | 45.5% | 1.70 s |
-
-  Recall@5 is 100% at every ceiling: the true image always surfaces, and what the extra measuring
-  buys is the *ordering* of the shortlist, not its membership.
+- The sign real-data gate ran `node src/sign.js evaluate sample_images/` over a **20-image** corpus:
+  600 constellations each, ingested at 28.0 s per image (9.3 min total), then each re-identified from
+  a **fresh** random draw — 16/20 rank-1, recall@5 20/20, MRR 0.871, and 8/20 searches stopping early
+  at no accuracy cost. All four misses are near-duplicate confusions (burst shots), and the true image
+  always surfaces, so recall@k and MRR are the metrics to read alongside rank-1 on a corpus like this.
+  An earlier 11-image corpus scored 11/11 on the same code path.
+- `./benchmark.sh` records the cost/accuracy curve in `benchmarks/scores.csv`. On the 20-image corpus
+  (`-c 600 -m 60,240`): 15/20 at a 60-constellation ceiling (1.54 s mean search) and 15/20 at 240
+  (4.51 s), recall@5 100% and 35% early stops at both — so past 60 constellations the extra measuring
+  buys almost nothing here (MRR 0.842 → 0.854). On the earlier 11-image corpus the same sweep did
+  improve rank-1 (10/11 at 60 and 120, 11/11 at 240), which is the difference a corpus with
+  near-duplicates makes.
+- **Expect ±1 image of run-to-run variance.** Training constellations are drawn from `Math.random`
+  unless seeded, so a freshly trained corpus is not the same corpus: the same code scored 16/20 on one
+  training run and 15/20 on another. Compare benchmark rows, not single evaluations.
 - The Phase 2 real-data gate ran `src/train.js` over 50 images against Cheetah port 4471. All 50
   records completed; 15,000 features formed 11,860 candidate-scan prefixes with page sizes p50=1,
   p95=2, p99=3, max=5, and zero above the 500-row target. This validates the version-1 scan layout
