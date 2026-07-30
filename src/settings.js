@@ -82,6 +82,43 @@ const cheetahSettings = {
   graphTermIndex: getBoolean('CHEETAH_GRAPH_TERM_INDEX', false),
 };
 
+// The sign pipeline (src/lib/sign/, src/signPipeline.js, src/sign.js).
+//
+// Only *operational* knobs live here. The quantisation tables that decide which
+// vocabulary word a measurement falls into are frozen in
+// src/lib/sign/constants.js and are deliberately not environment variables: an
+// env var that repartitions the vocabulary would silently invalidate every
+// stored graph edge.
+const signSettings = {
+  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 600),
+  pointCount: getNumber('SIGN_POINT_COUNT', 5),
+  pointPatchRelative: getNumber('SIGN_POINT_PATCH_REL', 0.004),
+  workingMaxSide: getNumber('SIGN_WORKING_MAX_SIDE', 1024),
+  // Off by default: pinning where the centre sits makes a sign refuse to match
+  // the same subject at another aspect ratio, because the half-diagonal unit
+  // rescales differently per axis.
+  withCentrePosition: getBoolean('SIGN_WITH_CENTRE_POSITION', false),
+  search: {
+    batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
+    minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 24),
+    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 240),
+    // A word carried by more than this share of the corpus is a stop word and
+    // is not worth a recall seed.
+    stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 0.6),
+    seedsPerRound: getNumber('SIGN_SEARCH_SEEDS_PER_ROUND', 96),
+    // "Confidence" is the leader's share of the mass across every candidate the
+    // recall has surfaced, so it does not approach 1 the way a posterior over a
+    // closed set would — on an 11-image corpus the true match leads with
+    // 15-28%. These two defaults were measured, not guessed: at 0.25/1.5 the
+    // sample_images run keeps 11/11 rank-1 while five of eleven searches stop
+    // after 24-36 constellations instead of running to the ceiling.
+    confidenceTarget: getNumber('SIGN_SEARCH_CONFIDENCE', 0.25),
+    separationTarget: getNumber('SIGN_SEARCH_SEPARATION', 1.5),
+    rerankTop: getNumber('SIGN_SEARCH_RERANK_TOP', 5),
+    rerankSigns: getNumber('SIGN_SEARCH_RERANK_SIGNS', 12),
+  },
+};
+
 const correlationSettings = {
   similarityThreshold: getNumber('CORRELATION_SIMILARITY_THRESHOLD', 0.2),
   maxCandidateSample: getNumber('CORRELATION_MAX_CANDIDATE_SAMPLE', 256),
@@ -146,6 +183,7 @@ const settings = {
   search: searchSettings,
   database: databaseSettings,
   cheetah: cheetahSettings,
+  sign: signSettings,
   correlation: correlationSettings,
   training: trainingSettings,
 };

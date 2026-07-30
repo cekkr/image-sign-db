@@ -2,9 +2,40 @@
 
 Fast-access operational reference for agents working in this repository.
 
+## Pre-flight — do this before anything else, every request
+
+**1. Pull the [`cheetah/`](cheetah) submodule before you start.** Not once per session, not "if it
+looks stale": at the beginning of *every* request, before reading code, before planning. This
+repository pins a SHA and Cheetah is a moving target, so anything you conclude from a stale checkout
+may be wrong about the database you will actually talk to.
+
+```bash
+git -C cheetah pull --ff-only origin main
+```
+
+If the fast-forward is refused, stop and report it — the submodule has diverged and silently
+resetting it would destroy work.
+
+**2. If you edit anything under `cheetah/`, the commit goes in the `cheetah/` git repository, on its
+own `main`.** A Cheetah change committed in *this* repository records nothing: submodule content
+lives in the submodule's own history. The sequence is always commit inside `cheetah/` → push to its
+`main` → only then `git add cheetah` here to bump the pointer.
+
+```bash
+git -C cheetah add -A && git -C cheetah commit -m "…" && git -C cheetah push origin main
+```
+
+Cheetah's own rules are stricter than this repository's and apply to that commit — `gofmt`,
+`go build ./... && go vet ./... && go test ./src`, and a same-commit update to
+[`cheetah/AGENTS.md`](cheetah/AGENTS.md). The full list is in
+[Working with the Cheetah submodule](#working-with-the-cheetah-submodule); read it before committing
+there.
+
 **Image Sign DB** is a research-stage content-based image retrieval (CBIR) engine written in CommonJS Node.js. It never stores or compares whole images: it samples a deterministic *constellation* of relative anchor/neighbour patch pairs, stores only the HSV/luminance **delta** between them, and identifies an image through a server-driven question/answer dialogue in which the client measures only the descriptors the server asks for.
 
-> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. The MySQL implementation remains the only complete pipeline. [`src/lib/cheetah/`](src/lib/cheetah) now implements roadmap Phases 0–2: `STORAGE_BACKEND=cheetah` routes exhaustive ingestion and the random first progressive cycle to Cheetah with completion gating and bounded payload-budget pruning. Search, evaluation, guided ingestion, discovery, image deletion, and graph-aware pruning are not ported. Do not read later roadmap phases as a description of what runs.
+> **Migration in progress — read this before touching storage.** The project is moving off **MySQL** onto **[Cheetah DB](cheetah)** (vendored as a git submodule), and rebuilding recognition around **n-gram probe paths** plus a **property graph** that resolves a set of measured descriptors into an image ID. [`ROADMAP.md`](ROADMAP.md) owns that plan. For the original `delta` family, the MySQL implementation remains the only complete pipeline. [`src/lib/cheetah/`](src/lib/cheetah) implements roadmap Phases 0–2: `STORAGE_BACKEND=cheetah` routes exhaustive ingestion and the random first progressive cycle to Cheetah with completion gating and bounded payload-budget pruning. Search, evaluation, guided ingestion, discovery, image deletion, and graph-aware pruning are not ported for that family. Do not read later roadmap phases as a description of what runs.
+
+> **There are now two pipelines, and they share nothing but the database.** The **`delta` family** is everything described above and below unless a section says otherwise. The **sign pipeline** ([`src/lib/sign/`](src/lib/sign), [`src/lib/cheetah/signStore.js`](src/lib/cheetah/signStore.js), [`src/signPipeline.js`](src/signPipeline.js), [`src/sign.js`](src/sign.js)) is a second recognition engine, Cheetah-native end to end and complete end to end — train, search and evaluate all run. It implements the constellation specification and [`studies/continuous_colors_function.md`](studies/continuous_colors_function.md): odd-length point chains, HSV deltas against the neighbour towards the centre, half-diagonal units, a frozen 73 728-word vocabulary, `GRAPH_RECALL` over word→image edges as the resolver, and a Gaussian-process colour field as the reranker. It never touches MySQL and does not use `STORAGE_BACKEND`. When a contract below says "descriptor", "`f:`", `value_types` or `ANCHOR_SCALE`, it is about the delta family only.
 
 What this project is **not**:
 
@@ -40,7 +71,7 @@ Vocabulary, defined once:
 
 - **Documentation sync is enforced.** Touching `src/lib/augmentations.js`, `src/lib/constants.js`, `src/lib/constellation.js`, `src/lib/vectorGenerators.js`, `src/lib/vectorSpecs.js`, `src/lib/descriptor.js`, `src/featureExtractor.js`, `src/settings.js`, `src/setupDatabase.js`, `src/lib/schema.js`, `src/index.js`, or `src/clientAPI.js` requires an accompanying edit to `README.md` and/or `TECH_NOTES.md`. Run `npm run maintenance:check` before committing. **Exception/limitation:** the checker reads `git status --porcelain`, so it only sees the *uncommitted* working tree — it passes trivially once you commit, and it does not know about `AGENTS.md`. Update this file by hand under the same triggers.
 - **Tests cover the Cheetah groundwork only.** `npm test` runs `node --test test/*.test.js` — the protocol codec and the key codec, both pure. `npm run test:integration` additionally builds and spawns `cheetah-server` and round-trips against it. **Nothing in the MySQL pipeline is tested**: verification there still means running the real pipeline against a MySQL instance and a small dataset. Never report a change as "tested" without saying which command you ran and against what data.
-- **Anything under [`src/lib/cheetah/`](src/lib/cheetah) needs a test with it.** That directory was built test-first for a reason — the key layout is a wire format and the protocol is untyped text. Do not add a function there without covering it.
+- **Anything under [`src/lib/cheetah/`](src/lib/cheetah) or [`src/lib/sign/`](src/lib/sign) needs a test with it.** Those directories were built test-first for a reason — the key layout and the sign vocabulary are wire formats, and the protocol is untyped text. Do not add a function there without covering it.
 - **Datasets are untracked.** `datasets/*` is git-ignored; `.env` is git-ignored. Never commit images, credentials, or `.env`. `.gitignore` whitelists `.env.example`, but no such file exists — if you add environment variables, adding `.env.example` is the right place to document them.
 - **Preserve the dirty tree.** The working tree was clean at branch `main` when this file was written. Do not `git clean`, `git checkout --`, or stash unrelated changes to simplify your own work.
 - **Schema changes go in [`src/setupDatabase.js`](src/setupDatabase.js) only**, as `CREATE TABLE IF NOT EXISTS` plus a best-effort `ALTER` wrapped in `try/catch`. The script must stay idempotent and re-runnable on a populated database.
@@ -224,9 +255,65 @@ Phases 0–1 plus the Phase 2 storage/ingestion slice in [`ROADMAP.md`](ROADMAP.
     count then last-use time, and deletes one bounded batch (maximum 5,000) with exact
     `DEL pairs key=` operations plus matching `use:` rows. Usage payloads carry `feature_key`
     because the SHA-1-based `use:` key is not invertible. Incomplete images are protected.
-  - No graph records exist in Cheetah yet. Phase 4 must exclude graph-pinned feature rows before
-    graph learning and size-budget pruning are enabled together.
+  - The **delta** family writes no graph records. Phase 4 must exclude graph-pinned feature rows
+    before graph learning and size-budget pruning are enabled together. (The sign pipeline's graph
+    records live in its own namespaces and are not touched by `f:` pruning.)
 - [`server.js`](src/lib/cheetah/server.js) — development/test lifecycle only: `ensureServerBinary` (builds from the submodule if missing), `startServer` (headless, polls for the listener), `stop` (SIGTERM then SIGKILL). Defaults to `CHEETAH_GRAPH_TERM_INDEX=0` and `pair_bytes=2`.
+- [`graph.js`](src/lib/cheetah/graph.js) — the `GRAPH_*` surface: `setNode`, `setEdgeBatch`, `degree`, `recall`, `recallBatched`, `encodeJsonArgument`. Used by the sign pipeline; the delta family does not touch the graph.
+  - **`GRAPH_*` splits `key=value` tokens on whitespace** (`parseKeyValueArgs` → `strings.Fields`), so no value may contain a space. Anything free-form — props, batch items — travels base64. The split itself is on the *first* `=` (`strings.Cut`), so base64 padding inside a value is safe.
+  - **`GRAPH_RECALL` accepts at most 32 seeds** (`graphRecallMaxSeeds`). `recallBatched` batches above that and merges with the same noisy-OR the server uses inside one batch.
+  - `setEdgeBatch` throws when the server reports `failed > 0`. An ignored partial batch is an index with holes in it, and nothing downstream would notice.
+  - `recallBatched` keeps each hit's **`sources`** — which seeds reached it, with how much activation — rather than collapsing them. That list is the only part of the answer a caller can reweight, and the sign search's idf weighting depends on it.
+- [`signStore.js`](src/lib/cheetah/signStore.js) — storage and retrieval for [`src/lib/sign/`](src/lib/sign): `putImage`, `putSigns`, `commitGraph`, `markComplete`, `listImages`, `wordDegrees`, `recallImages`, `signsForWord`, `getSign`. Same commit-marker protocol as `CheetahStore` — readers ignore anything without `complete`.
+  - It validates `cfg:sign_layout_version` on connect, **separately from** `cfg:key_layout_version`. The two layouts version independently because the namespaces are disjoint.
+  - **Soft assignment happens here, on the write side.** A triple is written under every word of its edge sweep (≤4), so a query only asks for the cell it actually fell in. Sweeping on both sides would widen a match by two cells instead of one.
+  - Edge weight is `min(1, tf / TF_SATURATION)` because Cheetah clamps weight into `[0,1]` before using it as activation (`graphRecallAffinity`); a raw count would flatten to 1 the moment it exceeded one.
+
+### [`src/lib/sign/`](src/lib/sign) — the sign algorithm
+
+Seven modules implementing the constellation specification and [`studies/continuous_colors_function.md`](studies/continuous_colors_function.md). Everything except `sampler.js` is pure: no socket, no settings, no image library.
+
+- [`constants.js`](src/lib/sign/constants.js) — **a wire format.** Point count, hop-radius factors, the level tables that decide which vocabulary word a measurement falls into, the field's probe grid and error weights. Changing any of them re-partitions the vocabulary, so nothing here is an environment variable and `SIGN_LAYOUT_VERSION` guards the lot.
+  - It records the two readings the specification left open: `CIRCUMFERENCE_TO_RADIUS` (the drawn length is a *circumference*, so radius is `C/2π` — the radius reading cannot be placed inside a square frame at all), and the doubled circular hue distance.
+- [`rng.js`](src/lib/sign/rng.js) — mulberry32 + SHA-1 seeding. Deliberately not `augmentations.js`'s `createSeededRandom`: that one backs a permanent determinism contract and drags in `sharp`; constellations are meant to be freshly random, and a seed here is a testing affordance.
+- [`geometry.js`](src/lib/sign/geometry.js) — `sampleConstellation` (seed pixel is the **centre**, chain grows outwards, rejection sampling per hop), `layoutFromPoints`, `localFromLinks`, `edgesFromLocal`, `imageScale`, `wrapAngle`/`normalizeAngle`. The unit is the half diagonal throughout.
+  - `sampleConstellation` returns **null** when a chain could not be placed. Callers redraw; accepting a truncated sign would put an out-of-frame point into the corpus.
+- [`measure.js`](src/lib/sign/measure.js) — `measureConstellation` → `pointDeltas` (the stored form, centre `[0,0,0]`) and `edgeDeltas` (chain-forward, what words are built from), plus `edgeDeltasFromPointDeltas` as the inverse.
+- [`field.js`](src/lib/sign/field.js) — `RadialBasisField` (Gaussian RBF with a GP posterior variance read as confidence), `choleskySolve`, `medianNearestNeighbour`, `probeGrid`, `canonicalDescriptor`, `descriptorDistance`, `scoreObservations`.
+  - The study's §1 circular-hue encoding is **not** implemented, on purpose: this field interpolates delta *magnitudes*, which are not circular. Re-adding it would only make sense for an absolute-colour mode, which the specification forbids.
+- [`words.js`](src/lib/sign/words.js) — `tripleWords`, `constellationWords`, `primaryWords`, `allWords`, and the level/sweep primitives.
+  - **A word is a triple, not a whole sign and not a hop.** A whole sign never collides (nothing is ever recalled); a hop always collides (nothing is ever discriminated).
+  - **Hop lengths are almost absent from a word** — only a three-band scale. The radius of every hop is drawn at sampling time, so a fine length describes the sampler, not the image.
+- [`signature.js`](src/lib/sign/signature.js) — `buildConstellationRecord` / `parseConstellationRecord` (the compact one-letter payload), `constellationField`, `constellationDescriptor`, `compareConstellations`.
+  - The record stores **only** what the specification says to: per-point deltas and per-point distance+bearing. Everything else is derived, so there is exactly one place it can be wrong.
+- [`sampler.js`](src/lib/sign/sampler.js) — the only module here that needs `sharp`. `loadImagePixels` applies **EXIF orientation** (`.rotate()`) and downscales to `SIGN_WORKING_MAX_SIDE`; without the rotate, a portrait phone photo is sampled sideways and never matches a straightened copy.
+
+### [`src/signPipeline.js`](src/signPipeline.js)
+
+`trainImage`, `searchImage`, `Evidence`, `selectSeeds`, `inverseDocumentFrequency`, `rerankWithField`.
+
+- **Ingestion order is the commit protocol:** `putImage(complete:false)` → `putSigns` → `commitGraph` → `markComplete`. An interrupted run leaves rows every reader ignores.
+- **Search accumulates evidence in Node, not in one large recall.** `GRAPH_RECALL` scores with a noisy-OR, which is the right rule *inside* a batch ("did these converge") and the wrong one *across* batches ("how much has piled up"), because it saturates towards 1.
+- Two corrections are applied to what the graph reports, and neither is something the graph could apply itself: seed **rarity** (idf), and division by `sqrt(image vocabulary size)` so an image that published many words is not simply more likely to be hit. The second is the document-norm half of a cosine with the vocabulary count standing in for the true norm.
+- **Common mistake:** the search must ask for `primaryWords`, not `allWords`. The sweep was already spent at ingestion; asking for it again widens every match by two cells.
+
+### [`src/sign.js`](src/sign.js)
+
+CLI: `train`, `find`, `evaluate`, `stats`. `--spawn` runs the vendored `cheetah-server` for the command's duration (building it if missing), `--database`, `--constellations`, `--max`, `--skip-train`, `--no-rerank`.
+
+- `evaluate` also accepts `--report <file>` (the whole run as JSON) and `--label <text>`. The report is the benchmark's input; see [`benchmark.sh`](benchmark.sh).
+- **Common mistakes:** there is no `--port`; point it at a non-default server with `CHEETAH_PORT`. `evaluate` re-identifies each image from a **fresh** random draw seeded per filename — a run that reused the trained constellations would prove nothing.
+- On a `--skip-train` run the report reads the corpus's density and vocabulary **back out of the store**, not from `--constellations`. Trusting the flag there recorded whatever `settings.js` defaulted to, which is how the first benchmark labelled an 80-constellation corpus as 600.
+
+### [`benchmark.sh`](benchmark.sh) and [`scripts/benchmark-report.js`](scripts/benchmark-report.js)
+
+`./benchmark.sh` sweeps *(training density × search ceiling)*, one run each, and records the scores. The shell script orchestrates; the Node helper turns `--report` documents into `benchmarks/scores.csv` (appended, accumulating across sessions) and the end-of-run comparison table.
+
+- **The split is deliberate.** Nothing parses the CLI's console output: that output is for people, so scraping it would make every cosmetic change a silent benchmark break. `evaluate --report` emits JSON and the helper reads only that.
+- **`COLUMNS` order in `benchmark-report.js` is a file format.** `scores.csv` is appended to across sessions, so a field inserted in the middle shifts every historical row one column right and every past score becomes wrong. New fields go at the **end**.
+- **`null` must never render as `0`.** A `--skip-train` run has no training time, which is not training that took no time. Covered by [`test/benchmark-report.test.js`](test/benchmark-report.test.js).
+- The script runs **one** `cheetah-server` for the whole session rather than letting each command `--spawn` its own, so start-up cost stays out of the timings; each density gets a fresh database, because a corpus trained at 200 and topped up to 600 is not a corpus trained at 600.
+- `benchmarks/*/` is git-ignored (reports plus the server log, all reproducible); `benchmarks/scores.csv` is deliberately **not** — it is the artefact worth committing.
 
 ### [`test/`](test)
 
@@ -743,6 +830,7 @@ Documentation-sync guardrail run by `npm run maintenance:check`.
 - `node src/setupDatabase.js` → [`src/setupDatabase.js`](src/setupDatabase.js) `setupDatabase` (runs on load).
 - `node src/featureExtractor.js <image>` → exhaustive extraction, guarded by `require.main === module`.
 - `node src/testCorrelations.js` → seeds sample stats (mutates the database).
+- `node src/sign.js train|find|evaluate|stats` → [`src/sign.js`](src/sign.js). The **sign pipeline only**; it needs Cheetah, never MySQL. `--spawn` runs the vendored server for the command; there is no `--port`, use `CHEETAH_PORT`.
 - `npm run maintenance:check` → [`scripts/check-maintenance.js`](scripts/check-maintenance.js).
 
 **Worker message protocol** — [`src/workers/ingestWorker.js`](src/workers/ingestWorker.js): `ingest` / `shutdown` in; `result` / `error` / `shutdown_ack` out.
@@ -754,6 +842,10 @@ Documentation-sync guardrail run by `npm run maintenance:check`.
 [`src/setupDatabase.js`](src/setupDatabase.js)), plus `image_blobs` created lazily by
 [`src/featureExtractor.js`](src/featureExtractor.js). Cheetah Phase 2 ingestion owns `d:`/`t:`/`r:`/
 `f:`/`i:`/`fn:` plus `use:`/`skip:`/`cfg:` through [`src/lib/cheetah/store.js`](src/lib/cheetah/store.js).
+The **sign pipeline** owns a disjoint set — `si:`/`sn:`/`sc:`/`sw:` plus `cfg:sign_layout_version`
+through [`src/lib/cheetah/signStore.js`](src/lib/cheetah/signStore.js) — and, uniquely in this
+repository, Cheetah **graph** records: `w<hex5>` word nodes, `m<hex8>` image nodes, and `sign` edges
+between them.
 
 ## Build, Run, Debug, and Release
 
@@ -921,6 +1013,12 @@ checks.
 | [`test/cheetah-protocol.test.js`](test/cheetah-protocol.test.js) | Response parsing (`SUCCESS`/`ERROR`/`PENDING`, `value=` rest-of-line, `items=`, `next_cursor`, `payload=`, `branches=`) and argument encoding, including the `x<HEX>` escape and the `rawArgument` cursor pass-through | yes |
 | [`test/cheetah-keys.test.js`](test/cheetah-keys.test.js) | ROADMAP §3: key round-trip (including fixed-width filename image-id payloads), byte-order == numeric-order via `Buffer.compare`, negative-offset ordering, the ≤2-bucket sweep contract, and a 10⁵-descriptor collision fuzz | yes |
 | [`test/cheetah-integration.test.js`](test/cheetah-integration.test.js) | Live round-trip against a spawned `cheetah-server`: pair set/get, pooled KV, paged scan, summary, graph recall, token vocabulary, storage completion gating/candidate hydration, page measurement, payload-budget accounting and cold-row pruning, usage/skip/settings mutation, pipelining, namespace delete | **no** — gated on `CHEETAH_INTEGRATION=1`, i.e. `npm run test:integration`, because it needs a Go toolchain |
+| [`test/sign-geometry.test.js`](test/sign-geometry.test.js) | Constellation placement: every point on a real pixel across six aspect ratios, the centre as seed with no link, `links` → local frame round-trip, scale invariance of the half-diagonal unit, odd-point-count enforcement, angle conventions | yes |
+| [`test/sign-field.test.js`](test/sign-field.test.js) | The four claims `studies/continuous_colors_function.md` makes: exact interpolation at reference points, confidence decaying away from samples, geometry (not just nearest distance) deciding confidence, and the `β(1−C)` term stopping a candidate from winning by being uncertain | yes |
+| [`test/sign-words.test.js`](test/sign-words.test.js) | Vocabulary codec: level monotonicity, edge-tolerance sweeps in both directions and their `MAX_WORD_VARIANTS` cap, turn-angle wrap, determinism, and every word inside `WORD_CARDINALITY` under 4 000 random triples | yes |
+| [`test/sign-keys.test.js`](test/sign-keys.test.js) | The `si:`/`sn:`/`sc:`/`sw:` layout: round-trip, the posting **prefix hierarchy** the reranker depends on, byte-order == numeric-order, out-of-range refusal, and that no namespace is a prefix of another | yes |
+| [`test/benchmark-report.test.js`](test/benchmark-report.test.js) | `scores.csv` as a file format: header written once, every row the width the header claims, column order stable, `null` as an empty field and as `-` in the table (never `0`), CSV escaping, and refusing a document that is not a report | yes |
+| [`test/sign-integration.test.js`](test/sign-integration.test.js) | The sign pipeline against a live server: ingestion writing constellation records and word postings that read back, graph degree/recall agreeing with what was written, a **fresh** random draw identifying the image it came from, the field rerank ranking the true match best, and incomplete images staying invisible | **no** — gated on `CHEETAH_INTEGRATION=1` |
 
 The closest substitutes for the untested MySQL pipeline, and what each actually covers:
 
@@ -959,6 +1057,7 @@ The closest substitutes for the untested MySQL pipeline, and what each actually 
 - Evaluation harness (`--evaluate`), training self-evaluation, and constellation reprobing (`--reprobe`).
 - Storage-budget pruning plus real-time pruning of skip-pattern descriptors and stale group nodes.
 - Runtime schema guard (`ensureValueTypeCapacity`) and idempotent schema setup.
+- **The sign pipeline, end to end on Cheetah** ([`src/lib/sign/`](src/lib/sign), [`src/lib/cheetah/graph.js`](src/lib/cheetah/graph.js), [`src/lib/cheetah/signStore.js`](src/lib/cheetah/signStore.js), [`src/signPipeline.js`](src/signPipeline.js), [`src/sign.js`](src/sign.js)) — constellation sampling, HSV neighbour deltas in half-diagonal units, the frozen 73 728-word vocabulary, trie postings, `word --sign--> image` graph edges, `GRAPH_RECALL`-driven search with idf/length-normalised evidence, and the Gaussian-process colour field. **Verified**, at pinned Cheetah SHA `8ecdf35`: 28 unit tests and one 8-assertion live round-trip (`node --test test/sign-*.test.js`; `npm run test:integration` is 82 green in total), plus a real-data run over [`sample_images/`](sample_images) — 11 images × 600 constellations ingested in 17 m 19 s (287–5 469 distinct words per image), then each image re-identified from a **fresh** random draw at **11/11 rank-1** (`node src/sign.js evaluate sample_images/`). With the tuned stopping thresholds the same 11/11 holds while five of the eleven searches stop after 24–36 constellations instead of the 240 ceiling. `./benchmark.sh -c 600 -m 60,120,240` gives the cost curve: 10/11 at a 60-constellation ceiling (0.71 s mean search), 10/11 at 120, 11/11 at 240 (1.70 s) — with **recall@5 at 100% throughout**, so the extra measuring buys the ordering of the shortlist, not its membership. The field rerank is reported but does not discriminate — see [Known Gaps](#known-gaps).
 
 ### Experimental / Scaffold
 
@@ -970,7 +1069,10 @@ The closest substitutes for the untested MySQL pipeline, and what each actually 
 
 ### Known Gaps
 
-- **No CI, no lint, and no tests outside [`src/lib/cheetah/`](src/lib/cheetah).** The single largest risk to every contract in this document. The runner now exists, so adding a test is no longer a project-setup task.
+- **No CI, no lint, and no tests outside [`src/lib/cheetah/`](src/lib/cheetah) and [`src/lib/sign/`](src/lib/sign).** The single largest risk to every contract in this document. The runner now exists, so adding a test is no longer a project-setup task.
+- **The sign pipeline's field rerank does not discriminate, and is reported as a diagnostic only.** On the [`sample_images/`](sample_images) run the graph recall was 11/11 rank-1; reordering its top five by the study's observation score gave 3/11 and by its canonical-descriptor distance 1/11 — at or below the ~1-in-5 a coin would get. The likely cause is structural, not a bug: two constellations that share a word were still sampled at unrelated places, so most query points fall where the candidate's field has no observation and the `β(1−C)` term dominates the score. **Neither number reorders anything** — the answer is the graph's — but do not build on the rerank until it has been made frame-comparable (align the two layouts, or compare only signs whose geometry is close).
+- **`SIGN_SEARCH_CONFIDENCE` is not a posterior and must not be read as one.** It is the leader's share of the mass across every candidate the recall has surfaced, so it does not approach 1 the way a probability over a closed set would — on 11 images the true match leads with 15–28%, which is why the default is 0.25 and not 0.9. Both stopping thresholds were measured on [`sample_images/`](sample_images) (0.25/1.5 keeps 11/11 while five of eleven searches stop after 24–36 constellations); they will need re-measuring on a corpus of a different size.
+- **Sign ingestion is slow: ~95 s per image at 600 constellations.** A write is `INSERT` + `PAIR_SET`, so one image is roughly 15 000 round trips; the Cheetah process sits at ~26% CPU throughout, so the cost is per-operation, not throughput. Reducing it means a batched write on the Cheetah side, not a change here.
 - **`knowledge_nodes.miss_count` is never incremented**, so all confidences are 1.0 and the README's "Learning on Search" reinforcement loop does not exist in code.
 - **The quadtree feature family described in the README is unimplemented** — there is no `hsv_tree_mean`/`hsv_tree_delta` producer or consumer.
 - **The README's claim that the server picks the next question from `feature_group_stats` separation scores is stale.** `buildNextQuestion` uses `knowledge_nodes` via `fetchRelatedConstellations`, with random exploration; `feature_group_stats` feeds guided *ingestion*, not question selection.

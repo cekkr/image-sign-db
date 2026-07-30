@@ -146,3 +146,13 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .DS_Store
+
+# benchmark.sh output. The per-run directories hold full JSON reports and the
+# cheetah-server log and are reproducible; benchmarks/scores.csv is the one
+# artefact worth committing, because a regression should show up as a diff.
+benchmarks/*/
+!benchmarks/scores.csv
+
+# Local image corpora are intentionally never committed. `sample_images/` is
+# the developer's convenient default for the benchmark runner.
+sample_images/

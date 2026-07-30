@@ -117,6 +117,62 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
   - Uses `fetchRelatedConstellations` + `extendConstellationPath` to prioritise learned patterns (`source=knowledge`) while occasionally injecting random probes (`source=exploration`/`random`) for privacy and continued learning.
 - CLI mode mirrors HTTP logic for offline searches (`node src/index.js find <image>`).
 
+## 10½. Sign Pipeline (`src/lib/sign/`, `src/lib/cheetah/signStore.js`, `src/signPipeline.js`, `src/sign.js`)
+
+A second, independent recognition engine, Cheetah-native end to end. It shares no code path with the
+`delta` family above and never touches MySQL. Implements the constellation specification plus
+`studies/continuous_colors_function.md`.
+
+- **Descriptor.** A *sign* is a chain of an odd number of points (default 5) whose middle point is
+  the randomly drawn seed. Each hop draws a circumference length uniformly in
+  `[0.25, 1.0] × (W+H)/2`, takes its radius, and rejects angles that leave the frame. Stored per
+  point: the absolute HSV difference against the neighbour towards the centre (the centre is
+  `[0,0,0]` by definition, so no absolute colour is ever persisted), and that hop's distance and
+  bearing **in half-diagonal units** — `1` is the image centre to a corner. Hue is compared as a
+  circular distance, doubled so all three channels share `[0,1]`. The optional centre position
+  (`SIGN_WITH_CENTRE_POSITION`) is off by default because the half-diagonal unit rescales
+  differently per axis and pinning it breaks matching across aspect ratios.
+- **Vocabulary.** Each triple of consecutive points → one integer word from a frozen space of
+  `3 × 6 × 4⁶ = 73,728` (scale band, turn angle, six colour-delta levels). Hop *lengths* are only a
+  three-band scale: the radius is drawn at sampling time, so a fine length describes the sampler and
+  not the image. Level tables and tolerances are frozen in `src/lib/sign/constants.js` behind
+  `SIGN_LAYOUT_VERSION`; `SignStore.connect()` validates `cfg:sign_layout_version` and refuses a
+  mismatch.
+- **Key layout** (owned, like every Cheetah key, by `src/lib/cheetah/keys.js`):
+  `si:<imageHex8>`, `sn:<sha1(filename)>`, `sc:<imageHex8>/<constHex4>`,
+  `sw:<wordHex5>/<imageHex8>/<constHex4>`. Additive to the `f:` layout — a database written before
+  they existed stays readable. The `sw:` segment order is load-bearing: `sw:<word>/` is the posting
+  list and `sw:<word>/<image>/` is the drill-down the reranker walks.
+- **Graph.** `word --sign--> image` edges, `w<hex5>` and `m<hex8>` node ids (bare prefix + hex, no
+  separator word, same reason as `n`/`m` in §13). Edge weight is `min(1, tf / 3)`; Cheetah clamps
+  weight into `[0,1]` before using it as activation, so saturating explicitly is what keeps "seen
+  once" distinct from "seen repeatedly".
+- **Ingestion.** `putImage(complete:false)` → `putSigns` → `commitGraph` → `markComplete`, the same
+  commit-marker protocol as `CheetahStore`. Soft assignment is applied on the ingestion side: a
+  triple is written under every word of its edge sweep (at most 4), so a query only has to ask for
+  the cell it actually fell in.
+- **Search.** Measure a batch of constellations → drop unknown and too-common words
+  (`GRAPH_DEGREE`) → seed `GRAPH_RECALL` with the rarest survivors (`hops=1`, `decay=1`,
+  `direction=out`, `type=sign`, batched at the server's 32-seed cap) → fold each hit's *per-seed*
+  activations into a running belief, weighted by word idf and divided by `sqrt(image vocabulary)` →
+  stop when the leader holds `SIGN_SEARCH_CONFIDENCE` of the belief and leads by
+  `SIGN_SEARCH_SEPARATION`. Evidence is accumulated in Node rather than by one large recall because
+  the server's noisy-OR saturates: right *inside* a batch, wrong *across* batches.
+- **Rerank.** Candidates are scored with the study's continuous colour field — a Gaussian-RBF
+  interpolator over the constellation's own local frame with a Gaussian-process posterior variance
+  read as confidence, and the `C·E + β(1−C)` scoring rule. Hue's circular encoding from the study's
+  §1 is deliberately **not** implemented: the field interpolates delta magnitudes, which are not
+  circular.
+- **CLI.** `node src/sign.js train|find|evaluate|stats`, `--spawn` to run the vendored server for
+  the command's duration. `evaluate` re-identifies each trained image from a fresh random draw, and
+  `--report <file>` writes the run as JSON.
+- **Benchmarking.** `./benchmark.sh` sweeps `(training density × search ceiling)`, one run each,
+  building `cheetah-server` if needed and holding one instance for the whole session so start-up
+  cost stays out of the timings. Each density gets a fresh Cheetah database. Reports land in
+  `benchmarks/<timestamp>/` and one row per run is appended to `benchmarks/scores.csv` by
+  `scripts/benchmark-report.js`. That helper's `COLUMNS` order is a file format — the CSV is
+  appended to across sessions, so new fields go at the end or every historical row shifts.
+
 ## 11. Client Tools & Scripts
 - `src/setupDatabase.js`: Initializes database and tables; idempotent with best-effort migrations.
 - `src/insert.js`:
@@ -144,6 +200,20 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
     (see `ROADMAP.md`).
     `CHEETAH_DATA_DIR`, `CHEETAH_PAIR_INDEX_BYTES` and `CHEETAH_GRAPH_TERM_INDEX` are also
     read by the Go server process itself.
+  - `sign`: operational knobs of the Cheetah-native sign pipeline (§10½) —
+    `SIGN_CONSTELLATIONS_PER_IMAGE` (600), `SIGN_POINT_COUNT` (5, must be odd),
+    `SIGN_POINT_PATCH_REL` (0.004; `0` reads exactly one pixel), `SIGN_WORKING_MAX_SIDE` (1024),
+    `SIGN_WITH_CENTRE_POSITION` (false), and under `search`: `SIGN_SEARCH_BATCH` (12),
+    `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (240),
+    `SIGN_SEARCH_STOPWORD_RATIO` (0.6), `SIGN_SEARCH_SEEDS_PER_ROUND` (96),
+    `SIGN_SEARCH_CONFIDENCE` (0.25), `SIGN_SEARCH_SEPARATION` (1.5),
+    `SIGN_SEARCH_RERANK_TOP` (5), `SIGN_SEARCH_RERANK_SIGNS` (12).
+    The two stopping thresholds were measured on `sample_images/`, not guessed: `confidence` is the
+    leader's share of mass across every candidate the recall surfaced, so it does not approach 1 —
+    on 11 images the true match leads with 15-28%.
+    The vocabulary quantisation tables are **not** here: they are frozen in
+    `src/lib/sign/constants.js` behind `SIGN_LAYOUT_VERSION`, because an environment variable that
+    repartitioned the vocabulary would invalidate every stored graph edge without saying so.
   - `correlation`: similarity thresholds, candidate sample caps, online runner sizing.
   - `training`: defaults for CLI flags, augmentation budgets, progressive ingestion, self-evaluation, real-time pruning, and debug logging.
 - Environment variables in `.env` override defaults; always document new flags here and in this file when adding tunables.
@@ -177,6 +247,27 @@ Authoritative technical reference for Image Sign DB. Update this document whenev
 - `npm run test:integration` additionally builds `cheetah-server` from the submodule, spawns it
   headless on an ephemeral port, and round-trips the client against it. It is skipped by plain
   `npm test` (gated on `CHEETAH_INTEGRATION=1`) so the default suite needs no Go toolchain.
+- The sign pipeline (§10½) adds `test/sign-geometry`, `sign-field`, `sign-words` and `sign-keys`
+  (28 pure tests, run by default) plus `test/sign-integration` (ingestion → postings → graph →
+  search against a live server, gated the same way). Whole suite: 82 green.
+- The sign real-data gate ran `node src/sign.js evaluate sample_images/`: 11 images × 600
+  constellations ingested in 17 m 19 s, then each re-identified from a **fresh** random draw at
+  11/11 rank-1. With `SIGN_SEARCH_CONFIDENCE=0.25` / `SIGN_SEARCH_SEPARATION=1.5` (now the
+  defaults) the same 11/11 holds while five of eleven searches stop after 24–36 constellations
+  instead of the 240 ceiling. Reordering the graph's top five by either of the study's field rules
+  scored 3/11 (observations) and 1/11 (canonical descriptor) — at or below chance, which is why the
+  rerank is reported and never applied.
+- `./benchmark.sh -c 600 -m 60,120,240` over the same corpus gives the cost/accuracy curve
+  (`benchmarks/scores.csv`):
+
+  | ceiling | rank-1 | MRR | recall@5 | early stops | mean search |
+  | --- | --- | --- | --- | --- | --- |
+  | 60 | 10/11 (90.9%) | 0.955 | 11/11 | 36.4% | 0.71 s |
+  | 120 | 10/11 (90.9%) | 0.955 | 11/11 | 36.4% | 0.98 s |
+  | 240 | 11/11 (100%) | 1.000 | 11/11 | 45.5% | 1.70 s |
+
+  Recall@5 is 100% at every ceiling: the true image always surfaces, and what the extra measuring
+  buys is the *ordering* of the shortlist, not its membership.
 - The Phase 2 real-data gate ran `src/train.js` over 50 images against Cheetah port 4471. All 50
   records completed; 15,000 features formed 11,860 candidate-scan prefixes with page sizes p50=1,
   p95=2, p99=3, max=5, and zero above the 500-row target. This validates the version-1 scan layout

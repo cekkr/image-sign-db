@@ -51,6 +51,13 @@ const NAMESPACES = Object.freeze({
     stat: 'stat:',
     ngram: 'g:',
     config: 'cfg:',
+    // The sign pipeline (src/lib/sign/). Additive: these namespaces do not
+    // touch any layout above, so a database written before they existed stays
+    // readable — the sign side carries its own `cfg:sign_layout_version`.
+    signImage: 'si:',
+    signFilename: 'sn:',
+    signConstellation: 'sc:',
+    signWord: 'sw:',
 });
 
 const SEGMENT = '/';
@@ -63,6 +70,10 @@ const HEX_WIDTH = Object.freeze({
     anchor: 4,
     offset: 4,
     order: 2,
+    // 5 hex digits hold 1048576 words against a frozen vocabulary of 73728.
+    word: 5,
+    // Constellations per image, hex: 65536 signs is far above any useful count.
+    constellation: 4,
 });
 
 /**
@@ -495,6 +506,111 @@ function parseNodeId(nodeId) {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Sign namespaces (src/lib/sign/)
+// ---------------------------------------------------------------------------
+//
+//   si:<imageHex8>                                  image record
+//   sn:<sha1(filename)>                             filename -> imageHex8
+//   sc:<imageHex8>/<constHex4>                      one constellation record
+//   sw:<wordHex5>/<imageHex8>/<constHex4>           inverted index posting
+//
+// The posting order is what makes the index useful in a trie: `sw:<word>/`
+// answers "which images know this word", and `sw:<word>/<image>/` narrows to
+// "and which of that image's signs", which is the drill-down the reranker needs
+// after the graph has chosen the candidates.
+
+/** `si:<imageHex8>` → `{filename, width, height, created_at, complete, …}`. */
+function signImageKey(imageId) {
+    return `${NAMESPACES.signImage}${formatImageId(imageId)}`;
+}
+
+/** `sn:<sha1(filename)>` → imageHex8. */
+function signFilenameKey(originalFilename) {
+    return `${NAMESPACES.signFilename}${sha1(originalFilename)}`;
+}
+
+function formatConstellationOrdinal(ordinal) {
+    return hex(ordinal, HEX_WIDTH.constellation, 'constellationOrdinal');
+}
+
+/** `sc:<imageHex8>/<constHex4>` → the constellation record. */
+function signConstellationKey(imageId, ordinal) {
+    return `${NAMESPACES.signConstellation}${formatImageId(imageId)}${SEGMENT}` +
+        `${formatConstellationOrdinal(ordinal)}`;
+}
+
+/** Every constellation of one image. */
+function signConstellationPrefix(imageId) {
+    return `${NAMESPACES.signConstellation}${formatImageId(imageId)}${SEGMENT}`;
+}
+
+function formatWord(word) {
+    return hex(word, HEX_WIDTH.word, 'word');
+}
+
+/** `sw:<wordHex5>/` — every posting of one word, across all images. */
+function signWordPrefix(word) {
+    return `${NAMESPACES.signWord}${formatWord(word)}${SEGMENT}`;
+}
+
+/** `sw:<wordHex5>/<imageHex8>/` — one word's postings inside one image. */
+function signWordImagePrefix(word, imageId) {
+    return `${signWordPrefix(word)}${formatImageId(imageId)}${SEGMENT}`;
+}
+
+/** `sw:<wordHex5>/<imageHex8>/<constHex4>` → the posting payload. */
+function signWordPostingKey(word, imageId, ordinal) {
+    return `${signWordImagePrefix(word, imageId)}${formatConstellationOrdinal(ordinal)}`;
+}
+
+function parseSignConstellationKey(key) {
+    if (typeof key !== 'string' || !key.startsWith(NAMESPACES.signConstellation)) {
+        throw new TypeError(`not a sign constellation key: ${key}`);
+    }
+    const segments = key.slice(NAMESPACES.signConstellation.length).split(SEGMENT);
+    if (segments.length !== 2) {
+        throw new TypeError(`sign constellation key must have 2 segments: ${key}`);
+    }
+    return {
+        imageId: parseImageId(segments[0]),
+        ordinal: unhex(segments[1], 'constellationOrdinal'),
+    };
+}
+
+function parseSignWordPostingKey(key) {
+    if (typeof key !== 'string' || !key.startsWith(NAMESPACES.signWord)) {
+        throw new TypeError(`not a sign word posting key: ${key}`);
+    }
+    const segments = key.slice(NAMESPACES.signWord.length).split(SEGMENT);
+    if (segments.length !== 3) {
+        throw new TypeError(`sign word posting key must have 3 segments: ${key}`);
+    }
+    return {
+        word: unhex(segments[0], 'word'),
+        imageId: parseImageId(segments[1]),
+        ordinal: unhex(segments[2], 'constellationOrdinal'),
+    };
+}
+
+/**
+ * `w<wordHex5>` — the graph node of one vocabulary word.
+ *
+ * Bare prefix + hex, exactly like `n`/`m` above and for the same reason: a
+ * separator word such as `word:` would give Cheetah's lexical term index a
+ * shared token, and two unrelated ids would cross-match at a fixed score.
+ */
+function wordNodeId(word) {
+    return `w${formatWord(word)}`;
+}
+
+function parseWordNodeId(nodeId) {
+    if (typeof nodeId !== 'string' || nodeId[0] !== 'w') {
+        throw new TypeError(`not a word node id: ${nodeId}`);
+    }
+    return unhex(nodeId.slice(1), 'word');
+}
+
 /**
  * Validate any key this module produced against Cheetah's reserved space and
  * the bare-argument rules. Cheap enough to call on every write in tests.
@@ -547,14 +663,27 @@ module.exports = {
     parseNgramKey,
     parseNodeId,
     parseReverseTokenKey,
+    parseSignConstellationKey,
+    parseSignWordPostingKey,
     parseStatKey,
+    parseWordNodeId,
     quantize,
     resolutionBucket,
     resolutionBucketRange,
     resolutionBucketSweep,
     reverseTokenKey,
+    formatConstellationOrdinal,
+    formatWord,
+    signConstellationKey,
+    signConstellationPrefix,
+    signFilenameKey,
+    signImageKey,
+    signWordImagePrefix,
+    signWordPostingKey,
+    signWordPrefix,
     skipKey,
     statKey,
     tokenKey,
     usageKey,
+    wordNodeId,
 };

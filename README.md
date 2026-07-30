@@ -284,6 +284,121 @@ If you are wiring a custom client, call:
 3. For subsequent steps continue with `POST /search/refine` as before, passing each requested descriptor and measured value.
 
 
+The Sign Pipeline (Cheetah-native)
+----------------------------------
+
+Everything above describes the original `delta` pipeline on MySQL. The **sign pipeline** is a second,
+independent recognition engine built directly on [Cheetah DB](cheetah): it shares the project's
+principles — only relative measurements are stored, the database never sees a reconstructable image —
+but it uses a different descriptor, a different index, and Cheetah's property graph instead of SQL
+joins. It lives in [`src/lib/sign/`](src/lib/sign), [`src/signPipeline.js`](src/signPipeline.js) and
+[`src/sign.js`](src/sign.js), and it does not touch MySQL at all.
+
+### What a sign is
+
+A sign is one **constellation**: an odd number of points (5 by default) chained across the image.
+
+1. A seed pixel is drawn at random. It is the **centre** of the chain.
+2. The chain grows outwards in both directions. Each hop draws a circumference length uniformly
+   between 0.25 and 1.0 times the mean image side, takes its radius, and then draws a random angle,
+   keeping it only if the point lands on a real pixel.
+3. Each point's HSV is read, and only the **absolute difference of the three values against the
+   neighbour towards the centre** is kept. The centre therefore has `(0, 0, 0)` by definition, and no
+   absolute colour is ever stored — a sign survives a global exposure or white-balance shift.
+   Hue is compared as a circular distance, so two nearly identical reds are near, not opposite.
+4. Each hop's **distance and bearing** are stored in a single reference unit: `1` is the distance
+   from the centre of the image to a corner (the half diagonal). That is what makes a sign
+   comparable between an image and a rescaled copy of it.
+5. Recording where the centre sits in the frame is **optional and off by default**
+   (`SIGN_WITH_CENTRE_POSITION`). The half-diagonal unit rescales differently per axis, so pinning
+   the centre makes a sign refuse to match the same subject at another aspect ratio.
+
+Training draws many constellations per image; searching draws as few as it can get away with.
+
+### How an image is found
+
+Each triple of consecutive points — two hops, their turn angle, and their six colour deltas — is
+quantised into one integer **word** out of a frozen vocabulary of 73 728. Words are the join key:
+
+- Ingestion writes each constellation under `sc:` and one posting per word under `sw:`, then
+  publishes the image's vocabulary into Cheetah's property graph as `word --sign--> image` edges.
+- A search measures a small batch of constellations, drops the words that are too common or unknown,
+  and hands the rest to **`GRAPH_RECALL` as seeds**. Activation spreads from all of them at once and
+  the graph answers which images they converge on, saying for each hit *which* seeds reached it.
+- The result is reweighted by word rarity and image vocabulary size, folded into a running belief,
+  and the search stops as soon as one image is both dominant and clearly separated — or keeps
+  measuring until the ceiling. This is the "as much as needed for a good confidence" loop.
+- The surviving candidates are reranked with a **continuous colour field**: the constellation's three
+  delta magnitudes as a smooth Gaussian-RBF function of position in its own local frame, scored with
+  the Gaussian-process confidence penalty from
+  [`studies/continuous_colors_function.md`](studies/continuous_colors_function.md). Agreeing where
+  the candidate has real observations is cheap; agreeing only by extrapolation is not.
+
+### Running it
+
+    # start (and build, if needed) the vendored server for the duration of the command
+    node src/sign.js train sample_images/ --constellations 600 --spawn
+    node src/sign.js find sample_images/IMG_3355.jpg --spawn
+    node src/sign.js evaluate sample_images/ --spawn
+
+    # or against a server you already run
+    node src/sign.js stats
+
+`evaluate` trains the corpus and then re-identifies every image from a **fresh** random draw — the
+query constellations are never the trained ones — and reports rank-1 accuracy for both the graph
+recall and the field rerank. Add `--report <file>` to also write the whole run as JSON.
+
+### Benchmarking
+
+`./benchmark.sh` trains, validates, and records the scores. Each *(training density × search
+ceiling)* pair is one run; a run writes a full JSON report under `benchmarks/<timestamp>/` and
+appends one row to `benchmarks/scores.csv`, so results accumulate and a regression shows up as a
+diff rather than as a number nobody wrote down.
+
+    ./benchmark.sh                                # defaults, over sample_images/
+    ./benchmark.sh -c 200,600,1200                # sweep training density
+    ./benchmark.sh -c 600 -m 60,120,240           # sweep the search ceiling
+    ./benchmark.sh -i datasets/mine -l nightly    # another corpus, labelled
+
+    SIGN_SEARCH_SEPARATION=1.2 ./benchmark.sh -l loose   # any SIGN_* knob sweeps this way
+
+It builds `cheetah-server` if it is missing and runs one instance for the whole session, in a
+temporary data directory it removes on exit (`--keep` to keep it). Each training density gets its own
+Cheetah database — a corpus trained at 200 constellations and then topped up to 600 is not the same
+corpus as one trained at 600 — and additional ceilings for that density reuse it instead of
+retraining.
+
+Recorded per run: rank-1 and its rate, recall at the returned depth, mean reciprocal rank, the rank-1
+each field rule would have given, median and mean constellations measured, seeds spent, early-stop
+rate, mean leader confidence and separation, search seconds, and training seconds and vocabulary size
+per image. The summary table at the end compares the runs of that invocation side by side.
+
+### Sign configuration
+
+All of these are read by [`src/settings.js`](src/settings.js) into `settings.sign`:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SIGN_CONSTELLATIONS_PER_IMAGE` | `600` | Signs drawn per image at training time. |
+| `SIGN_POINT_COUNT` | `5` | Points per constellation. Must be odd. |
+| `SIGN_POINT_PATCH_REL` | `0.004` | Side of the square averaged per point, as a fraction of the shorter side. `0` reads exactly one pixel. |
+| `SIGN_WORKING_MAX_SIDE` | `1024` | Longest side the sampler decodes to. |
+| `SIGN_WITH_CENTRE_POSITION` | `false` | Record where the constellation centre sits in the frame. |
+| `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
+| `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |
+| `SIGN_SEARCH_MAX_CONSTELLATIONS` | `240` | Ceiling on one search. |
+| `SIGN_SEARCH_STOPWORD_RATIO` | `0.6` | A word carried by more than this share of the corpus is not worth a seed. |
+| `SIGN_SEARCH_SEEDS_PER_ROUND` | `96` | Recall seeds per round, rarest first. |
+| `SIGN_SEARCH_CONFIDENCE` | `0.25` | Share of belief the leader needs to stop the search. Not a posterior over a closed set — on 11 images the true match leads with 15–28%. |
+| `SIGN_SEARCH_SEPARATION` | `1.5` | How far ahead of the runner-up the leader must be. |
+| `SIGN_SEARCH_RERANK_TOP` | `5` | Candidates passed to the field rerank. |
+| `SIGN_SEARCH_RERANK_SIGNS` | `12` | Measured signs used by the rerank. |
+
+The quantisation tables that decide which word a measurement falls into are **not** environment
+variables. They are frozen in [`src/lib/sign/constants.js`](src/lib/sign/constants.js) behind
+`SIGN_LAYOUT_VERSION`, because an env var that repartitions the vocabulary would silently invalidate
+every stored graph edge; `cfg:sign_layout_version` makes a mismatch fail loudly instead.
+
 Configuration & Tuning
 ----------------------
 
