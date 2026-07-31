@@ -95,7 +95,7 @@ const cheetahSettings = {
 // env var that repartitions the vocabulary would silently invalidate every
 // stored graph edge.
 const signSettings = {
-  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 2048),
+  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 4096),
   pointCount: getNumber('SIGN_POINT_COUNT', 7),
   pointPatchRelative: getNumber('SIGN_POINT_PATCH_REL', 0.004),
   workingMaxSide: getNumber('SIGN_WORKING_MAX_SIDE', 1024),
@@ -214,7 +214,7 @@ const trainingSettings = {
   },
   realTimePruning: {
     enabled: getBoolean('TRAINING_REALTIME_PRUNING_ENABLED', true),
-    intervalMs: getNumber('TRAINING_REALTIME_PRUNING_INTERVAL_MS', 10000),
+    intervalMs: getNumber('TRAINING_REALTIME_PRUNING_INTERVAL_MS', 60000),
     minIngests: getNumber('TRAINING_REALTIME_PRUNING_MIN_INGESTS', 24),
     batchSize: getNumber('TRAINING_REALTIME_PRUNING_BATCH_SIZE', 24),
     vectorBatchSize: getNumber('TRAINING_REALTIME_PRUNING_VECTOR_BATCH', 400),
