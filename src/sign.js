@@ -79,6 +79,19 @@ async function withStore(flags, run) {
 }
 
 /**
+ * An error as one line of a progress log.
+ *
+ * The batch writers report which item failed and why in the message itself, so
+ * the message is the useful part; the stack is not, in a loop that names the
+ * image on the same line. Newlines are folded because a multi-line entry breaks
+ * the alignment of a column the run is read by.
+ */
+function describeError(error) {
+    const message = (error && error.message) || String(error);
+    return message.replace(/\s+/g, ' ').trim();
+}
+
+/**
  * One adaptive checkpoint, as it happens.
  *
  * This is the run's only view of the validation the trainer performs on itself:
@@ -140,6 +153,13 @@ async function commandTrain(store, targets, flags) {
 
     const startedAll = Date.now();
     const results = [];
+    // One image that cannot be written must not end the run. A failure leaves
+    // the image record *incomplete*, and every reader ignores incomplete
+    // records, so the corpus stays consistent with the images that did land —
+    // the rest of the directory is still worth ingesting. The names are
+    // collected and re-printed at the end, and the process exits non-zero, so a
+    // partial run is never mistaken for a clean one.
+    const failures = [];
     // Position in the corpus, right-aligned so the column does not wobble at 10
     // and 100. A benchmark over a real dataset is a long silence otherwise:
     // "how far in is this?" should not require counting lines.
@@ -149,16 +169,25 @@ async function commandTrain(store, targets, flags) {
         // Named before the work, not after: the checkpoint lines belong to this
         // image and arrive while it is still being written.
         if (adaptive) console.log(`  ▸ ${at(index)} ${path.basename(image)}`);
-        const result = adaptive
-            ? await trainImageAdaptive(store, image, {
-                count,
-                extendTo,
-                // The trainer validates itself between chunks whether anyone is
-                // watching; this is what makes it visible while it runs rather
-                // than only in the report afterwards.
-                onCheckpoint: (checkpoint) => reportCheckpoint(checkpoint, ceiling),
-            })
-            : await trainImage(store, image, { count });
+        let result;
+        try {
+            result = adaptive
+                ? await trainImageAdaptive(store, image, {
+                    count,
+                    extendTo,
+                    // The trainer validates itself between chunks whether anyone is
+                    // watching; this is what makes it visible while it runs rather
+                    // than only in the report afterwards.
+                    onCheckpoint: (checkpoint) => reportCheckpoint(checkpoint, ceiling),
+                })
+                : await trainImage(store, image, { count });
+        } catch (error) {
+            const seconds = (Date.now() - started) / 1000;
+            const filename = path.basename(image);
+            failures.push({ filename, error: describeError(error) });
+            console.log(`  ✗ ${at(index)} ${filename}  ${describeError(error)}  (${seconds.toFixed(1)}s)`);
+            continue;
+        }
         const seconds = (Date.now() - started) / 1000;
         results.push({ ...result, seconds });
         console.log(
@@ -166,6 +195,14 @@ async function commandTrain(store, targets, flags) {
             `${result.edges} edges  (${seconds.toFixed(1)}s)` +
             (result.reason ? `  [${result.reason}]` : '')
         );
+    }
+
+    if (failures.length > 0) {
+        console.log(`\n  ${failures.length} of ${images.length} image(s) failed to train:`);
+        for (const failure of failures) console.log(`    ✗ ${failure.filename}  ${failure.error}`);
+        // Trained nothing at all: there is no corpus, and every command that
+        // would follow is meaningless. That is a failed run, not a partial one.
+        if (results.length === 0) throw new Error('every image failed to train');
     }
 
     const signs = results.reduce((sum, result) => sum + result.signs, 0);
@@ -190,6 +227,11 @@ async function commandTrain(store, targets, flags) {
         extendTo: adaptive ? extendTo : 0,
         ceiling,
         images: results.length,
+        // What was asked for, versus what is actually in the corpus. A report
+        // that recorded only the images that worked would describe a corpus of
+        // 199 as a corpus of 198 with no trace of the difference.
+        attempted: images.length,
+        failed: failures,
         seconds: (Date.now() - startedAll) / 1000,
         // What adaptive training actually bought: the share of the ceiling it
         // did not need to write. Measured against `ceiling`, not `count`, or an
@@ -288,12 +330,45 @@ async function commandEvaluate(store, targets, flags) {
     for (const [index, image] of images.entries()) {
         const expected = path.basename(image);
         const started = Date.now();
-        const result = await searchImage(store, image, {
-            maxConstellations,
-            // Seeded per filename so a re-run is comparable, but never with the
-            // seed training used: the query constellations must be fresh.
-            seed: `evaluate:${expected}`,
-        });
+        let result;
+        try {
+            result = await searchImage(store, image, {
+                maxConstellations,
+                // Seeded per filename so a re-run is comparable, but never with the
+                // seed training used: the query constellations must be fresh.
+                seed: `evaluate:${expected}`,
+            });
+        } catch (error) {
+            // A search that threw is a miss, not an absence: it still gets a row,
+            // so the rates below are measured against every image that was asked
+            // for. Dropping the row would quietly raise the accuracy of a run
+            // that went worse than one where the image was merely not found.
+            rows.push({
+                expected,
+                got: null,
+                hit: false,
+                rank: null,
+                confidence: null,
+                mass: null,
+                separation: null,
+                constellations: null,
+                rounds: null,
+                seeds: null,
+                reason: 'error',
+                error: describeError(error),
+                seconds: (Date.now() - started) / 1000,
+                byFieldObservations: null,
+                byFieldDescriptor: null,
+                byTripleFeatures: null,
+                candidates: [],
+            });
+            const hitsSoFar = rows.filter((row) => row.hit).length;
+            console.log(
+                `\n✗ ${at(index)} ${expected} → (error: ${describeError(error)})   ` +
+                `(rank-1 so far ${hitsSoFar}/${rows.length}, ${((hitsSoFar / rows.length) * 100).toFixed(1)}%)`
+            );
+            continue;
+        }
         const seconds = (Date.now() - started) / 1000;
 
         const top = result.candidates[0] || null;
@@ -315,6 +390,7 @@ async function commandEvaluate(store, targets, flags) {
             rounds: result.rounds,
             seeds: result.seeds,
             reason: result.reason,
+            error: null,
             seconds,
             byFieldObservations: bestBy(result.candidates, 'fieldScore')?.filename ?? null,
             byFieldDescriptor: bestBy(result.candidates, 'descriptorScore')?.filename ?? null,
@@ -356,9 +432,14 @@ async function commandEvaluate(store, targets, flags) {
         rank1ByFieldObservations: count((row) => row.byFieldObservations === row.expected),
         rank1ByFieldDescriptor: count((row) => row.byFieldDescriptor === row.expected),
         rank1ByTripleFeatures: count((row) => row.byTripleFeatures === row.expected),
-        meanConstellations: mean(rows.map((row) => row.constellations)),
-        medianConstellations: median(rows.map((row) => row.constellations)),
-        meanSeeds: mean(rows.map((row) => row.seeds)),
+        // Effort statistics describe the searches that ran. A row that errored
+        // measured nothing, and folding its nulls in as zeroes would report a
+        // cheaper search than the one that happened; the failures are counted
+        // separately, as `errors`.
+        errors: count((row) => row.reason === 'error'),
+        meanConstellations: mean(rows.map((row) => row.constellations).filter(Number.isFinite)),
+        medianConstellations: median(rows.map((row) => row.constellations).filter(Number.isFinite)),
+        meanSeeds: mean(rows.map((row) => row.seeds).filter(Number.isFinite)),
         earlyStops: count((row) => row.reason === 'confident'),
         earlyStopRate: count((row) => row.reason === 'confident') / rows.length,
         meanTopConfidence: mean(rows.map((row) => row.confidence).filter(Number.isFinite)),
@@ -381,6 +462,12 @@ async function commandEvaluate(store, targets, flags) {
         `median ${scores.medianConstellations} constellations   ` +
         `early stops ${share(scores.earlyStops)}`
     );
+    if (scores.errors > 0) {
+        console.log(`\n${scores.errors} search(es) failed and are counted as misses above:`);
+        for (const row of rows.filter((row_) => row_.reason === 'error')) {
+            console.log(`  ✗ ${row.expected}  ${row.error}`);
+        }
+    }
 
     const report = {
         label: flags.get('label') || null,
@@ -441,21 +528,31 @@ async function main() {
         throw new Error(`--reset applies to training only, not to '${command || '(no command)'}'`);
     }
 
+    // A run that skipped past failures still failed at them. The commands report
+    // what went wrong and keep going; deciding what that means for the exit
+    // status is this function's job, so `commandTrain`/`commandEvaluate` stay
+    // callable from a test without setting the test runner's own exit code.
     switch (command) {
-        case 'train':
-            await withStore(flags, (store) => commandTrain(store, targets, flags));
+        case 'train': {
+            const training = await withStore(flags, (store) => commandTrain(store, targets, flags));
+            if (training.failed.length > 0) process.exitCode = 1;
             break;
+        }
         case 'find':
             if (targets.length !== 1) throw new Error('usage: sign.js find <image>');
             await withStore(flags, (store) => commandFind(store, targets[0], flags));
             break;
-        case 'evaluate':
-            await withStore(flags, (store) => commandEvaluate(
+        case 'evaluate': {
+            const report = await withStore(flags, (store) => commandEvaluate(
                 store,
                 targets.length > 0 ? targets : ['sample_images'],
                 flags
             ));
+            if (report.scores.errors > 0 || (report.training?.failed.length ?? 0) > 0) {
+                process.exitCode = 1;
+            }
             break;
+        }
         case 'stats':
             await withStore(flags, (store) => commandStats(store));
             break;
@@ -504,4 +601,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { collectImages, parseArgs, withStore };
+module.exports = { collectImages, parseArgs, withStore, describeError, commandTrain, commandEvaluate };

@@ -26,6 +26,7 @@ const keys = require('../src/lib/cheetah/keys');
 const { scanAll } = require('../src/lib/cheetah/kv');
 const { searchImage, trainImage, trainImageAdaptive } = require('../src/signPipeline');
 const { mulberry32 } = require('../src/lib/sign/rng');
+const { commandTrain, collectImages } = require('../src/sign');
 
 function freePort() {
     return new Promise((resolve, reject) => {
@@ -387,6 +388,44 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
             assert.equal(result.record.training, 'fixed');
         } finally {
             await solo.close();
+        }
+    });
+
+    // A store write can fail for reasons that have nothing to do with the image
+    // in front of it — the server running out of file descriptors partway
+    // through a directory is the case this was written for. The failed image is
+    // left incomplete, which every reader already ignores, so the run has no
+    // reason to abandon the images after it.
+    await t.test('training reports a failed image and keeps going', async () => {
+        const resilient = new SignStore({ port, database: 'sign_db_resilient_test' });
+        try {
+            await resilient.connect();
+            // The order the CLI will walk, not the order the fixtures were
+            // written in: the doomed image has to be the one the second call
+            // actually lands on.
+            const listing = collectImages(imageDir).map((file) => path.basename(file));
+            const putSigns = resilient.putSigns.bind(resilient);
+            const doomed = listing[1];
+            let seen = 0;
+            resilient.putSigns = async (imageId, signs) => {
+                seen += 1;
+                if (seen === 2) throw new Error('cheetah PAIR_SET failed: internal_error:too many open files');
+                return putSigns(imageId, signs);
+            };
+
+            const result = await commandTrain(resilient, [imageDir], new Map([['constellations', '120']]));
+
+            assert.equal(result.attempted, listing.length);
+            assert.equal(result.images, listing.length - 1);
+            assert.deepEqual(result.failed.map((failure) => failure.filename), [doomed]);
+            assert.match(result.failed[0].error, /too many open files/);
+            // Everything after the failure was still written, and the failed
+            // image is not in the corpus a reader sees.
+            const stored = await resilient.listImages();
+            const names = [...stored.values()].map((record) => record.filename).sort();
+            assert.deepEqual(names, listing.filter((name) => name !== doomed).sort());
+        } finally {
+            await resilient.close();
         }
     });
 });
