@@ -78,6 +78,32 @@ async function withStore(flags, run) {
     }
 }
 
+/**
+ * One adaptive checkpoint, as it happens.
+ *
+ * This is the run's only view of the validation the trainer performs on itself:
+ * `probeQuality` searches for the image being written, against everything
+ * already stored, and the loop decides from these numbers whether to keep
+ * going. Printing them live is what makes an "exhausted" run legible — the
+ * curve says whether the image was still climbing when the budget ran out or
+ * had been flat for two chunks.
+ *
+ * Gains are `null` at the first checkpoint (nothing to compare against), and
+ * both are signed so that positive always means better: accuracy rises, search
+ * effort falls.
+ */
+function reportCheckpoint(checkpoint, ceiling) {
+    const gain = (value) => (Number.isFinite(value) ? `${value >= 0 ? '+' : ''}${value.toFixed(3)}` : '  n/a');
+    const hits = Math.round(checkpoint.hitRate * checkpoint.probes);
+    console.log(
+        `      · ${String(checkpoint.constellations).padStart(5)}/${ceiling}  ` +
+        `hit ${hits}/${checkpoint.probes}  ` +
+        `margin ${checkpoint.margin >= 0 ? '+' : ''}${checkpoint.margin.toFixed(3)}  ` +
+        `acc ${checkpoint.accuracy.toFixed(3)} (${gain(checkpoint.accuracyGain)})  ` +
+        `effort ${checkpoint.effort.toFixed(3)} (${gain(checkpoint.effortGain)})`
+    );
+}
+
 async function commandTrain(store, targets, flags) {
     const count = numberFlag(flags, 'constellations', settings.sign.constellationsPerImage);
     // `--adaptive` / `--no-adaptive` both override the configured default, so a
@@ -85,6 +111,10 @@ async function commandTrain(store, targets, flags) {
     const adaptive = flags.get('no-adaptive') === 'true'
         ? false
         : (flags.get('adaptive') === 'true' || settings.sign.train.adaptive);
+    // How far an image that is still improving at `count` may keep going. Only
+    // meaningful under adaptive training, where a ceiling is a ceiling and not a
+    // quota; a flat run ignores it.
+    const extendTo = numberFlag(flags, 'extend-to', settings.sign.train.extendTo);
     const images = targets.flatMap(collectImages);
     if (images.length === 0) throw new Error('no images found');
 
@@ -98,10 +128,13 @@ async function commandTrain(store, targets, flags) {
         );
         await store.reset();
     }
+    const ceiling = adaptive ? Math.max(count, extendTo || 0) : count;
     console.log(
         adaptive
-            ? `Training ${images.length} image(s), up to ${count} constellations each, ` +
-              `probing every ${settings.sign.train.checkEvery}`
+            ? `Training ${images.length} image(s), as many constellations as needed ` +
+              `up to ${ceiling}${ceiling > count ? ` (nominal ${count})` : ''}, ` +
+              `validating every ${settings.sign.train.checkEvery} with ` +
+              `${settings.sign.train.probes} probe(s)`
             : `Training ${images.length} image(s) with ${count} constellations each`
     );
 
@@ -109,8 +142,18 @@ async function commandTrain(store, targets, flags) {
     const results = [];
     for (const image of images) {
         const started = Date.now();
+        // Named before the work, not after: the checkpoint lines belong to this
+        // image and arrive while it is still being written.
+        if (adaptive) console.log(`  ▸ ${path.basename(image)}`);
         const result = adaptive
-            ? await trainImageAdaptive(store, image, { count })
+            ? await trainImageAdaptive(store, image, {
+                count,
+                extendTo,
+                // The trainer validates itself between chunks whether anyone is
+                // watching; this is what makes it visible while it runs rather
+                // than only in the report afterwards.
+                onCheckpoint: (checkpoint) => reportCheckpoint(checkpoint, ceiling),
+            })
             : await trainImage(store, image, { count });
         const seconds = (Date.now() - started) / 1000;
         results.push({ ...result, seconds });
@@ -122,15 +165,34 @@ async function commandTrain(store, targets, flags) {
     }
 
     const signs = results.reduce((sum, result) => sum + result.signs, 0);
+    if (adaptive) {
+        // Why each image stopped, which is the summary of the validation above.
+        // `exhausted` means "still improving when the budget ran out" — an
+        // under-trained image, not a converged one — so it is worth counting.
+        const reasons = new Map();
+        for (const result of results) {
+            const reason = result.reason ?? 'unknown';
+            reasons.set(reason, (reasons.get(reason) || 0) + 1);
+        }
+        console.log(
+            `  mean ${(signs / results.length).toFixed(0)} constellations of ${ceiling} ` +
+            `(${((1 - signs / (ceiling * results.length)) * 100).toFixed(1)}% of the ceiling unwritten)  ` +
+            [...reasons].map(([reason, images_]) => `${reason} ${images_}`).join(', ')
+        );
+    }
     return {
         constellationsPerImage: count,
         adaptive,
+        extendTo: adaptive ? extendTo : 0,
+        ceiling,
         images: results.length,
         seconds: (Date.now() - startedAll) / 1000,
         // What adaptive training actually bought: the share of the ceiling it
-        // did not need to write.
+        // did not need to write. Measured against `ceiling`, not `count`, or an
+        // extended run reports a negative saving against a budget it was
+        // explicitly allowed to exceed.
         meanConstellations: signs / results.length,
-        constellationsSaved: adaptive ? 1 - signs / (count * results.length) : 0,
+        constellationsSaved: adaptive ? 1 - signs / (ceiling * results.length) : 0,
         perImage: results.map((result) => ({
             filename: result.filename,
             signs: result.signs,
@@ -400,12 +462,16 @@ async function main() {
                 '                        establishes the corpus instead of adding to it',
                 '  --constellations <n>  signs per image at training time (a ceiling when',
                 '                        adaptive training is on)',
-                '  --adaptive            train in chunks and stop when more constellations stop',
-                '                        improving recall. Off by default: it only pays when images',
-                '                        converge before the ceiling, and on sample_images/ they do',
-                '                        not (+62% for the same output). SIGN_TRAIN_EXTEND_TO lets a',
-                '                        still-improving image go past the ceiling instead.',
+                '  --adaptive            use as many constellations as each image needs: train in',
+                '                        chunks, validate against the corpus between them, and stop',
+                '                        when more constellations stop improving recall. The',
+                '                        checkpoints are printed as they happen. Off by default: it',
+                '                        only pays when images converge before the ceiling, and on',
+                '                        sample_images/ they do not (+62% for the same output).',
                 '  --no-adaptive         force the flat count when the default is adaptive',
+                '  --extend-to <n>       adaptive only: how far an image that is *still* improving',
+                '                        at --constellations may keep going (0 = not at all,',
+                '                        the default; SIGN_TRAIN_EXTEND_TO sets it too)',
                 '  --max <n>             ceiling on constellations measured per search',
                 '  --spawn               start the vendored cheetah-server for this command',
                 '  --data-dir <path>     data directory for --spawn',

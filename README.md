@@ -401,6 +401,22 @@ Three things make the measurement mean what it says:
 Each image ends with one of three reasons: `converged` (the stop rule fired), `exhausted` (it was
 still improving when it hit the ceiling), or `corpus-too-small`.
 
+**Every checkpoint is printed as it happens**, so the validation is readable while the run is going
+rather than only in the JSON report afterwards:
+
+    ▸ 003__sample-3.jpg
+        ·    32/128  hit 0/3  margin -0.198  acc -0.198 (  n/a)  effort 1.000 (  n/a)
+        ·    64/128  hit 3/3  margin +0.295  acc 1.295 (+1.493)  effort 0.250 (+0.750)
+        ·    96/128  hit 3/3  margin +0.520  acc 1.520 (+0.224)  effort 0.250 (+0.000)
+      ✓ 003__sample-3.jpg  128 signs, 345 words, 345 edges  (1.2s)  [exhausted]
+
+`hit` is how many of the probes ranked the image first and `margin` is how far ahead of the runner-up
+it was; `acc` is their sum and `effort` the share of a probe's ceiling a search had to spend. Both
+parenthesised gains are signed so that **positive always means better** — accuracy rises, effort
+falls — and both are measured against the best checkpoint so far, not the previous one. The first
+checkpoint has nothing to compare against and reads `n/a`. `--extend-to <n>` (or
+`SIGN_TRAIN_EXTEND_TO`) lets an image still climbing at the ceiling continue up to `n`.
+
 #### What it measured on `sample_images/`, which was not what it was built to find
 
 The loop was written to cut training time by stopping early. On this corpus it almost never stops,
@@ -426,28 +442,41 @@ whole thing off and writes the flat count.
 
 ### Benchmarking
 
-`./benchmark.sh` trains, validates, and records the scores. Each *(training density × search
+`./benchmark.sh` trains, validates, and records the scores. Each *(training ceiling × search
 ceiling)* pair is one run; a run writes a full JSON report under `benchmarks/<timestamp>/` and
 appends one row to `benchmarks/scores.csv`, so results accumulate and a regression shows up as a
 diff rather than as a number nobody wrote down.
 
     ./benchmark.sh                                # defaults, over sample_images/
-    ./benchmark.sh -c 200,600,1200                # sweep training density
+    ./benchmark.sh -c 200,600,1200                # sweep the training ceiling
     ./benchmark.sh -c 600 -m 60,120,240           # sweep the search ceiling
     ./benchmark.sh -i datasets/mine -l nightly    # another corpus, labelled
+    ./benchmark.sh --no-adaptive                  # flat density instead
+    ./benchmark.sh -c 2048 -e 4096                # let still-improving images continue
 
     SIGN_SEARCH_SEPARATION=1.2 ./benchmark.sh -l loose   # any SIGN_* knob sweeps this way
 
+**Training is adaptive here by default**, unlike the CLI: `-c` is a ceiling, each image gets as many
+constellations as it needs, and the checkpoints stream to the console so an under-trained corpus is
+visible while the sweep runs. `--adaptive`/`--no-adaptive` is always passed to `src/sign.js`
+explicitly, so a run is never silently reinterpreted by whatever `SIGN_TRAIN_ADAPTIVE` says in the
+environment; the mode also lands in the run id (`-fixed`, `-x<n>`) and in the CSV, because two rows
+named `c600-m240` that were trained differently are a comparison waiting to be read wrong.
+
 It builds `cheetah-server` if it is missing and runs one instance for the whole session, in a
-temporary data directory it removes on exit (`--keep` to keep it). Each training density gets its own
-Cheetah database — a corpus trained at 200 constellations and then topped up to 600 is not the same
-corpus as one trained at 600 — and additional ceilings for that density reuse it instead of
-retraining.
+temporary data directory it removes on exit (`--keep` to keep it). Each training ceiling gets its own
+Cheetah database **and** is trained with `--reset` — a corpus trained at 200 constellations and then
+topped up to 600 is not the same corpus as one trained at 600, and a data directory an earlier
+benchmark left behind must not leak into this one. Additional search ceilings for that density reuse
+the trained corpus instead of retraining.
 
 Recorded per run: rank-1 and its rate, recall at the returned depth, mean reciprocal rank, the rank-1
 each field rule would have given, median and mean constellations measured, seeds spent, early-stop
 rate, mean leader confidence and separation, search seconds, and training seconds and vocabulary size
-per image. The summary table at the end compares the runs of that invocation side by side.
+per image, plus — since adaptive training makes the density a ceiling — whether training was adaptive,
+the mean constellations the images actually took, and the share of the ceiling left unwritten. The
+summary table at the end compares the runs of that invocation side by side; `train/img` is what was
+allowed and `wrote/img` what was used, and they differ only under adaptive training.
 
 ### Sign configuration
 
@@ -467,7 +496,7 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 | `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of the probes finds the image. Below it, a flat checkpoint means "not findable yet", not "trained enough". |
 | `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so the ceiling is trained in full. |
 | `SIGN_TRAIN_PROBE_MAX` | `96` | Ceiling on one probe search. Probes also run with the reranker off. |
-| `SIGN_TRAIN_EXTEND_TO` | `0` (off) | How far an image still improving at `SIGN_CONSTELLATIONS_PER_IMAGE` may keep training. Buys recall with training time. |
+| `SIGN_TRAIN_EXTEND_TO` | `0` (off) | How far an image still improving at `SIGN_CONSTELLATIONS_PER_IMAGE` may keep training. Buys recall with training time. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
 | `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
 | `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |
 | `SIGN_SEARCH_MAX_CONSTELLATIONS` | `240` | Ceiling on one search. |

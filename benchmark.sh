@@ -4,23 +4,41 @@
 # fresh random draw, and record the scores.
 #
 #   ./benchmark.sh                                   # defaults, sample_images/
-#   ./benchmark.sh -c 200,600,1200                   # sweep training density
+#   ./benchmark.sh -c 200,600,1200                   # sweep the training ceiling
 #   ./benchmark.sh -c 600 -m 60,120,240              # sweep the search ceiling
 #   ./benchmark.sh -i datasets/mine -o benchmarks    # another corpus
+#   ./benchmark.sh --no-adaptive                     # fixed density instead
 #
-# Each (training density x search ceiling) pair is one run. A run writes a full
+# Training is **adaptive** by default: each image gets as many constellations as
+# it needs rather than a flat quota. `--constellations` is therefore a ceiling —
+# the trainer writes in chunks, re-searches for the image it is writing against
+# everything already stored, and stops once more constellations no longer buy
+# accuracy or a cheaper search. Those checkpoints stream to the console as they
+# happen (`· 512/2048  hit 3/3  margin +0.21  acc … effort …`), so an under-
+# trained corpus is visible while the run is going rather than afterwards, and
+# `--extend-to` lets an image that is still climbing at the ceiling continue.
+#
+# Each (training ceiling x search ceiling) pair is one run. A run writes a full
 # JSON report under --out and appends one row to benchmarks/scores.csv, so
 # results accumulate across sessions and a regression shows up as a diff rather
-# than as a number nobody wrote down.
+# than as a number nobody wrote down. Under adaptive training the row records
+# both what was allowed (`constellations_per_image`) and what the images took
+# (`mean_trained_constellations`); they are the same number only with
+# `--no-adaptive`.
 #
-# Two things this deliberately does *not* do:
+# Three things this deliberately does *not* do:
 #
 #   - It never reuses a trained database across densities. Each density gets its
-#     own Cheetah database, because a corpus trained at 200 constellations and
-#     then topped up to 600 is not the same corpus as one trained at 600.
+#     own Cheetah database *and* trains it with `--reset`, because a corpus
+#     trained at 200 constellations and then topped up to 600 is not the same
+#     corpus as one trained at 600 — and a data directory left behind by an
+#     earlier benchmark must not leak into this one.
 #   - It never evaluates with the seed training used. `src/sign.js evaluate`
 #     seeds per filename with an `evaluate:` prefix; a benchmark that replayed
 #     the trained constellations would score itself on its own homework.
+#   - It never lets the environment decide whether training is adaptive.
+#     `--adaptive`/`--no-adaptive` is always passed explicitly, so a run is not
+#     silently reinterpreted by whatever `SIGN_TRAIN_ADAPTIVE` happens to say.
 #
 # It runs one cheetah-server for the whole session rather than letting each
 # command spawn its own, so start-up cost does not land inside the timings.
@@ -38,25 +56,40 @@ DATA_DIR=""
 KEEP_DATA=0
 PORT=4477
 LABEL=""
+ADAPTIVE=1
+EXTEND_TO=""
 
 usage() {
     cat <<'EOF'
 usage: ./benchmark.sh [options]
 
   -i, --images DIR          image directory or file (default: sample_images)
-  -c, --constellations LIST comma-separated training densities (default: 600)
+  -c, --constellations LIST comma-separated training ceilings (default: 600)
   -m, --max LIST            comma-separated search ceilings (default: SIGN_SEARCH_MAX_CONSTELLATIONS)
   -o, --out DIR             where reports and scores.csv go (default: benchmarks)
   -l, --label TEXT          prefix for run ids inside the reports
+  -a, --adaptive            as many constellations as needed, up to -c (default)
+      --no-adaptive         write exactly -c constellations per image instead
+  -e, --extend-to N         adaptive only: let an image still improving at -c
+                            keep going up to N constellations
       --data-dir DIR        Cheetah data directory (default: a temp dir, removed on exit)
       --keep                keep the Cheetah data directory
       --port N              port for the benchmark's own cheetah-server (default: 4477)
   -h, --help
 
+Training always runs with --reset against a per-density database, so every run
+establishes its corpus rather than adding to one; there is nothing to pass.
+
 Every other tunable is read from the environment by src/settings.js, so a sweep
 over, say, the stop rule is just:
 
   SIGN_SEARCH_SEPARATION=1.2 ./benchmark.sh -l loose
+
+and the adaptive loop's own knobs are SIGN_TRAIN_CHECK_EVERY (constellations
+between validations), SIGN_TRAIN_PROBES, SIGN_TRAIN_MIN_GAIN,
+SIGN_TRAIN_STOP_MIN_HIT_RATE and SIGN_TRAIN_MIN_CORPUS:
+
+  SIGN_TRAIN_CHECK_EVERY=256 ./benchmark.sh -c 2048 -l fine-grained
 EOF
 }
 
@@ -67,6 +100,9 @@ while [ $# -gt 0 ]; do
         -m|--max)            MAX_LIST="$2"; shift 2 ;;
         -o|--out)            OUT_DIR="$2"; shift 2 ;;
         -l|--label)          LABEL="$2"; shift 2 ;;
+        -a|--adaptive)       ADAPTIVE=1; shift ;;
+        --no-adaptive)       ADAPTIVE=0; shift ;;
+        -e|--extend-to)      EXTEND_TO="$2"; shift 2 ;;
         --data-dir)          DATA_DIR="$2"; shift 2 ;;
         --keep)              KEEP_DATA=1; shift ;;
         --port)              PORT="$2"; shift 2 ;;
@@ -76,6 +112,21 @@ while [ $# -gt 0 ]; do
 done
 
 [ -d "$IMAGES" ] || [ -f "$IMAGES" ] || { echo "✗ no such image path: $IMAGES" >&2; exit 1; }
+
+# The training flags, decided once. `--adaptive`/`--no-adaptive` is always sent
+# rather than left to SIGN_TRAIN_ADAPTIVE: a benchmark whose meaning depends on
+# an unstated environment variable is not a benchmark.
+TRAIN_FLAGS=()
+if [ "$ADAPTIVE" -eq 1 ]; then
+    TRAIN_FLAGS+=(--adaptive)
+    [ -n "$EXTEND_TO" ] && TRAIN_FLAGS+=(--extend-to "$EXTEND_TO")
+else
+    TRAIN_FLAGS+=(--no-adaptive)
+    # Refuse rather than ignore: without the checkpoints there is nothing to
+    # decide whether an image is still improving, so --extend-to would do
+    # nothing at all and the run would silently answer a different question.
+    [ -z "$EXTEND_TO" ] || { echo "✗ --extend-to needs adaptive training; drop --no-adaptive" >&2; exit 1; }
+fi
 
 # The search ceiling defaults to whatever settings.js resolves, so an unset
 # --max benchmarks the configuration the project actually ships.
@@ -149,11 +200,26 @@ REPORTS=()
 IFS=',' read -r -a DENSITIES <<< "$CONSTELLATIONS"
 IFS=',' read -r -a CEILINGS <<< "$MAX_LIST"
 
+# The training mode belongs in the run id, not only in the report: scores.csv
+# accumulates across sessions and two rows named `c600-m240` that were trained
+# differently are a comparison waiting to be read wrong. The default mode gets
+# no tag, so existing run ids keep their spelling.
+MODE_TAG=""
+[ "$ADAPTIVE" -eq 1 ] || MODE_TAG="-fixed"
+[ -z "$EXTEND_TO" ] || MODE_TAG="-x${EXTEND_TO}"
+
+if [ "$ADAPTIVE" -eq 1 ]; then
+    echo "▸ adaptive training: up to ${CONSTELLATIONS} constellations per image${EXTEND_TO:+, extending to $EXTEND_TO while still improving}"
+    echo "  validation runs every $(node -e 'process.stdout.write(String(require("./src/settings").sign.train.checkEvery))') constellations and is printed as it happens"
+else
+    echo "▸ fixed training: exactly ${CONSTELLATIONS} constellations per image"
+fi
+
 for density in "${DENSITIES[@]}"; do
-    database="bench_${STAMP}_c${density}"
+    database="bench_${STAMP}_c${density}${MODE_TAG}"
     trained=0
     for ceiling in "${CEILINGS[@]}"; do
-        name="${LABEL:+${LABEL}-}c${density}-m${ceiling}"
+        name="${LABEL:+${LABEL}-}c${density}${MODE_TAG}-m${ceiling}"
         report="$RUN_DIR/$name.json"
         echo
         echo "════ $name ═══════════════════════════════════════════"
@@ -165,10 +231,15 @@ for density in "${DENSITIES[@]}"; do
             # --reset makes the run reproducible even against a data directory
             # that a previous benchmark left behind: the corpus is established
             # here, not added to.
+            #
+            # Unbuffered through `tee` on purpose: the adaptive checkpoints are
+            # the run's live validation, and a benchmark that only showed them
+            # once training finished would be no better than reading the report.
             node src/sign.js evaluate "$IMAGES" \
                 --db-name "$database" \
                 --reset \
                 --constellations "$density" \
+                "${TRAIN_FLAGS[@]}" \
                 --max "$ceiling" \
                 --label "$name" \
                 --report "$report" | tee "$RUN_DIR/$name.log"

@@ -50,6 +50,15 @@ const COLUMNS = [
     // Appended, not inserted: scores.csv is added to across sessions, so a new
     // column in the middle would shift every historical row.
     ['rank1_triple_features', (report) => report.scores.rank1ByTripleFeatures],
+    // Adaptive training makes `constellations_per_image` a ceiling rather than a
+    // quota, so the density the corpus was really built at is a separate
+    // measurement. `null`, not `0`, on a --skip-train run: no training happened,
+    // which is not training that wrote nothing.
+    ['adaptive_training', (report) => (report.training ? report.training.adaptive : null)],
+    ['mean_trained_constellations', (report) => (report.training ? report.training.meanConstellations : null)],
+    ['constellations_saved', (report) => (
+        report.training && report.training.adaptive ? report.training.constellationsSaved : null
+    )],
 ];
 
 function readReport(file) {
@@ -181,7 +190,10 @@ const TABLE = [
     ['run', (report, file) => report.label || path.basename(file, '.json'), 'left'],
     ['corpus', (report) => report.scores.corpus],
     ['queried', (report) => report.scores.images],
+    // Under adaptive training the first is the ceiling and the second is what
+    // the images actually needed; without it they are the same number.
     ['train/img', (report) => report.config.constellations_per_image ?? '-'],
+    ['wrote/img', (report) => (report.training ? fixed(report.training.meanConstellations, 0) : '-')],
     ['ceiling', (report) => report.config.search.maxConstellations],
     ['rank-1', (report) => `${report.scores.rank1}/${report.scores.images}`],
     ['rank-1 %', (report) => fixed(report.scores.rank1Rate, 1, 100)],
