@@ -142,7 +142,7 @@ const signSettings = {
   search: {
     batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
     minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 24),
-    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 480),
+    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 786),
     // A word carried by more than this share of the corpus is a stop word and
     // is not worth a recall seed.
     stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 0.6),
