@@ -96,7 +96,7 @@ const cheetahSettings = {
 // stored graph edge.
 const signSettings = {
   constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 2048),
-  pointCount: getNumber('SIGN_POINT_COUNT', 5),
+  pointCount: getNumber('SIGN_POINT_COUNT', 7),
   pointPatchRelative: getNumber('SIGN_POINT_PATCH_REL', 0.004),
   workingMaxSide: getNumber('SIGN_WORKING_MAX_SIDE', 1024),
   // Off by default: pinning where the centre sits makes a sign refuse to match
@@ -142,7 +142,7 @@ const signSettings = {
   search: {
     batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
     minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 24),
-    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 240),
+    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 480),
     // A word carried by more than this share of the corpus is a stop word and
     // is not worth a recall seed.
     stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 0.6),

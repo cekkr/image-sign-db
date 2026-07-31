@@ -156,3 +156,4 @@ benchmarks/*/
 # Local image corpora are intentionally never committed. `sample_images/` is
 # the developer's convenient default for the benchmark runner.
 sample_images/
+/samples_image_backups
