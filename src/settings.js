@@ -95,7 +95,7 @@ const cheetahSettings = {
 // env var that repartitions the vocabulary would silently invalidate every
 // stored graph edge.
 const signSettings = {
-  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 4096),
+  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 3600),
   pointCount: getNumber('SIGN_POINT_COUNT', 7),
   pointPatchRelative: getNumber('SIGN_POINT_PATCH_REL', 0.004),
   workingMaxSide: getNumber('SIGN_WORKING_MAX_SIDE', 1024),
@@ -142,7 +142,7 @@ const signSettings = {
   search: {
     batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
     minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 24),
-    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 786),
+    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 720),
     // A word carried by more than this share of the corpus is a stop word and
     // is not worth a recall seed.
     stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 0.6),
