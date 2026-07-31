@@ -404,11 +404,11 @@ still improving when it hit the ceiling), or `corpus-too-small`.
 **Every checkpoint is printed as it happens**, so the validation is readable while the run is going
 rather than only in the JSON report afterwards:
 
-    ▸ 003__sample-3.jpg
+    ▸ [6/6] 003__sample-3.jpg
         ·    32/128  hit 0/3  margin -0.198  acc -0.198 (  n/a)  effort 1.000 (  n/a)
         ·    64/128  hit 3/3  margin +0.295  acc 1.295 (+1.493)  effort 0.250 (+0.750)
         ·    96/128  hit 3/3  margin +0.520  acc 1.520 (+0.224)  effort 0.250 (+0.000)
-      ✓ 003__sample-3.jpg  128 signs, 345 words, 345 edges  (1.2s)  [exhausted]
+      ✓ [6/6] 003__sample-3.jpg  128 signs, 345 words, 345 edges  (1.2s)  [exhausted]
 
 `hit` is how many of the probes ranked the image first and `margin` is how far ahead of the runner-up
 it was; `acc` is their sum and `effort` the share of a probe's ceiling a search had to spend. Both
@@ -462,6 +462,12 @@ visible while the sweep runs. `--adaptive`/`--no-adaptive` is always passed to `
 explicitly, so a run is never silently reinterpreted by whatever `SIGN_TRAIN_ADAPTIVE` says in the
 environment; the mode also lands in the run id (`-fixed`, `-x<n>`) and in the CSV, because two rows
 named `c600-m240` that were trained differently are a comparison waiting to be read wrong.
+
+Progress is counted at both levels, because a sweep over a real dataset is otherwise a long silence:
+the banner says which run of how many is starting and over how many images (`▸ 2 run(s) over 6
+image(s)`, `════ [1/2] …`), and `src/sign.js` prefixes every trained and every evaluated image with
+its position (`▸ [3/6] 002__sample-1.jpg`). Each evaluation line also carries the running rank-1
+tally, so "is this going well?" is answerable before the summary.
 
 It builds `cheetah-server` if it is missing and runs one instance for the whole session, in a
 temporary data directory it removes on exit (`--keep` to keep it). Each training ceiling gets its own

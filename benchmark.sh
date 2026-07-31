@@ -215,14 +215,26 @@ else
     echo "▸ fixed training: exactly ${CONSTELLATIONS} constellations per image"
 fi
 
+# How many (density x ceiling) pairs this invocation will do, counted up front so
+# the banner can say where in the sweep a run is. Inside a run, src/sign.js
+# prints the per-image position of its own.
+RUN_TOTAL=$(( ${#DENSITIES[@]} * ${#CEILINGS[@]} ))
+RUN_INDEX=0
+IMAGE_TOTAL=$(node -e '
+    const { collectImages } = require("./src/sign");
+    process.stdout.write(String(collectImages(process.argv[1]).length));
+' "$IMAGES")
+echo "▸ $RUN_TOTAL run(s) over $IMAGE_TOTAL image(s)"
+
 for density in "${DENSITIES[@]}"; do
     database="bench_${STAMP}_c${density}${MODE_TAG}"
     trained=0
     for ceiling in "${CEILINGS[@]}"; do
+        RUN_INDEX=$((RUN_INDEX + 1))
         name="${LABEL:+${LABEL}-}c${density}${MODE_TAG}-m${ceiling}"
         report="$RUN_DIR/$name.json"
         echo
-        echo "════ $name ═══════════════════════════════════════════"
+        echo "════ [$RUN_INDEX/$RUN_TOTAL] $name ═══════════════════════════════════════════"
 
         # The first ceiling for a density pays for training; the rest reuse the
         # corpus it built, which is why --skip-train appears only after one

@@ -140,11 +140,15 @@ async function commandTrain(store, targets, flags) {
 
     const startedAll = Date.now();
     const results = [];
-    for (const image of images) {
+    // Position in the corpus, right-aligned so the column does not wobble at 10
+    // and 100. A benchmark over a real dataset is a long silence otherwise:
+    // "how far in is this?" should not require counting lines.
+    const at = (index) => `[${String(index + 1).padStart(String(images.length).length)}/${images.length}]`;
+    for (const [index, image] of images.entries()) {
         const started = Date.now();
         // Named before the work, not after: the checkpoint lines belong to this
         // image and arrive while it is still being written.
-        if (adaptive) console.log(`  ▸ ${path.basename(image)}`);
+        if (adaptive) console.log(`  ▸ ${at(index)} ${path.basename(image)}`);
         const result = adaptive
             ? await trainImageAdaptive(store, image, {
                 count,
@@ -158,7 +162,7 @@ async function commandTrain(store, targets, flags) {
         const seconds = (Date.now() - started) / 1000;
         results.push({ ...result, seconds });
         console.log(
-            `  ✓ ${result.filename}  ${result.signs} signs, ${result.words} words, ` +
+            `  ✓ ${at(index)} ${result.filename}  ${result.signs} signs, ${result.words} words, ` +
             `${result.edges} edges  (${seconds.toFixed(1)}s)` +
             (result.reason ? `  [${result.reason}]` : '')
         );
@@ -280,7 +284,8 @@ async function commandEvaluate(store, targets, flags) {
 
     console.log(`\nEvaluating ${images.length} image(s)`);
     const rows = [];
-    for (const image of images) {
+    const at = (index) => `[${String(index + 1).padStart(String(images.length).length)}/${images.length}]`;
+    for (const [index, image] of images.entries()) {
         const expected = path.basename(image);
         const started = Date.now();
         const result = await searchImage(store, image, {
@@ -323,7 +328,15 @@ async function commandEvaluate(store, targets, flags) {
                 descriptorScore: candidate.descriptorScore,
             })),
         });
-        console.log(`\n${rows[rows.length - 1].hit ? '✓' : '✗'} ${expected} → ${top?.filename || '(nothing)'}`);
+        // The running tally is on the same line as the position: an evaluation
+        // over a large corpus is long enough that "is this going well?" should
+        // be answerable without waiting for the summary.
+        const hits = rows.filter((row) => row.hit).length;
+        console.log(
+            `\n${rows[rows.length - 1].hit ? '✓' : '✗'} ${at(index)} ${expected} → ` +
+            `${top?.filename || '(nothing)'}   ` +
+            `(rank-1 so far ${hits}/${rows.length}, ${((hits / rows.length) * 100).toFixed(1)}%)`
+        );
         reportCandidates(result);
     }
 
