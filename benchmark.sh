@@ -58,6 +58,8 @@ PORT=4477
 LABEL=""
 ADAPTIVE=1
 EXTEND_TO=""
+REHEARSE=0
+REVIEW_TOP_UP=""
 
 usage() {
     cat <<'EOF'
@@ -72,6 +74,10 @@ usage: ./benchmark.sh [options]
       --no-adaptive         write exactly -c constellations per image instead
   -e, --extend-to N         adaptive only: let an image still improving at -c
                             keep going up to N constellations
+  -r, --rehearse            between images, re-probe the ones already trained and
+                            top up any the corpus can no longer find (--review-*
+                            knobs come from the environment; see settings.js)
+      --review-top-up N     constellations one top-up adds (implies --rehearse)
       --data-dir DIR        Cheetah data directory (default: a temp dir, removed on exit)
       --keep                keep the Cheetah data directory
       --port N              port for the benchmark's own cheetah-server (default: 4477)
@@ -103,6 +109,8 @@ while [ $# -gt 0 ]; do
         -a|--adaptive)       ADAPTIVE=1; shift ;;
         --no-adaptive)       ADAPTIVE=0; shift ;;
         -e|--extend-to)      EXTEND_TO="$2"; shift 2 ;;
+        -r|--rehearse)       REHEARSE=1; shift ;;
+        --review-top-up)     REVIEW_TOP_UP="$2"; REHEARSE=1; shift 2 ;;
         --data-dir)          DATA_DIR="$2"; shift 2 ;;
         --keep)              KEEP_DATA=1; shift ;;
         --port)              PORT="$2"; shift 2 ;;
@@ -126,6 +134,17 @@ else
     # decide whether an image is still improving, so --extend-to would do
     # nothing at all and the run would silently answer a different question.
     [ -z "$EXTEND_TO" ] || { echo "✗ --extend-to needs adaptive training; drop --no-adaptive" >&2; exit 1; }
+fi
+
+# Rehearsal is orthogonal to how each image is trained — it is about what happens
+# to the images already trained — so it composes with either mode, and is passed
+# explicitly for the same reason: a run whose meaning depends on an unstated
+# SIGN_TRAIN_REVIEW is not a benchmark.
+if [ "$REHEARSE" -eq 1 ]; then
+    TRAIN_FLAGS+=(--rehearse)
+    [ -z "$REVIEW_TOP_UP" ] || TRAIN_FLAGS+=(--review-top-up "$REVIEW_TOP_UP")
+else
+    TRAIN_FLAGS+=(--no-rehearse)
 fi
 
 # The search ceiling defaults to whatever settings.js resolves, so an unset
@@ -207,6 +226,9 @@ IFS=',' read -r -a CEILINGS <<< "$MAX_LIST"
 MODE_TAG=""
 [ "$ADAPTIVE" -eq 1 ] || MODE_TAG="-fixed"
 [ -z "$EXTEND_TO" ] || MODE_TAG="-x${EXTEND_TO}"
+# Appended rather than replacing: a rehearsed run is still fixed or adaptive, and
+# a row that hid one of the two would be compared against the wrong baseline.
+[ "$REHEARSE" -eq 0 ] || MODE_TAG="${MODE_TAG}-rehearsed"
 
 if [ "$ADAPTIVE" -eq 1 ]; then
     echo "▸ adaptive training: up to ${CONSTELLATIONS} constellations per image${EXTEND_TO:+, extending to $EXTEND_TO while still improving}"

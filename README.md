@@ -440,6 +440,186 @@ The cost of the loop is honest too: with nothing converging, the probes are pure
 searches per checkpoint, at `SIGN_TRAIN_PROBE_MAX` constellations each. `--no-adaptive` turns the
 whole thing off and writes the flat count.
 
+### Rehearsal: keeping the early images findable (`--rehearse`, off by default)
+
+Adaptive training answers "has *this* image been trained enough?" against the corpus that exists at
+the moment it is asked. That is the wrong tense for a corpus that is still being built. An image
+trained when five images were stored was measured against four competitors; by the time the corpus
+holds fifty, forty-nine images are competing for the same words, and the first ones can stop being
+answerable without a single byte of their own having changed. Nothing about them degraded — the
+competition arrived. A one-pass trainer never looks back, so this shows up only at evaluation time,
+as the oldest images failing.
+
+`--rehearse` turns the training run into a cycle instead of a sweep:
+
+    node src/sign.js train datasets/mine --rehearse --constellations 1200
+
+Every `--review-every` images (4 by default) it re-probes images already in the corpus, least
+recently reviewed first, and any image the probes can no longer find gets `--review-top-up` more
+constellations appended to it. After the last image it keeps passing while a pass still tops
+something up, because the images trained last have had the fewest chances to be reviewed. The passes
+print as they happen:
+
+```text
+  ✓ [ 8/20] 069__sample-6.jpg  1200 signs, 5147 words, 5147 edges  (16.8s)
+      ↻ 012__sample-5.jpg  hit 0.33 margin -0.184  +512 → 1712 constellations
+    ↻ rehearsal after [ 8/20]: reviewed 8, topped up 1 (+512 constellations)
+```
+
+Four things it is careful about, each of which it would otherwise get wrong:
+
+- **A top-up appends.** The image is reopened (`SignStore.reopenImage`), the new signs are written at
+  the ordinal after its last one, and the graph is republished from the image's **cumulative** word
+  counts. Publishing the chunk's own counts would *lower* the edge weight of every word it
+  re-observed, because a weight is `min(1, tf / TF_SATURATION)` over the whole image. Counts a
+  previous session did not leave in memory are rebuilt from the stored constellations.
+- **The probe seeds are stable per image across passes**, for the same reason the chunked trainer
+  fixes its own: two passes must ask the same question of a corpus that changed.
+- **Passes are bounded.** `--review-sample` caps how many images a pass probes, so a large corpus is
+  covered *across* passes rather than fully re-measured after every image.
+- **`--review-ceiling` is what stops it.** Some images are genuinely indistinguishable from a
+  near-duplicate, and no amount of constellations fixes that; without a cap the cycle would spend
+  most of its budget on exactly those.
+
+It is off by default because every pass is real search work — it buys corpus-wide findability with
+training time, which is a decision rather than a default.
+
+#### What it measured, and the assumption it broke
+
+The mechanism does exactly what it says: over a random 20-image subset trained flat at 600
+constellations, six passes topped up 17 of the 20 images by 300 each (+8 400 in total), and the
+per-pass count fell from 7 of 8 to 3 of 8 as the corpus caught up. The **accuracy went down**.
+
+…**and then it turned into the best result this corpus has produced**, once the thing it broke was
+put back. Four runs, one 20-image subset, `--max 240`, back to back:
+
+| Run | Density | Length slope | Rank-1 | Recall@k | MRR | Train s/image |
+| --- | --- | --- | --- | --- | --- | --- |
+| flat 600 | uniform | 0 | 15/20 (75%) | 100% | 0.867 | 5.4 |
+| flat 1020 | uniform | 0 | 14/20 (70%) | 100% | 0.838 | 10.5 |
+| flat 600 | uniform | 0.5 | 12/20 (60%) | 95% | 0.754 | 6.3 |
+| rehearsed | 600–1500 | 0 | 14/20 (70%) | 90% | 0.783 | 11.7 |
+| **rehearsed** | 600–1500 | **0.5** | **19/20 (95%)** | **100%** | **0.975** | 12.9 |
+
+**Each ingredient alone is a regression and the pair is the best result this corpus has produced.**
+Rehearsal at slope 0 costs 5 points of rank-1; the slope on a uniform corpus costs 15; together they
+gain 20. That is an interaction, not two independent knobs, and the reason is the same sentence read
+in both directions:
+
+- **Rehearsal makes density uneven, and the ranking was not density-invariant.** `lengthSlope = 0`
+  means no correction for how much an image published, so a topped-up image simply accumulates more
+  mass; `TF_SATURATION = 3` also pins more of a denser image's edges at weight 1.0. On a uniform
+  corpus neither matters and slope 0 is the right, measured answer — which is exactly why it was the
+  default, and exactly why it stopped being right the moment something spent constellations
+  selectively.
+- **Length normalisation on a uniform corpus is a pure over-correction** — 80% → 60% at slope 0.5 in
+  the earlier sweep, because it divides again for something the raw mass already accounts for. It
+  only pays when the vocabulary sizes it is correcting for are genuinely *unequal*.
+
+So the pair is the feature: rehearsal creates the inequality, the slope prices it correctly, and
+together they beat both flat controls **and** the previous best on this corpus (85%, at twice the
+density and twice the search ceiling). Do not enable one without the other.
+
+This is also why `--adaptive` never surfaced any of it: on `sample_images/` its stop rule almost
+never fires, so it writes the same count on every image and the corpus stays uniform by accident.
+
+One separate warning the flat controls make plain: uniform 1020 scored **worse** than uniform 600 at
+`--max 240`, while the same subset scores 85% at 1200 constellations with `--max 480`. **Training
+density and search ceiling have to be raised together** — a denser corpus publishes more words per
+image, and a search not allowed to measure more of them only sees more overlap.
+
+### Five points or seven
+
+`SIGN_POINT_COUNT` is the one sampling knob that changes cost at every stage at once: a chain of `n`
+points is `n − 1` hops and **`n − 2` triples**, and a triple is what becomes a word, a posting, a
+graph edge and a recall seed. Seven points is therefore 5/3 of five points' storage and measurement
+for the same number of constellations, which makes "7 vs 5 at the same `--constellations`" the wrong
+comparison — it compares two different budgets.
+
+Measured over a random 20-image subset of `sample_images/`, fixed training, `--max 480`, three runs
+back to back on one machine:
+
+| Points | Constellations | Words/image | Rank-1 | MRR | Separation | Train s/image | Search s |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 7 | 1200 | 4 833 | **17/20 (85%)** | 0.908 | 1.375 | 14.8 | 2.55 |
+| 5 | 1200 | 3 092 | 16/20 (80%) | 0.885 | 1.268 | 6.5 | 1.05 |
+| 5 | 2000 | 4 831 | **17/20 (85%)** | 0.925 | 1.270 | 14.5 | 2.59 |
+
+The third row is the honest comparison: `5 × 2000 = 7 × 1200` triples, so it holds the *budget* fixed
+instead of the constellation count. At equal budget the two are the same answer — same rank-1, same
+recall@k (100% for all three), MRR marginally better at five points, leader separation marginally
+better at seven, everything inside the noise of a corpus where one image is 5 percentage points. What
+is **not** noise is the first two rows against each other: at the same constellation count, seven
+points costs **2.3× the training time and 2.4× the search time** for one more image.
+
+So seven points is not a better feature; it is a bigger measurement per constellation, and buying the
+same measurement with five points costs the same and works as well.
+
+#### Why that is a defect and not a law of nature
+
+A seven-point chain really does carry more *relative* references than a five-point one, so it ought
+to discriminate better and not merely sample more. It does not, because **the chain is measured as a
+chain and retrieved as a bag of triples.**
+
+The structure is in the record — `sc:` stores the whole chain and a `sw:` posting even carries the
+constellation ordinal it came from — but it never reaches the ranking. Ingestion publishes one
+`word --sign--> image` graph edge per distinct word, with no ordinal on the graph side. The search
+flattens every triple of every constellation in a round into one bag of words, seeds the rarest of
+them, and the fold sums `activation × idf` per seed independently. **Nothing anywhere asks whether
+several triples of the *same* measured constellation landed on the same image.** So `n − 2` triples
+are `n − 2` independent bag items, and a longer chain contributes exactly what drawing more short
+constellations contributes — which is what the table above measured.
+
+Two structural facts compound it: consecutive triples **share a hop**, so their six delta levels
+overlap by two, and individual hop lengths are deliberately excluded from a word. The extra triples
+of a longer chain are therefore *correlated* evidence, not independent evidence — all the more reason
+that they only pay if they are scored jointly.
+
+`SIGN_SEARCH_CHAIN_BONUS` scores them jointly. The fold groups each recall's seeds by the
+constellation that asked them and scales every group by `1 + bonus × (agreeing triples − 1)`, so a
+seven-point chain putting several mutually agreeing triples behind one image outweighs the same
+triples arriving from unrelated constellations — a coincidence that does not scale that way. At `0`
+it is arithmetically the previous sum (a word asked by two signs splits its activation, so nothing
+double counts).
+
+**Counting *every* agreeing triple makes it worse, and that is the interesting part.** Measured at
+1200 constellations, `--max 480`, with early stopping switched off on both sides so each search
+measures the same amount:
+
+| Fold | Rank-1 | MRR | Separation |
+| --- | --- | --- | --- |
+| bag of words (bonus 0) | **18/20 (90%)** | **0.950** | 1.39 |
+| every agreeing triple (bonus 1) | 15/20 (75%) | 0.846 | 1.59 |
+| non-adjacent triples only (bonus 1) | 15/20 (75%) | 0.858 | 1.54 |
+
+The bonus makes the search **more confident and less correct** — separation up, accuracy down — and
+the first explanation was not enough. The shared hop is real: triple *i* and triple *i+1* are built
+from edges *(i, i+1)* and *(i+1, i+2)*, so two of their six colour-delta levels are the same
+measurement counted twice, and agreement is now counted over a maximal set of pairwise **non-adjacent**
+triples for that reason (a 7-point sign can contribute 3 — indices 0, 2, 4 — where a 5-point sign
+contributes 2). But removing the redundancy **changed nothing**: still 15/20.
+
+So the honest reading is stronger than "redundant evidence". **The triples of one constellation are
+not independent evidence at all, adjacent or not**, because a constellation samples one
+*neighbourhood* of the image and near-duplicates share neighbourhoods. The image that agrees with
+several triples of a chain is exactly the near-duplicate that the corpus confuses it with, so any
+fold that rewards within-chain agreement concentrates evidence on the wrong candidate. The
+bag-of-words fold with idf is robust here precisely because it refuses to let one region of one
+constellation speak louder than the rest.
+
+`SIGN_SEARCH_CHAIN_BONUS` therefore ships at `0`, with the mechanism kept because the *structural*
+observation stands: the chain really is discarded, and something should use it. What the measurement
+rules out is doing so on the query side alone. The untried direction is the symmetric one — the
+`sw:` posting already carries the candidate's own constellation ordinal, so recall could require that
+a candidate's matching postings come from **one of its own constellations** too, rather than only
+checking that the query's did.
+
+Two further warnings for anyone raising it. It **widens the leader/runner-up ratio**, so
+`SIGN_SEARCH_SEPARATION` has to be raised with it — left at 1.35, a bonus of 1 stopped the median
+search after 24 constellations instead of 480 and scored 65%. And in the same sweep, simply
+**disabling early stopping** was worth more than any fold change: 17/20 with the shipped stop rule
+against 18/20 without it, on identical corpora.
+
 ### Benchmarking
 
 `./benchmark.sh` trains, validates, and records the scores. Each *(training ceiling × search
@@ -453,6 +633,7 @@ diff rather than as a number nobody wrote down.
     ./benchmark.sh -i datasets/mine -l nightly    # another corpus, labelled
     ./benchmark.sh --no-adaptive                  # flat density instead
     ./benchmark.sh -c 2048 -e 4096                # let still-improving images continue
+    ./benchmark.sh -c 1200 -r                     # rehearse: keep the early images findable
 
     SIGN_SEARCH_SEPARATION=1.2 ./benchmark.sh -l loose   # any SIGN_* knob sweeps this way
 
@@ -460,8 +641,11 @@ diff rather than as a number nobody wrote down.
 constellations as it needs, and the checkpoints stream to the console so an under-trained corpus is
 visible while the sweep runs. `--adaptive`/`--no-adaptive` is always passed to `src/sign.js`
 explicitly, so a run is never silently reinterpreted by whatever `SIGN_TRAIN_ADAPTIVE` says in the
-environment; the mode also lands in the run id (`-fixed`, `-x<n>`) and in the CSV, because two rows
-named `c600-m240` that were trained differently are a comparison waiting to be read wrong.
+environment; the mode also lands in the run id (`-fixed`, `-x<n>`, `-rehearsed`) and in the CSV,
+because two rows named `c600-m240` that were trained differently are a comparison waiting to be read
+wrong. `-r/--rehearse` composes with either mode — it is about what happens to the images *already*
+trained — and is passed explicitly for the same reason, so `SIGN_TRAIN_REVIEW` never decides a run's
+meaning behind its back.
 
 Progress is counted at both levels, because a sweep over a real dataset is otherwise a long silence:
 the banner says which run of how many is starting and over how many images (`▸ 2 run(s) over 6
@@ -490,8 +674,8 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SIGN_CONSTELLATIONS_PER_IMAGE` | `2048` | Signs drawn per image at training time. A **ceiling** when adaptive training is on. |
-| `SIGN_POINT_COUNT` | `5` | Points per constellation. Must be odd. |
+| `SIGN_CONSTELLATIONS_PER_IMAGE` | `3600` | Signs drawn per image at training time. A **ceiling** when adaptive training is on. |
+| `SIGN_POINT_COUNT` | `7` | Points per constellation. Must be odd. A chain of `n` points yields `n − 2` triples, so the cost of every stage scales with it — see [Five points or seven](#five-points-or-seven). |
 | `SIGN_POINT_PATCH_REL` | `0.004` | Side of the square averaged per point, as a fraction of the shorter side. `0` reads exactly one pixel. |
 | `SIGN_WORKING_MAX_SIDE` | `1024` | Longest side the sampler decodes to. |
 | `SIGN_WITH_CENTRE_POSITION` | `false` | Record where the constellation centre sits in the frame. |
@@ -503,12 +687,20 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 | `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so the ceiling is trained in full. |
 | `SIGN_TRAIN_PROBE_MAX` | `96` | Ceiling on one probe search. Probes also run with the reranker off. |
 | `SIGN_TRAIN_EXTEND_TO` | `0` (off) | How far an image still improving at `SIGN_CONSTELLATIONS_PER_IMAGE` may keep training. Buys recall with training time. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
+| `SIGN_TRAIN_REVIEW` | `false` | Rehearsal: between images, re-probe the ones already trained and top up any the corpus can no longer find. `--rehearse` / `--no-rehearse` override it per run. See [Rehearsal](#rehearsal-keeping-the-early-images-findable). |
+| `SIGN_TRAIN_REVIEW_EVERY` | `4` | Images trained between two rehearsal passes. `0` rehearses only after the last image. |
+| `SIGN_TRAIN_REVIEW_SAMPLE` | `8` | Images probed per pass, least recently reviewed first. `0` reviews all of them, which is quadratic in corpus size. |
+| `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` | `1` | Below this probe hit rate an image is topped up — the same "every probe must find it" bar the chunked trainer stops on. |
+| `SIGN_TRAIN_REVIEW_TOP_UP` | `512` | Constellations one top-up adds. One chunk, then the image is measured again on a later pass. |
+| `SIGN_TRAIN_REVIEW_CEILING` | `8192` | Total constellations an image may reach through top-ups. Some images are genuinely indistinguishable from a near-duplicate and no amount of evidence fixes that. |
+| `SIGN_TRAIN_REVIEW_FINAL_PASSES` | `2` | Passes after the last image, repeated while any pass still tops something up. |
 | `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
 | `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |
-| `SIGN_SEARCH_MAX_CONSTELLATIONS` | `240` | Ceiling on one search. |
+| `SIGN_SEARCH_MAX_CONSTELLATIONS` | `720` | Ceiling on one search. |
 | `SIGN_SEARCH_STOPWORD_RATIO` | `0.6` | A word carried by more than this share of the corpus is not worth a seed. |
 | `SIGN_SEARCH_SEEDS_PER_ROUND` | `96` | Recall seeds per round, rarest first. |
-| `SIGN_SEARCH_LENGTH_SLOPE` | `0` | Pivoted correction for how many words an image published. `0` ignores it, `1` is fully proportional. Measured: correcting made accuracy monotonically worse. |
+| `SIGN_SEARCH_LENGTH_SLOPE` | `0` | Pivoted correction for how many words an image published. `0` ignores it, `1` is fully proportional. On a **uniform** corpus correcting made accuracy monotonically worse, which is why `0` is the default — but on an **uneven** one it is required: with `--rehearse` it took rank-1 from 70% to 95%. Raise it whenever anything spends constellations selectively. |
+| `SIGN_SEARCH_CHAIN_BONUS` | `0` | How much a constellation that agrees with itself outweighs the same triples arriving separately: each group of seeds from one measured sign is scaled by `1 + bonus × (agreeing triples − 1)`. `0` is the historical bag-of-words fold. **Raising it widens the leader/runner-up ratio, so `SIGN_SEARCH_SEPARATION` must be raised with it** — left at 1.35, a bonus of 1 stopped the median search after 24 constellations instead of 480. See [Five points or seven](#five-points-or-seven). |
 | `SIGN_SEARCH_CONFIDENCE_MULTIPLE` | `2` | How far above an even split (`1/corpus`) the leader must be to stop. A multiple, not a share — a share cannot survive a change of corpus size. |
 | `SIGN_SEARCH_SEPARATION` | `1.35` | How far ahead of the runner-up the leader must be. The criterion that actually carries the signal. |
 | `SIGN_SEARCH_RERANK_TOP` | `5` | Candidates passed to the field rerank. |

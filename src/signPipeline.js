@@ -21,7 +21,12 @@ const path = require('path');
 const settings = require('./settings');
 const { createRandom } = require('./lib/sign/rng');
 const { loadImagePixels, sampleSigns } = require('./lib/sign/sampler');
-const { allWords, tripleFeatureDistance, tripleFeatures } = require('./lib/sign/words');
+const {
+    allWords,
+    constellationWords,
+    tripleFeatureDistance,
+    tripleFeatures,
+} = require('./lib/sign/words');
 const {
     compareConstellations,
     constellationDescriptor,
@@ -85,7 +90,10 @@ async function trainImage(store, imagePath, {
     });
     onProgress?.({ stage: 'complete', filename, imageId, edges });
 
-    return { imageId, filename, signs: signs.length, words: wordCounts.size, edges, record };
+    // `wordCounts` rides along because extending this image later needs the
+    // cumulative totals its edge weights were published from, and rebuilding
+    // them from storage costs a page-walk of the whole image.
+    return { imageId, filename, signs: signs.length, words: wordCounts.size, edges, record, wordCounts };
 }
 
 /**
@@ -285,6 +293,8 @@ async function trainImageAdaptive(store, imagePath, {
         edgeWrites,
         written,
         record,
+        // As in `trainImage`: the totals a later top-up must republish from.
+        wordCounts: cumulativeWords,
         reason,
         checkpoints,
         // What the run would have written without the stop rule, so a caller can
@@ -352,6 +362,236 @@ async function probeQuality(store, imagePath, {
 }
 
 /**
+ * Rebuild an image's per-word observation counts from what is stored.
+ *
+ * Only ever needed to *extend* an image whose counts nobody kept: an edge weight
+ * is `min(1, tf / TF_SATURATION)` over the whole image, so a top-up that
+ * republished its chunk's own counts would lower the weight of every word the
+ * chunk re-observed. Within one session `reviewCorpus` carries the counts in
+ * memory and never calls this; a corpus reopened in a later session has nothing
+ * else to read them from.
+ *
+ * It counts the way `putSigns` does — the primary word only, once per
+ * constellation regardless of how many of its triples landed in that cell — but
+ * it cannot be bit-exact and must not be assumed to be. **A stored record is
+ * lossy**: deltas and links are rounded to `STORED_DECIMALS` (1e-5), so a triple
+ * whose measurement sat within rounding distance of a quantisation edge comes
+ * back in the neighbouring cell. Measured on a real image at 400 constellations:
+ * ~0.15% of triples, each moving one observation between two words, i.e. an edge
+ * weight off by at most 1/TF_SATURATION for a handful of words out of thousands.
+ *
+ * That drift is not this function's: **ingestion indexes an image under words
+ * its own stored record does not fully reproduce**, because `putSigns` computes
+ * them from the live measurement while everything that reads a record back —
+ * this, and the reranker — recomputes them from the rounded form. Making the two
+ * agree means computing the published words from the record as well, which
+ * changes what is written and needs a re-ingest; it is worth doing and it is not
+ * in scope here.
+ */
+async function storedWordCounts(store, imageId) {
+    const counts = new Map();
+    let signs = 0;
+    for await (const { record } of store.listSigns(imageId)) {
+        const parsed = parseConstellationRecord(record);
+        const triples = constellationWords(parsed);
+        const seen = new Set();
+        for (const triple of triples) {
+            if (seen.has(triple.words[0])) continue;
+            seen.add(triple.words[0]);
+            counts.set(triple.words[0], (counts.get(triple.words[0]) || 0) + 1);
+        }
+        signs += 1;
+    }
+    return { wordCounts: counts, signs };
+}
+
+/**
+ * Draw more constellations onto an image that is already in the corpus.
+ *
+ * The commit protocol is the one every other write path uses — reopen, write,
+ * publish, complete — and the two things it must not get wrong are the two the
+ * chunked trainer already documents: signs are appended at `startOrdinal` so
+ * they do not overwrite the image's existing ones, and the graph is republished
+ * with **cumulative** word counts so an edge weight never falls.
+ *
+ * `wordCounts` is the running total from a caller that has it; without one the
+ * totals are rebuilt from storage, which costs one page-walk of the image.
+ */
+async function extendImage(store, imagePath, {
+    imageId,
+    count,
+    wordCounts = null,
+    startOrdinal = null,
+    seed = null,
+    ...overrides
+} = {}) {
+    const options = samplerOptions(overrides);
+    const filename = path.basename(imagePath);
+    const { rawPixels, meta } = await loadImagePixels(imagePath, options);
+
+    let cumulative = wordCounts;
+    let from = startOrdinal;
+    if (!cumulative || from === null) {
+        const stored = await storedWordCounts(store, imageId);
+        cumulative = cumulative || stored.wordCounts;
+        from = from === null ? stored.signs : from;
+    }
+
+    const signs = sampleSigns({
+        rawPixels,
+        meta,
+        count,
+        random: createRandom(seed),
+        ...options,
+    });
+    if (signs.length === 0) {
+        throw new Error(`no constellation could be placed on ${filename} (${meta.width}x${meta.height})`);
+    }
+
+    const { record: reopened, release } = await store.reopenImage(imageId);
+    try {
+        const chunk = await store.putSigns(imageId, signs, { startOrdinal: from });
+        const touched = new Map();
+        for (const [word, observations] of chunk.wordCounts) {
+            const total = (cumulative.get(word) || 0) + observations;
+            cumulative.set(word, total);
+            touched.set(word, total);
+        }
+        const published = await store.commitGraph(imageId, filename, touched);
+        const signCount = from + signs.length;
+        const record = await store.markComplete(imageId, {
+            constellations: signCount,
+            words: cumulative.size,
+            // How the image was originally trained is not changed by extending
+            // it; how often it has been extended is worth keeping, because "this
+            // image has been topped up four times and is still behind" is the
+            // corpus telling you something a single count cannot.
+            training: reopened.training ?? 'fixed',
+            topUps: (Number(reopened.topUps) || 0) + 1,
+        });
+        return {
+            imageId,
+            filename,
+            added: signs.length,
+            signs: signCount,
+            words: cumulative.size,
+            edges: published.edges,
+            wordCounts: cumulative,
+            record,
+        };
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Re-ask the corpus about images it already holds, and top up the ones it has
+ * stopped being able to find.
+ *
+ * The failure this exists for is not a bug, it is the shape of the problem: an
+ * image is trained against the corpus that existed *when it was trained*, and
+ * every image added afterwards is a new competitor for the same words. An image
+ * that separated cleanly at corpus size 5 can be unfindable at corpus size 50
+ * without a single byte of its own having changed — the evidence did not
+ * degrade, the competition arrived. A one-pass trainer never revisits it, so the
+ * early images of a growing corpus quietly become the ones it cannot answer.
+ *
+ * So this is a rehearsal pass, not a repair pass: probe what is already there,
+ * and give more constellations to whichever image the corpus can no longer pick
+ * out. Four properties it depends on:
+ *
+ *   - **The probe seeds are stable per image across passes** (`review:<name>`),
+ *     for the same reason the chunked trainer fixes its own: two passes have to
+ *     ask the *same* question of a corpus that changed, or the difference
+ *     between them is half "the corpus moved" and half "we asked something
+ *     else".
+ *   - **Probing is not free and the pass is bounded.** Each probe is a search;
+ *     `sample` caps how many images a pass looks at and the least-recently
+ *     reviewed go first, so a large corpus is covered across passes rather than
+ *     re-measured in full after every image.
+ *   - **A top-up is one chunk, not a retrain.** An image that is behind gets
+ *     `topUp` more constellations and is measured again on the next pass. Giving
+ *     it everything at once would spend the budget on the first image that
+ *     struggled, which on a near-duplicate corpus is not the image that needs it
+ *     most.
+ *   - **`ceiling` is what stops it.** Some images are genuinely
+ *     indistinguishable from a near-duplicate, and no amount of constellations
+ *     fixes that; without a per-image cap the pass would keep buying evidence
+ *     for exactly those.
+ */
+async function reviewCorpus(store, tracked, {
+    probes = settings.sign.train.probes,
+    minHitRate = settings.sign.train.review.minHitRate,
+    topUp = settings.sign.train.review.topUp,
+    ceiling = settings.sign.train.review.ceiling,
+    sample = settings.sign.train.review.sample,
+    probeMaxConstellations = settings.sign.train.probeMaxConstellations,
+    onReview = null,
+    ...overrides
+} = {}) {
+    const entries = [...tracked.values()].filter((entry) => entry.imageId != null);
+    if (entries.length === 0) return { reviewed: [], toppedUp: 0, added: 0 };
+
+    // Least recently reviewed first, so a bounded pass sweeps the corpus over
+    // several passes instead of re-measuring the same head of it every time.
+    const order = entries
+        .slice()
+        .sort((left, right) => (left.reviewedAt ?? -1) - (right.reviewedAt ?? -1));
+    const selected = sample > 0 ? order.slice(0, sample) : order;
+
+    const reviewed = [];
+    let toppedUp = 0;
+    let added = 0;
+
+    for (const entry of selected) {
+        const quality = await probeQuality(store, entry.path, {
+            imageId: entry.imageId,
+            probes,
+            seedPrefix: `review:${entry.filename}`,
+            maxConstellations: probeMaxConstellations,
+        });
+        entry.reviewedAt = (entry.reviewedAt ?? 0) + 1;
+        entry.quality = quality;
+
+        const behind = quality.hitRate < minHitRate;
+        const room = ceiling <= 0 || entry.signs < ceiling;
+        let extension = null;
+        if (behind && room && topUp > 0) {
+            const wanted = ceiling > 0 ? Math.min(topUp, ceiling - entry.signs) : topUp;
+            extension = await extendImage(store, entry.path, {
+                imageId: entry.imageId,
+                count: wanted,
+                wordCounts: entry.wordCounts ?? null,
+                startOrdinal: entry.wordCounts ? entry.signs : null,
+                // A top-up must not redraw the constellations the image already
+                // has: the seed moves with the ordinal it starts at.
+                seed: `${entry.filename}:top-up:${entry.signs}`,
+                ...overrides,
+            });
+            entry.wordCounts = extension.wordCounts;
+            entry.signs = extension.signs;
+            entry.words = extension.words;
+            toppedUp += 1;
+            added += extension.added;
+        }
+
+        const outcome = {
+            filename: entry.filename,
+            imageId: entry.imageId,
+            hitRate: quality.hitRate,
+            margin: quality.margin,
+            signs: entry.signs,
+            added: extension?.added ?? 0,
+            reason: behind ? (extension ? 'topped-up' : 'at-ceiling') : 'findable',
+        };
+        reviewed.push(outcome);
+        onReview?.(outcome);
+    }
+
+    return { reviewed, toppedUp, added };
+}
+
+/**
  * Inverse document frequency of a word: how surprising it is that an image
  * produced it. A word every image produces separates nothing and must not
  * count as much as one only two images ever produced.
@@ -381,11 +621,48 @@ function inverseDocumentFrequency(documentFrequency, corpusSize) {
  * "fully proportional" with a slope, which is the standard remedy for exactly
  * this over-correction.
  */
+/**
+ * How many of these matched triples are *independent* evidence.
+ *
+ * Consecutive triples of a chain **share a hop**: triple `i` and `i+1` are built
+ * from edges `(i, i+1)` and `(i+1, i+2)`, so two of their six colour-delta
+ * levels and part of their scale band are the same measurement counted twice.
+ * Two adjacent triples agreeing is therefore close to one triple agreeing with
+ * itself, and rewarding it rewards redundancy rather than corroboration — which
+ * is not a theoretical worry: crediting every agreeing triple took rank-1 from
+ * 90% to 75% with the search budget held fixed, because on a near-duplicate
+ * corpus the image that matches one triple is exactly the image that matches its
+ * neighbours.
+ *
+ * So agreement is counted over a maximal set of pairwise **non-adjacent**
+ * triples, greedily along the chain: a 7-point sign can contribute 3 (indices
+ * 0, 2, 4) where a 5-point sign can contribute 2 (0, 2). The longer chain is
+ * still worth more, but only for the part of it that is not the same hop read
+ * twice.
+ */
+function independentAgreement(triples) {
+    const sorted = [...triples].sort((left, right) => left - right);
+    let count = 0;
+    let last = -Infinity;
+    for (const index of sorted) {
+        if (index - last < 2) continue;
+        count += 1;
+        last = index;
+    }
+    return count;
+}
+
 class Evidence {
-    constructor({ corpusSize, averageWords = 1, lengthSlope = settings.sign.search.lengthSlope }) {
+    constructor({
+        corpusSize,
+        averageWords = 1,
+        lengthSlope = settings.sign.search.lengthSlope,
+        chainBonus = settings.sign.search.chainBonus,
+    }) {
         this.corpusSize = corpusSize;
         this.averageWords = averageWords > 0 ? averageWords : 1;
         this.lengthSlope = Math.min(1, Math.max(0, lengthSlope));
+        this.chainBonus = Math.max(0, Number(chainBonus) || 0);
         this.byImage = new Map();
         this.rounds = 0;
         this.constellations = 0;
@@ -398,7 +675,33 @@ class Evidence {
         return Math.max(1e-6, (1 - this.lengthSlope) + this.lengthSlope * relative);
     }
 
-    fold(results, degrees) {
+    /**
+     * Fold one recall's answer into the running belief.
+     *
+     * `origins` maps each seeded word back to the `{sign, triple}` positions
+     * that produced it this round, and it is what makes a *chain* worth more
+     * than the sum of its triples. Without it the fold is a bag of words: five
+     * triples of one constellation agreeing on an image count exactly as much as
+     * five triples scattered across five unrelated constellations, which is the
+     * reason more points per constellation bought nothing measurable — a longer
+     * chain only added more independent bag items, the same thing drawing more
+     * constellations already does, at the same cost.
+     *
+     * With `chainBonus > 0` an image is credited per *constellation*: the seeds
+     * it matched are grouped by the sign that asked them, and each group is
+     * scaled by `1 + chainBonus * (agreeing triples - 1)`. A 7-point chain can
+     * put five triples behind one image where a 5-point chain can put three, so
+     * the extra points finally express themselves as *joint* evidence rather
+     * than as extra samples. Coincidence does not scale that way: an unrelated
+     * image matching one triple of each of five constellations gets no bonus at
+     * all.
+     *
+     * A word produced by several signs splits its activation equally between
+     * them, so at `chainBonus = 0` this is arithmetically the old sum, to the
+     * last bit — the knob is off by default and turning it off is exact.
+     */
+    fold(results, degrees, origins = null) {
+        const grouped = this.chainBonus > 0 && origins;
         for (const result of results) {
             const current = this.byImage.get(result.imageId) || {
                 imageId: result.imageId,
@@ -406,12 +709,35 @@ class Evidence {
                 words: result.words,
                 rawMass: 0,
                 sources: 0,
+                // How much of this image's evidence came from constellations
+                // that agreed with themselves. Reported, not ranked on.
+                chained: 0,
             };
+            const perSign = grouped ? new Map() : null;
             for (const seed of result.seeds) {
-                current.rawMass += seed.activation * inverseDocumentFrequency(
+                const weight = seed.activation * inverseDocumentFrequency(
                     degrees.get(seed.word) || 1,
                     this.corpusSize
                 );
+                const producers = grouped ? origins.get(seed.word) : null;
+                if (!producers || producers.length === 0) {
+                    current.rawMass += weight;
+                    continue;
+                }
+                const share = weight / producers.length;
+                for (const { sign, triple } of producers) {
+                    const entry = perSign.get(sign) || { mass: 0, triples: new Set() };
+                    entry.mass += share;
+                    entry.triples.add(triple);
+                    perSign.set(sign, entry);
+                }
+            }
+            if (perSign) {
+                for (const entry of perSign.values()) {
+                    const agreement = independentAgreement(entry.triples) - 1;
+                    current.rawMass += entry.mass * (1 + this.chainBonus * agreement);
+                    if (agreement > 0) current.chained += entry.mass * this.chainBonus * agreement;
+                }
             }
             current.sources += result.sourceCount;
             this.byImage.set(result.imageId, current);
@@ -578,6 +904,7 @@ async function searchImage(store, imagePath, {
         averageWords: corpusRecords.reduce((sum, record) => sum + (Number(record.words) || 0), 0) /
             Math.max(1, corpusRecords.length),
         lengthSlope: search.lengthSlope,
+        chainBonus: search.chainBonus,
     });
     const degreeCache = new Map();
     const querySigns = [];
@@ -602,6 +929,22 @@ async function searchImage(store, imagePath, {
         // bridges the edge — and it is the cheap side: a variant costs one more
         // seed on a recall that is happening anyway, where at ingestion time it
         // cost a stored posting and a graph edge, permanently.
+        // Which constellation and which triple of it asked for each word. The
+        // words themselves are still one flat bag — that is what the recall
+        // takes — but the fold needs to know which of them came from the same
+        // chain, or a chain is worth no more than its triples scattered.
+        const origins = new Map();
+        batch.forEach((sign, signIndex) => {
+            for (const triple of sign.triples) {
+                for (const word of triple.words) {
+                    const producers = origins.get(word) || [];
+                    if (!producers.some((p) => p.sign === signIndex && p.triple === triple.index)) {
+                        producers.push({ sign: signIndex + evidence.rounds * search.batchSize, triple: triple.index });
+                    }
+                    origins.set(word, producers);
+                }
+            }
+        });
         const words = allWords(batch.flatMap((sign) => sign.triples));
         const unknown = words.filter((word) => !degreeCache.has(word));
         if (unknown.length > 0) {
@@ -615,7 +958,7 @@ async function searchImage(store, imagePath, {
         });
         evidence.seeds += seeds.length;
 
-        if (seeds.length > 0) evidence.fold(await store.recallImages(seeds), degreeCache);
+        if (seeds.length > 0) evidence.fold(await store.recallImages(seeds), degreeCache, origins);
 
         const ranked = evidence.ranked();
         onRound?.({
@@ -656,12 +999,15 @@ async function searchImage(store, imagePath, {
 
 module.exports = {
     Evidence,
+    extendImage,
     inverseDocumentFrequency,
     probeQuality,
     rerankWithField,
+    reviewCorpus,
     samplerOptions,
     searchImage,
     selectSeeds,
+    storedWordCounts,
     trainImage,
     trainImageAdaptive,
 };

@@ -132,6 +132,36 @@ const signSettings = {
     // A probe is a cost, not a deliverable: it runs to a lower ceiling than a
     // real search and with the reranker off.
     probeMaxConstellations: getNumber('SIGN_TRAIN_PROBE_MAX', 96),
+    // Rehearsal: re-probe images already in the corpus and top up the ones it
+    // has stopped being able to find (src/signPipeline.js → reviewCorpus).
+    //
+    // An image is trained against the corpus that existed when it was trained,
+    // and every later image is a new competitor for the same words — so the
+    // early images of a growing corpus lose findability without changing. This
+    // is the loop that notices. Off by default because it costs probes; turn it
+    // on with `--rehearse` while a corpus is being built up.
+    review: {
+      enabled: getBoolean('SIGN_TRAIN_REVIEW', false),
+      // Images trained between two review passes. 0 reviews only at the end.
+      every: getNumber('SIGN_TRAIN_REVIEW_EVERY', 4),
+      // Images looked at per pass, least recently reviewed first. 0 = all of
+      // them, which is quadratic in corpus size and only sane on small corpora.
+      sample: getNumber('SIGN_TRAIN_REVIEW_SAMPLE', 8),
+      // Below this probe hit rate an image is topped up. The default is the
+      // same "every probe must find it" bar the chunked trainer stops on.
+      minHitRate: getNumber('SIGN_TRAIN_REVIEW_MIN_HIT_RATE', 1),
+      // Constellations one top-up buys. One chunk, then measure again: giving a
+      // struggling image everything at once spends the budget on whichever
+      // image happened to be probed first.
+      topUp: getNumber('SIGN_TRAIN_REVIEW_TOP_UP', 512),
+      // Total constellations an image may reach through top-ups. Some images
+      // are genuinely indistinguishable from a near-duplicate and no amount of
+      // evidence fixes that; without a cap the pass buys most for exactly those.
+      ceiling: getNumber('SIGN_TRAIN_REVIEW_CEILING', 8192),
+      // Final passes after the last image, repeated while any top-up happened.
+      // The last images trained have had the fewest chances to be reviewed.
+      finalPasses: getNumber('SIGN_TRAIN_REVIEW_FINAL_PASSES', 2),
+    },
     // How far an image that is *still improving* at `constellationsPerImage`
     // may keep going. `0` disables it, which is the shipped default: extending
     // buys recall with training time and that is a decision, not a default.
@@ -159,6 +189,27 @@ const signSettings = {
     // (261-280 words against a corpus mean near 1300) win other images'
     // searches. The knob stays for a corpus whose vocabulary sizes are uniform.
     lengthSlope: getNumber('SIGN_SEARCH_LENGTH_SLOPE', 0),
+    // How much a constellation that agrees with *itself* is worth over the same
+    // triples arriving separately: each group of seeds from one measured sign is
+    // scaled by `1 + chainBonus * (agreeing triples - 1)`.
+    //
+    // 0 is the historical behaviour, exactly — the fold is a bag of words, and
+    // that is why point count behaved like a sampling rate rather than like a
+    // richer feature: a 7-point chain is 5 triples where a 5-point chain is 3,
+    // but scattered across a bag those extra triples are indistinguishable from
+    // simply drawing more constellations. Measured at equal triple budget the
+    // two scored the same, which is the symptom. Above 0, a longer chain can put
+    // more *mutually agreeing* evidence behind one image, which is the thing the
+    // extra points actually add and which coincidence does not reproduce.
+    // **It moves the separation scale, so `separationTarget` has to move with
+    // it.** The bonus is larger for the image a chain actually agrees with than
+    // for the ones it brushes, which is the whole point — but that widens the
+    // leader/runner-up ratio the stop rule reads, and a threshold calibrated on
+    // the bag-of-words scale then fires almost immediately. Measured: at bonus 1
+    // and `separationTarget` left at 1.35, the median search stopped after 24
+    // constellations instead of 480 and rank-1 fell 85% -> 65%. Raise the target
+    // when raising this, and judge the two together.
+    chainBonus: getNumber('SIGN_SEARCH_CHAIN_BONUS', 0),
     // How far ahead of an even split the leader must be before a search stops,
     // as a **multiple of the uniform share** `1/corpus`.
     //

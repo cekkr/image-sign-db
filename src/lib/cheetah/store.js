@@ -211,12 +211,13 @@ class CheetahStore extends CheetahDatabase {
             };
         });
 
-        for (let at = 0; at < prepared.length; at += this.writeBatchSize) {
-            const batch = prepared.slice(at, at + this.writeBatchSize);
-            // Each put is INSERT -> PAIR_SET, but all rows in this batch enter
-            // the pool together so its bounded FIFO queues keep the sockets full.
-            await Promise.all(batch.map(({ key, payload }) => this.putJson(key, payload)));
-        }
+        // One request per page, not two per record. Pipelining the individual
+        // INSERT -> PAIR_SET pairs through the pool kept the sockets busy but
+        // still spent a round trip on each half: ~7,800 records became ~15,600
+        // requests with the server idling, which is what `PAIR_PUT_BATCH` was
+        // added upstream to fix. The sign pipeline's `putSigns` already writes
+        // this way; the paging is identical, only the request count changes.
+        await this.putJsonBatched(prepared);
         return prepared.length;
     }
 

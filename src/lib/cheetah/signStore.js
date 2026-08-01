@@ -172,6 +172,35 @@ class SignStore extends CheetahDatabase {
         return this.updateImage(imageId, { ...extra, complete: true }, { verb: 'complete' });
     }
 
+    /**
+     * Take a completed image back off the shelf so more signs can be attached.
+     *
+     * `putSigns` refuses a completed image on purpose — an image that readers
+     * already rank on must not grow rows underneath them — so extending one is
+     * an explicit act with the same commit protocol as a first ingest: clear the
+     * marker, write, `markComplete` again. Between those two points the image is
+     * invisible to every *other* reader and visible to this process only, which
+     * is the same exemption adaptive training already uses within one ingest.
+     *
+     * The window is a real cost and the caller owns it: a corpus-wide review that
+     * reopened every image at once would empty the corpus it is measuring
+     * against. Reopen one image, extend it, complete it, move on.
+     *
+     * Returns the reopened record plus the `release` for that read exemption;
+     * `markComplete` does not call it, because the caller may still want to probe
+     * the image after completing it.
+     */
+    async reopenImage(imageId) {
+        const release = this.readWhileIncomplete(imageId);
+        try {
+            const record = await this.updateImage(imageId, { complete: false }, { verb: 'reopen' });
+            return { record, release };
+        } catch (error) {
+            release();
+            throw error;
+        }
+    }
+
     /** Every complete image record, keyed by image id. */
     async listImages({ includeIncomplete = false } = {}) {
         const images = new Map();
@@ -374,6 +403,29 @@ class SignStore extends CheetahDatabase {
     /** One constellation record by address. */
     async getSign(imageId, ordinal) {
         return this.getJson(keys.signConstellationKey(imageId, ordinal));
+    }
+
+    /**
+     * Every stored constellation of one image, in ordinal order.
+     *
+     * This exists for the one caller that has to know what an image already
+     * *contains* rather than what it matched: extending an image trained in an
+     * earlier session, whose per-word observation counts nobody is holding in
+     * memory any more. An edge weight is a function of the whole image's count,
+     * so republishing a chunk's own count would lower the weight of every word
+     * the chunk re-observed — the counts have to be rebuilt from the corpus, and
+     * the signs are the only place they survive.
+     *
+     * It hydrates through the scan reducer, so a whole image is one page-walk
+     * rather than a `READ` per constellation, and it yields rather than
+     * collecting: an image is thousands of records and the caller only ever
+     * folds them.
+     */
+    async *listSigns(imageId) {
+        for await (const { item, value } of this.scanJson(keys.signConstellationPrefix(imageId))) {
+            if (!value) continue;
+            yield { ordinal: keys.parseSignConstellationKey(item.key).ordinal, record: value };
+        }
     }
 }
 

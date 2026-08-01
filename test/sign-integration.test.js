@@ -20,11 +20,19 @@ const sharp = require('sharp');
 
 const ENABLED = process.env.CHEETAH_INTEGRATION === '1';
 
+const settings = require('../src/settings');
 const { startServer } = require('../src/lib/cheetah/server');
 const { SignStore } = require('../src/lib/cheetah/signStore');
 const keys = require('../src/lib/cheetah/keys');
 const { scanAll } = require('../src/lib/cheetah/kv');
-const { searchImage, trainImage, trainImageAdaptive } = require('../src/signPipeline');
+const {
+    extendImage,
+    reviewCorpus,
+    searchImage,
+    storedWordCounts,
+    trainImage,
+    trainImageAdaptive,
+} = require('../src/signPipeline');
 const { mulberry32 } = require('../src/lib/sign/rng');
 const { commandTrain, collectImages } = require('../src/sign');
 
@@ -151,10 +159,22 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         const stored = await scanAll(store.pool, keys.signConstellationPrefix(first.imageId));
         assert.equal(stored.length, 300);
         const record = await store.getSign(first.imageId, 0);
-        assert.equal(record.n, 5);
-        assert.equal(record.c, 2);
-        assert.deepEqual(record.d[2], [0, 0, 0], 'the centre must carry no colour delta');
-        assert.equal(record.l[2], null, 'the centre must carry no link');
+        // Read from settings, not hard-coded: `SIGN_POINT_COUNT` is a knob, and
+        // pinning 5 here made this test fail the moment the default became 7
+        // without anything actually being wrong. What must hold at any count is
+        // the shape — odd, with the centre exactly in the middle.
+        assert.equal(record.n, settings.sign.pointCount);
+        assert.equal(record.c, (settings.sign.pointCount - 1) / 2);
+        assert.equal(record.n % 2, 1, 'a chain needs a single centre');
+        // The centre is the seed pixel: it has no parent to differ from, so its
+        // delta slot is the zero it was born with and its link is absent. Index
+        // it by `record.c` rather than by a literal, or this only tests 5 points.
+        assert.deepEqual(record.d[record.c], [0, 0, 0], 'the centre must carry no colour delta');
+        assert.equal(record.l[record.c], null, 'the centre must carry no link');
+        // Every other point does carry one, which is what makes `pointDeltas` a
+        // repacking of the hops rather than a sparse array.
+        assert.equal(record.d.length, record.n);
+        assert.equal(record.l.filter((link) => link !== null).length, record.n - 1);
     });
 
     await t.test('a word posting resolves back to a real sign of that image', async () => {
@@ -368,6 +388,165 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         assert.equal(extended.signs, 300, 'a still-improving image should use the extension');
         assert.equal(extended.extended, true);
         assert.equal(extended.record.constellations, 300);
+    });
+
+    // Extending an image already in the corpus. The property everything else
+    // rests on is that a top-up *adds*: it must not redraw over the ordinals the
+    // image already has, and it must republish edge weights from the cumulative
+    // count rather than from its own chunk's.
+    await t.test('an image already in the corpus can be extended', async () => {
+        const file = files[1];
+        const base = await trainImage(store, file, { count: 200, seed: 'extend-base' });
+        assert.equal(base.record.complete, true);
+
+        // The counts a later session would have to rebuild, rebuilt: this is what
+        // keeps a cross-session top-up from lowering edge weights.
+        //
+        // It is deliberately **not** an exact-equality assertion, and that is a
+        // property of the format rather than a weak test. A constellation record
+        // stores its deltas and links rounded to `STORED_DECIMALS` (1e-5), so a
+        // triple whose measurement sits within rounding distance of a
+        // quantisation edge comes back in the neighbouring cell: measured at
+        // ~0.15% of triples. Every such flip moves one observation from one word
+        // to another, so each affected count is off by exactly one — an edge
+        // weight moved by at most 1/TF_SATURATION for a handful of words. What
+        // must hold is that the rebuild is faithful in bulk and never silently
+        // collapses; asserting bit-equality here would be asserting something
+        // the stored record cannot deliver.
+        const rebuilt = await storedWordCounts(store, base.imageId);
+        assert.equal(rebuilt.signs, 200);
+        let differing = 0;
+        for (const [word, count] of base.wordCounts) {
+            const back = rebuilt.wordCounts.get(word) ?? 0;
+            if (back === count) continue;
+            differing += 1;
+            assert.ok(
+                Math.abs(back - count) === 1,
+                `word ${word} rebuilt as ${back} against ${count}: a rounding flip moves a count by one, not more`
+            );
+        }
+        assert.ok(
+            differing <= Math.ceil(base.wordCounts.size * 0.02),
+            `${differing} of ${base.wordCounts.size} words diverged; the round trip should touch well under 2%`
+        );
+        assert.ok(
+            Math.abs(rebuilt.wordCounts.size - base.wordCounts.size) <= differing,
+            'the rebuilt vocabulary must not drift further than the flips explain'
+        );
+
+        const before = await store.getSign(base.imageId, 0);
+        const extended = await extendImage(store, file, {
+            imageId: base.imageId,
+            count: 100,
+            // Deliberately *not* passing wordCounts/startOrdinal: the rebuild
+            // path is the one a later session takes.
+            seed: 'extend-top-up',
+        });
+
+        assert.equal(extended.added, 100);
+        assert.equal(extended.signs, 300);
+        assert.equal(extended.record.complete, true, 'a top-up must put the image back on the shelf');
+        assert.equal(extended.record.constellations, 300);
+        assert.equal(extended.record.topUps, 1, 'the record counts how often it has been extended');
+        assert.deepEqual(await store.getSign(base.imageId, 0), before, 'a top-up must not overwrite ordinal 0');
+        assert.ok(await store.getSign(base.imageId, 299) !== null, 'the appended signs must be addressable');
+
+        const stored = await scanAll(store.pool, keys.signConstellationPrefix(base.imageId));
+        assert.equal(stored.length, 300, 'no holes and no overwrites');
+
+        // Cumulative, never per-chunk: every word the top-up re-observed must
+        // come back with a total at least as large as it had before.
+        for (const [word, count] of base.wordCounts) {
+            assert.ok(
+                extended.wordCounts.get(word) >= count,
+                `word ${word} fell from ${count} to ${extended.wordCounts.get(word)}`
+            );
+        }
+        assert.ok(extended.words >= base.words);
+    });
+
+    // The rehearsal pass: probe what is already stored, top up what the corpus
+    // can no longer find. Both directions have to be provable, or a pass that
+    // did nothing would look the same as a corpus that needed nothing.
+    await t.test('rehearsal tops up only the images that are behind', async () => {
+        const tracked = new Map();
+        for (const [index, file] of files.entries()) {
+            const result = await trainImage(store, file, { count: 150, seed: `rehearse:${index}` });
+            tracked.set(result.imageId, {
+                imageId: result.imageId,
+                filename: result.filename,
+                path: file,
+                signs: result.signs,
+                words: result.words,
+                wordCounts: result.wordCounts,
+                reviewedAt: 0,
+            });
+        }
+
+        // Nothing is behind when the bar is on the floor, so nothing may be
+        // written — a pass that topped up regardless would be measuring nothing.
+        const satisfied = await reviewCorpus(store, tracked, {
+            probes: 1,
+            minHitRate: 0,
+            topUp: 50,
+            ceiling: 0,
+            sample: 0,
+            probeMaxConstellations: 36,
+        });
+        assert.equal(satisfied.reviewed.length, tracked.size);
+        assert.equal(satisfied.toppedUp, 0);
+        assert.equal(satisfied.added, 0);
+        assert.ok(satisfied.reviewed.every((entry) => entry.reason === 'findable'));
+
+        // With an unreachable bar every reviewed image is behind, so every one
+        // is topped up — once, by one chunk, not to the ceiling.
+        const before = new Map([...tracked].map(([id, entry]) => [id, entry.signs]));
+        const behind = await reviewCorpus(store, tracked, {
+            probes: 1,
+            minHitRate: 2,
+            topUp: 50,
+            ceiling: 0,
+            sample: 2,
+            probeMaxConstellations: 36,
+        });
+        assert.equal(behind.reviewed.length, 2, 'sample bounds the pass');
+        assert.equal(behind.toppedUp, 2);
+        assert.equal(behind.added, 100);
+        for (const entry of behind.reviewed) {
+            assert.equal(entry.reason, 'topped-up');
+            assert.equal(entry.added, 50);
+            const tracker = [...tracked.values()].find((item) => item.filename === entry.filename);
+            assert.equal(tracker.signs, before.get(tracker.imageId) + 50);
+            assert.equal((await store.getImage(tracker.imageId)).constellations, tracker.signs);
+        }
+
+        // Least recently reviewed first: the second bounded pass must look at
+        // the images the first one did not, or a large corpus would only ever
+        // rehearse its head.
+        const reviewedFirst = new Set(behind.reviewed.map((entry) => entry.filename));
+        const next = await reviewCorpus(store, tracked, {
+            probes: 1,
+            minHitRate: 0,
+            topUp: 50,
+            ceiling: 0,
+            sample: 1,
+            probeMaxConstellations: 36,
+        });
+        assert.equal(next.reviewed.length, 1);
+        assert.equal(reviewedFirst.has(next.reviewed[0].filename), false);
+
+        // The ceiling is what stops an image no amount of evidence can fix.
+        const capped = await reviewCorpus(store, tracked, {
+            probes: 1,
+            minHitRate: 2,
+            topUp: 50,
+            ceiling: 1,
+            sample: 0,
+            probeMaxConstellations: 36,
+        });
+        assert.equal(capped.toppedUp, 0);
+        assert.equal(capped.added, 0);
+        assert.ok(capped.reviewed.every((entry) => entry.reason === 'at-ceiling'));
     });
 
     // A corpus with nothing to be confused with cannot measure discriminability,

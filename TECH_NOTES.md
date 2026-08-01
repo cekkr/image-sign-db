@@ -253,15 +253,24 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
     `CHEETAH_DATA_DIR`, `CHEETAH_PAIR_INDEX_BYTES` and `CHEETAH_GRAPH_TERM_INDEX` are also
     read by the Go server process itself.
   - `sign`: operational knobs of the Cheetah-native sign pipeline (§10½) —
-    `SIGN_CONSTELLATIONS_PER_IMAGE` (2048), `SIGN_POINT_COUNT` (5, must be odd),
+    `SIGN_CONSTELLATIONS_PER_IMAGE` (3600), `SIGN_POINT_COUNT` (7, must be odd; a chain of `n`
+    points yields `n − 2` triples, so it scales the cost of every stage),
     `SIGN_POINT_PATCH_REL` (0.004; `0` reads exactly one pixel), `SIGN_WORKING_MAX_SIDE` (1024),
     `SIGN_WITH_CENTRE_POSITION` (false); under `train` (adaptive ingestion, which makes
-    `SIGN_CONSTELLATIONS_PER_IMAGE` a ceiling rather than a quota): `SIGN_TRAIN_ADAPTIVE` (true),
+    `SIGN_CONSTELLATIONS_PER_IMAGE` a ceiling rather than a quota): `SIGN_TRAIN_ADAPTIVE` (false),
     `SIGN_TRAIN_CHECK_EVERY` (512), `SIGN_TRAIN_PROBES` (3), `SIGN_TRAIN_MIN_GAIN` (0.01),
-    `SIGN_TRAIN_MIN_CORPUS` (4), `SIGN_TRAIN_PROBE_MAX` (96); and under `search`: `SIGN_SEARCH_BATCH` (12),
-    `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (240),
+    `SIGN_TRAIN_MIN_CORPUS` (4), `SIGN_TRAIN_PROBE_MAX` (96), `SIGN_TRAIN_EXTEND_TO` (0);
+    under `train.review` (rehearsal — re-probe images already trained and top up the ones the
+    growing corpus can no longer find): `SIGN_TRAIN_REVIEW` (false), `SIGN_TRAIN_REVIEW_EVERY` (4),
+    `SIGN_TRAIN_REVIEW_SAMPLE` (8), `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` (1),
+    `SIGN_TRAIN_REVIEW_TOP_UP` (512), `SIGN_TRAIN_REVIEW_CEILING` (8192),
+    `SIGN_TRAIN_REVIEW_FINAL_PASSES` (2); and under `search`: `SIGN_SEARCH_BATCH` (12),
+    `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (720),
     `SIGN_SEARCH_STOPWORD_RATIO` (0.6), `SIGN_SEARCH_SEEDS_PER_ROUND` (96),
-    `SIGN_SEARCH_LENGTH_SLOPE` (0), `SIGN_SEARCH_CONFIDENCE_MULTIPLE` (2),
+    `SIGN_SEARCH_LENGTH_SLOPE` (0 — but required above 0 whenever training density is
+    uneven, e.g. under `--rehearse`), `SIGN_SEARCH_CHAIN_BONUS` (0 — credits a constellation
+    for agreeing with itself instead of folding its triples as an unordered bag),
+    `SIGN_SEARCH_CONFIDENCE_MULTIPLE` (2),
     `SIGN_SEARCH_SEPARATION` (1.35), `SIGN_SEARCH_RERANK_TOP` (5), `SIGN_SEARCH_RERANK_SIGNS` (12).
     Every one of these was measured on `sample_images/`, and three are counter-intuitive:
     `CONFIDENCE_MULTIPLE` is a multiple of the uniform share `1/corpus` because an absolute share

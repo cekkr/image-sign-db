@@ -152,3 +152,79 @@ test('seed selection drops the unknown and the ubiquitous, rarest first', () => 
         [2, 3]
     );
 });
+
+// A constellation is a *chain*, and until `chainBonus` it was folded as a bag:
+// five triples of one sign agreeing on an image counted exactly as much as five
+// triples of five unrelated signs. That is why a longer chain behaved like a
+// higher sampling rate instead of like a richer feature — the extra triples were
+// indistinguishable from extra constellations. Both halves are pinned here: that
+// the knob is arithmetically inert when off, and that when on it rewards
+// agreement *within* a sign and not coincidence across signs.
+test('chain agreement is worth more than the same triples scattered', () => {
+    const degrees = new Map([[1, 1], [2, 1], [3, 1]]);
+    // One image matched by three triples of one constellation; the other by one
+    // triple each of three different constellations. Identical seeds, identical
+    // activations — only the origin differs.
+    // Non-adjacent, so all three are independent evidence: consecutive triples
+    // share a hop and would be the same measurement counted twice.
+    const origins = new Map([
+        [1, [{ sign: 0, triple: 0 }]],
+        [2, [{ sign: 0, triple: 2 }]],
+        [3, [{ sign: 0, triple: 4 }]],
+    ]);
+    const scattered = new Map([
+        [1, [{ sign: 0, triple: 0 }]],
+        [2, [{ sign: 1, triple: 0 }]],
+        [3, [{ sign: 2, triple: 0 }]],
+    ]);
+    const seeds = [
+        { word: 1, activation: 1 },
+        { word: 2, activation: 1 },
+        { word: 3, activation: 1 },
+    ];
+
+    const chained = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 1 });
+    chained.fold([hit(10, 'chain.jpg', 1000, seeds)], degrees, origins);
+    const loose = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 1 });
+    loose.fold([hit(11, 'loose.jpg', 1000, seeds)], degrees, scattered);
+
+    const chainedMass = chained.ranked()[0].mass;
+    const looseMass = loose.ranked()[0].mass;
+    // Three independent triples of one chain: 1 + bonus * (3 - 1) = 3x.
+    assert.ok(Math.abs(chainedMass - 3 * looseMass) < 1e-12, `${chainedMass} vs ${looseMass}`);
+
+    // Adjacent triples share a hop, so 0,1,2 is worth two independent
+    // agreements, not three. Crediting all three is what took rank-1 from 90%
+    // to 75% with the search budget held fixed: on a near-duplicate corpus the
+    // image matching one triple is the image matching its neighbours, so the
+    // redundant credit lands on exactly the wrong candidate.
+    const adjacent = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 1 });
+    adjacent.fold([hit(16, 'adjacent.jpg', 1000, seeds)], degrees, new Map([
+        [1, [{ sign: 0, triple: 0 }]],
+        [2, [{ sign: 0, triple: 1 }]],
+        [3, [{ sign: 0, triple: 2 }]],
+    ]));
+    assert.ok(
+        Math.abs(adjacent.ranked()[0].mass - 2 * looseMass) < 1e-12,
+        `adjacent triples must count once per shared hop: ${adjacent.ranked()[0].mass} vs ${looseMass}`
+    );
+    assert.ok(chained.ranked()[0].chained > 0, 'the chained share is reported');
+    assert.equal(loose.ranked()[0].chained, 0, 'coincidence across signs earns no bonus');
+
+    // Off is exactly off: same seeds, same origins, the old arithmetic.
+    const off = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 0 });
+    off.fold([hit(12, 'off.jpg', 1000, seeds)], degrees, origins);
+    const bare = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 0 });
+    bare.fold([hit(13, 'bare.jpg', 1000, seeds)], degrees);
+    assert.equal(off.ranked()[0].mass, bare.ranked()[0].mass);
+
+    // A word two signs both asked for splits its activation rather than paying
+    // twice, so turning the knob on cannot inflate total mass by double counting.
+    const shared = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 0 });
+    shared.fold([hit(14, 'shared.jpg', 1000, [{ word: 1, activation: 1 }])], degrees, new Map([
+        [1, [{ sign: 0, triple: 0 }, { sign: 1, triple: 0 }]],
+    ]));
+    const single = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 0 });
+    single.fold([hit(15, 'single.jpg', 1000, [{ word: 1, activation: 1 }])], degrees);
+    assert.ok(Math.abs(shared.ranked()[0].mass - single.ranked()[0].mass) < 1e-12);
+});
