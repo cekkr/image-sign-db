@@ -16,10 +16,13 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const binder = require('../src/lib/cheetah/binder');
+const settings = require('../src/settings');
 const protocol = require('../src/lib/cheetah/protocol');
 const client = require('../src/lib/cheetah/client');
 const kv = require('../src/lib/cheetah/kv');
 const graph = require('../src/lib/cheetah/graph');
+const { CheetahStore } = require('../src/lib/cheetah/store');
+const { SignStore } = require('../src/lib/cheetah/signStore');
 
 test('the shims re-export the binder modules themselves, not copies', () => {
     assert.equal(protocol, binder.protocol);
@@ -54,6 +57,21 @@ test('the binder exports every symbol this project builds on', () => {
     for (const name of ['hex', 'unhex', 'sha1', 'quantize', 'bucketize', 'bucketSweep']) {
         assert.equal(typeof binder.keys[name], 'function', `keys.${name}`);
     }
+});
+
+test('both stores apply the configured byte-wise transport to owned pools', async () => {
+    for (const Store of [CheetahStore, SignStore]) {
+        const store = new Store({ poolSize: 2 });
+        assert.equal(store.pool.clients.length, 2);
+        assert.ok(store.pool.clients.every(
+            (conn) => conn.options.binary === settings.cheetah.binary
+        ));
+        await store.close();
+    }
+
+    const textStore = new CheetahStore({ binary: false });
+    assert.ok(textStore.pool.clients.every((conn) => conn.options.binary === false));
+    await textStore.close();
 });
 
 test('a READ payload keeps the commas inside our JSON records', () => {

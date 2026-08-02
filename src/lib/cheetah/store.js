@@ -64,6 +64,7 @@ class CheetahStore extends CheetahDatabase {
             poolSize: options.poolSize ?? configured.poolSize,
             host: options.host ?? configured.host,
             port: options.port ?? configured.port,
+            binary: options.binary ?? configured.binary,
             connectTimeoutMs: options.connectTimeoutMs ?? configured.connectTimeoutMs,
             commandTimeoutMs: options.commandTimeoutMs ?? configured.commandTimeoutMs,
             maxInFlight: options.maxInFlight ?? configured.maxInFlight,

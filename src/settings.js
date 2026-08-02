@@ -79,6 +79,10 @@ const cheetahSettings = {
   connectTimeoutMs: getNumber('CHEETAH_CONNECT_TIMEOUT_MS', 5000),
   commandTimeoutMs: getNumber('CHEETAH_COMMAND_TIMEOUT_MS', 30000),
   maxInFlight: getNumber('CHEETAH_MAX_IN_FLIGHT', 64),
+  // Byte-wise frames keep the command helpers unchanged while avoiding the
+  // text spelling cost on TCP. Set false only when talking to a pre-binary
+  // Cheetah server during a staged upgrade.
+  binary: getBoolean('CHEETAH_BINARY_PROTOCOL', true),
   // Stride 2 is a no-op at creation time only: pairs/format.dat wins on every
   // later open, so this must be right the first time (ROADMAP §4).
   pairIndexBytes: getNumber('CHEETAH_PAIR_INDEX_BYTES', 2),

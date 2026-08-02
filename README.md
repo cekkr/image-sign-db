@@ -791,6 +791,13 @@ are not ported yet. Storage-budget pruning is implemented for feature rows.
     pipelined on one socket before callers are queued.
   - Defaults: `5000` / `30000` / `64`
 
+• CHEETAH_BINARY_PROTOCOL
+  - Description: Use Cheetah's byte-wise framed TCP protocol. The command helpers are
+    unchanged; the binder negotiates the command/argument dictionaries and transcodes
+    their canonical lines at the socket boundary. Disable only while connecting to a
+    pre-binary server during a staged upgrade.
+  - Default: `true`
+
 • CHEETAH_PAIR_INDEX_BYTES
   - Description: Pair-trie stride. Only adopted when a database directory is *created* —
     `pairs/format.dat` wins on every later open.

@@ -247,7 +247,8 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   - `cheetah`: connection and lifecycle settings for the Cheetah migration groundwork —
     `CHEETAH_HOST`, `CHEETAH_PORT`, `CHEETAH_DATABASE`, `CHEETAH_DATA_DIR`,
     `CHEETAH_POOL_SIZE`, `CHEETAH_CONNECT_TIMEOUT_MS`, `CHEETAH_COMMAND_TIMEOUT_MS`,
-    `CHEETAH_MAX_IN_FLIGHT`, `CHEETAH_PAIR_INDEX_BYTES`, `CHEETAH_GRAPH_TERM_INDEX`.
+    `CHEETAH_MAX_IN_FLIGHT`, `CHEETAH_BINARY_PROTOCOL` (byte-wise framed TCP, default true),
+    `CHEETAH_PAIR_INDEX_BYTES`, `CHEETAH_GRAPH_TERM_INDEX`.
     Read by `src/lib/cheetah/*` and the Cheetah ingestion branch in `src/featureExtractor.js`
     (see `ROADMAP.md`).
     `CHEETAH_DATA_DIR`, `CHEETAH_PAIR_INDEX_BYTES` and `CHEETAH_GRAPH_TERM_INDEX` are also

@@ -43,6 +43,7 @@ test('cheetah round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRATION=1 
     const server = await startServer({ port, dataDir, graphTermIndex: false, pairIndexBytes: 2 });
     const client = new CheetahClient({
         port,
+        binary: true,
         database: 'image_sign_db_test',
         // Trie geometry is only adopted when the directory is created, so the
         // override has to be recorded on the name before the RESET_DB below.
@@ -86,6 +87,7 @@ test('cheetah round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRATION=1 
         const pool = new CheetahPool({
             size: 2,
             port,
+            binary: true,
             database: 'image_sign_db_test',
             databaseOptions: { pair_bytes: 2 },
         });

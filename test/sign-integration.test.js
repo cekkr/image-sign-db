@@ -125,6 +125,7 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
     });
 
     await store.connect();
+    assert.ok(store.pool.clients.every((conn) => conn.binary), 'every store socket negotiated binary mode');
 
     const files = [];
     for (const [index, style] of Object.keys(STYLES).entries()) {
