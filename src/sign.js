@@ -116,6 +116,7 @@ function reportCheckpoint(checkpoint, ceiling) {
     console.log(
         `      · ${String(checkpoint.constellations).padStart(5)}/${ceiling}  ` +
         `hit ${hits}/${checkpoint.probes}  ` +
+        `conf ${Math.round(checkpoint.confidentRate * checkpoint.probes)}/${checkpoint.probes}  ` +
         `margin ${checkpoint.margin >= 0 ? '+' : ''}${checkpoint.margin.toFixed(3)}  ` +
         `acc ${checkpoint.accuracy.toFixed(3)} (${gain(checkpoint.accuracyGain)})  ` +
         `effort ${checkpoint.effort.toFixed(3)} (${gain(checkpoint.effortGain)})`
@@ -141,6 +142,7 @@ async function runReviewPass(store, tracked, review, label) {
             if (result.reason === 'findable') return;
             console.log(
                 `      ↻ ${result.filename}  hit ${result.hitRate.toFixed(2)} ` +
+                `conf ${result.confidentRate.toFixed(2)} ` +
                 `margin ${result.margin >= 0 ? '+' : ''}${result.margin.toFixed(3)}  ` +
                 (result.added > 0
                     ? `+${result.added} → ${result.signs} constellations`
@@ -157,16 +159,23 @@ async function runReviewPass(store, tracked, review, label) {
 }
 
 async function commandTrain(store, targets, flags) {
-    const count = numberFlag(flags, 'constellations', settings.sign.constellationsPerImage);
     // `--adaptive` / `--no-adaptive` both override the configured default, so a
     // run can go either way without touching the environment.
     const adaptive = flags.get('no-adaptive') === 'true'
         ? false
         : (flags.get('adaptive') === 'true' || settings.sign.train.adaptive);
-    // How far an image that is still improving at `count` may keep going. Only
-    // meaningful under adaptive training, where a ceiling is a ceiling and not a
-    // quota; a flat run ignores it.
-    const extendTo = numberFlag(flags, 'extend-to', settings.sign.train.extendTo);
+    const countWasSpecified = flags.has('constellations');
+    // With no count, automatic training begins with one checkpoint-sized chunk
+    // and lets validation choose the rest. A supplied count is a nominal target,
+    // not an instruction to stop an image that fresh searches still cannot find.
+    const count = countWasSpecified
+        ? numberFlag(flags, 'constellations', settings.sign.constellationsPerImage)
+        : (adaptive ? settings.sign.train.checkEvery : settings.sign.constellationsPerImage);
+    // Finite hard cap for an image that keeps improving. `--extend-to 0` is the
+    // deliberate way to make the nominal count a hard ceiling again.
+    const extendTo = adaptive
+        ? numberFlag(flags, 'extend-to', settings.sign.train.extendTo)
+        : 0;
     // Rehearsal: keep the images already trained findable as the corpus that
     // competes with them grows. `--rehearse` / `--no-rehearse` override the
     // configured default the same way `--adaptive` does.
@@ -192,21 +201,60 @@ async function commandTrain(store, targets, flags) {
         );
         await store.reset();
     }
-    const ceiling = adaptive ? Math.max(count, extendTo || 0) : count;
+    const ceiling = adaptive ? Math.max(1, count, extendTo || 0) : Math.max(1, count);
+    if (adaptive && extendTo <= 0 && !flags.has('review-ceiling')) {
+        review.ceiling = ceiling;
+    }
+    // Automatic stabilisation needs a finite proof boundary. Preserve the
+    // historical `0` spelling as "use the training ceiling" rather than letting
+    // an indistinguishable pair create an endless final review loop.
+    if (review.enabled && review.ceiling <= 0) review.ceiling = ceiling;
+
+    // Link inputs to the canonical filename record before doing any writes.
+    // `putImage` allocates by design, so skipping this lookup used to create a
+    // second graph image every time `train sample_images/` was rerun. Besides
+    // wasting work, those duplicate IDs competed with the image they represented.
+    const tracked = new Map();
+    const linkedByPath = new Map();
+    const stored = await store.listImages();
+    for (const image of images) {
+        const filename = path.basename(image);
+        const imageId = await store.findImageIdByFilename(filename);
+        const record = imageId === null ? null : (stored.get(imageId) || await store.getImage(imageId));
+        if (!record?.complete) continue;
+        const entry = {
+            imageId,
+            filename,
+            path: image,
+            signs: Number(record.constellations) || 0,
+            words: Number(record.words) || 0,
+            wordCounts: null,
+            reviewedAt: 0,
+            linked: true,
+            record,
+        };
+        tracked.set(imageId, entry);
+        linkedByPath.set(image, entry);
+    }
+
     console.log(
         adaptive
-            ? `Training ${images.length} image(s), as many constellations as needed ` +
-              `up to ${ceiling}${ceiling > count ? ` (nominal ${count})` : ''}, ` +
+            ? `Training ${images.length} image(s), validation chooses the constellation count ` +
+              `up to ${ceiling}${countWasSpecified ? ` (requested ${count})` : ' (automatic)'}, ` +
               `validating every ${settings.sign.train.checkEvery} with ` +
               `${settings.sign.train.probes} probe(s)`
             : `Training ${images.length} image(s) with ${count} constellations each`
     );
+    if (linkedByPath.size > 0) {
+        console.log(`  linked ${linkedByPath.size} already-trained image(s); validating instead of duplicating`);
+    }
     if (review.enabled) {
         console.log(
             `  rehearsing: every ${review.every || images.length} image(s), ` +
             `${review.sample || 'all'} image(s) per pass, ` +
             `+${review.topUp} constellations below hit rate ${review.minHitRate} ` +
-            `up to ${review.ceiling || '∞'}`
+            `up to ${review.ceiling}; final validation requires ` +
+            `${Math.max(1, review.finalPasses)} clean fair cycle(s)`
         );
     }
 
@@ -216,7 +264,6 @@ async function commandTrain(store, targets, flags) {
     // image is on disk, and its running per-word counts. Keeping the counts here
     // is what lets a top-up republish cumulative edge weights without reading
     // the whole image back — see signPipeline.extendImage.
-    const tracked = new Map();
     const reviews = [];
     // One image that cannot be written must not end the run. A failure leaves
     // the image record *incomplete*, and every reader ignores incomplete
@@ -231,21 +278,35 @@ async function commandTrain(store, targets, flags) {
     const at = (index) => `[${String(index + 1).padStart(String(images.length).length)}/${images.length}]`;
     for (const [index, image] of images.entries()) {
         const started = Date.now();
+        const linked = linkedByPath.get(image) || null;
         // Named before the work, not after: the checkpoint lines belong to this
         // image and arrive while it is still being written.
-        if (adaptive) console.log(`  ▸ ${at(index)} ${path.basename(image)}`);
+        if (adaptive && !linked) console.log(`  ▸ ${at(index)} ${path.basename(image)}`);
         let result;
         try {
-            result = adaptive
-                ? await trainImageAdaptive(store, image, {
-                    count,
-                    extendTo,
-                    // The trainer validates itself between chunks whether anyone is
-                    // watching; this is what makes it visible while it runs rather
-                    // than only in the report afterwards.
-                    onCheckpoint: (checkpoint) => reportCheckpoint(checkpoint, ceiling),
-                })
-                : await trainImage(store, image, { count });
+            result = linked
+                ? {
+                    imageId: linked.imageId,
+                    filename: linked.filename,
+                    signs: linked.signs,
+                    words: linked.words,
+                    edges: linked.words,
+                    wordCounts: linked.wordCounts,
+                    record: linked.record,
+                    reason: 'linked',
+                    checkpoints: [],
+                    reused: true,
+                }
+                : (adaptive
+                    ? await trainImageAdaptive(store, image, {
+                        count,
+                        extendTo,
+                        // The trainer validates itself between chunks whether anyone is
+                        // watching; this is what makes it visible while it runs rather
+                        // than only in the report afterwards.
+                        onCheckpoint: (checkpoint) => reportCheckpoint(checkpoint, ceiling),
+                    })
+                    : await trainImage(store, image, { count }));
         } catch (error) {
             const seconds = (Date.now() - started) / 1000;
             const filename = path.basename(image);
@@ -258,17 +319,27 @@ async function commandTrain(store, targets, flags) {
         console.log(
             `  ✓ ${at(index)} ${result.filename}  ${result.signs} signs, ${result.words} words, ` +
             `${result.edges} edges  (${seconds.toFixed(1)}s)` +
-            (result.reason ? `  [${result.reason}]` : '')
+            (result.reused ? '  [linked; queued for validation]' : (result.reason ? `  [${result.reason}]` : ''))
         );
-        tracked.set(result.imageId, {
-            imageId: result.imageId,
-            filename: result.filename,
-            path: image,
-            signs: result.signs,
-            words: result.words,
-            wordCounts: result.wordCounts ?? null,
-            reviewedAt: 0,
-        });
+        const tracker = tracked.get(result.imageId);
+        if (tracker) {
+            // A linked image may already have been reviewed before its position
+            // in the input list. Preserve that generation and any top-up it
+            // received rather than replacing it with the stale stored record.
+            tracker.path = image;
+            tracker.wordCounts = tracker.wordCounts ?? result.wordCounts ?? null;
+        } else {
+            tracked.set(result.imageId, {
+                imageId: result.imageId,
+                filename: result.filename,
+                path: image,
+                signs: result.signs,
+                words: result.words,
+                wordCounts: result.wordCounts ?? null,
+                reviewedAt: 0,
+                linked: false,
+            });
+        }
 
         // The pass runs *between* images, not after the run, because that is
         // where the damage happens: the corpus this image just joined is the one
@@ -279,14 +350,43 @@ async function commandTrain(store, targets, flags) {
         }
     }
 
-    // The images trained last have had the fewest chances to be reviewed, and
-    // the corpus they compete with only became complete on the final image. Keep
-    // passing while any pass still tops something up.
+    // Final validation is made of complete, fair corpus cycles. Resetting only
+    // the scheduler generation (not any learned data) means every image — first
+    // and last, linked and newly trained — is probed exactly once per cycle.
+    // A top-up changes the corpus, invalidating that cycle as a final proof, so
+    // the clean streak resets. Finite per-image ceilings guarantee termination:
+    // once nothing else can be added, a clean cycle necessarily follows.
     if (review.enabled && tracked.size > 1) {
-        for (let pass = 0; pass < Math.max(1, review.finalPasses); pass += 1) {
-            const outcome = await runReviewPass(store, tracked, review, `final pass ${pass + 1}`);
-            reviews.push(outcome);
-            if (outcome.toppedUp === 0) break;
+        for (const entry of tracked.values()) entry.reviewedAt = 0;
+        const cleanNeeded = Math.max(1, Math.trunc(review.finalPasses) || 1);
+        let cleanCycles = 0;
+        let cycle = 0;
+        while (cleanCycles < cleanNeeded) {
+            cycle += 1;
+            let cycleToppedUp = 0;
+            let part = 0;
+            while ([...tracked.values()].some((entry) => entry.reviewedAt < cycle)) {
+                part += 1;
+                // Restrict a pass to entries not yet seen in this cycle. Without
+                // this view, a batch larger than the remaining tail would sample
+                // already-reviewed images again and slowly starve the tail.
+                const pending = new Map(
+                    [...tracked].filter(([, entry]) => entry.reviewedAt < cycle)
+                );
+                const outcome = await runReviewPass(
+                    store,
+                    pending,
+                    review,
+                    `final cycle ${cycle}.${part}`
+                );
+                reviews.push(outcome);
+                cycleToppedUp += outcome.toppedUp;
+            }
+            cleanCycles = cycleToppedUp === 0 ? cleanCycles + 1 : 0;
+            console.log(
+                `    ↻ final cycle ${cycle}: ${cycleToppedUp === 0 ? 'clean' : `${cycleToppedUp} top-up(s)`}; ` +
+                `clean streak ${cleanCycles}/${cleanNeeded}`
+            );
         }
     }
 
@@ -317,26 +417,33 @@ async function commandTrain(store, targets, flags) {
         );
     }
     if (adaptive) {
-        // Why each image stopped, which is the summary of the validation above.
-        // `exhausted` means "still improving when the budget ran out" — an
-        // under-trained image, not a converged one — so it is worth counting.
+        // Why each image entered rehearsal. `awaiting-review` is the bootstrap
+        // state for the first few images, and `linked` means no duplicate was
+        // written; the fair final cycles are their actual completion proof.
         const reasons = new Map();
         for (const result of results) {
             const reason = result.reason ?? 'unknown';
             reasons.set(reason, (reasons.get(reason) || 0) + 1);
         }
+        const densities = [...tracked.values()].map((entry) => entry.signs);
         console.log(
-            `  mean ${(signs / results.length).toFixed(0)} constellations of ${ceiling} ` +
-            `(${((1 - signs / (ceiling * results.length)) * 100).toFixed(1)}% of the ceiling unwritten)  ` +
+            `  final density ${Math.min(...densities)}–${Math.max(...densities)} ` +
+            `(mean ${(signs / Math.max(1, tracked.size)).toFixed(0)}, safety ceiling ${ceiling})  ` +
             [...reasons].map(([reason, images_]) => `${reason} ${images_}`).join(', ')
         );
     }
     return {
-        constellationsPerImage: count,
+        // Null is meaningful: no count was specified, so validation selected
+        // the per-image densities. `startingConstellations` records the first
+        // chunk used to begin that process.
+        constellationsPerImage: countWasSpecified || !adaptive ? count : null,
+        startingConstellations: count,
+        automatic: adaptive && !countWasSpecified,
         adaptive,
         extendTo: adaptive ? extendTo : 0,
         ceiling,
         images: results.length,
+        linked: results.filter((result) => result.reused).length,
         // What was asked for, versus what is actually in the corpus. A report
         // that recorded only the images that worked would describe a corpus of
         // 199 as a corpus of 198 with no trace of the difference.
@@ -347,8 +454,10 @@ async function commandTrain(store, targets, flags) {
         // did not need to write. Measured against `ceiling`, not `count`, or an
         // extended run reports a negative saving against a budget it was
         // explicitly allowed to exceed.
-        meanConstellations: signs / results.length,
-        constellationsSaved: adaptive ? 1 - signs / (ceiling * results.length) : 0,
+        meanConstellations: signs / Math.max(1, tracked.size),
+        constellationsSaved: adaptive && linkedByPath.size === 0
+            ? 1 - signs / (ceiling * Math.max(1, tracked.size))
+            : null,
         // `null` rather than an empty summary when rehearsal was off, so a
         // report cannot be read as "rehearsed, and it found nothing to do".
         rehearsal: review.enabled
@@ -359,6 +468,7 @@ async function commandTrain(store, targets, flags) {
                 topUp: review.topUp,
                 ceiling: review.ceiling,
                 minHitRate: review.minHitRate,
+                requiredCleanCycles: Math.max(1, Math.trunc(review.finalPasses) || 1),
                 added: reviews.reduce((sum, pass) => sum + pass.added, 0),
                 toppedUp: reviews.reduce((sum, pass) => sum + pass.toppedUp, 0),
                 seconds: reviews.reduce((sum, pass) => sum + pass.seconds, 0),
@@ -377,7 +487,8 @@ async function commandTrain(store, targets, flags) {
             // The corpus's count, which a top-up may have raised past the one
             // training wrote.
             signs: tracked.get(result.imageId)?.signs ?? result.signs,
-            trainedSigns: result.signs,
+            trainedSigns: result.reused ? 0 : result.signs,
+            reused: Boolean(result.reused),
             words: tracked.get(result.imageId)?.words ?? result.words,
             edges: result.edges,
             seconds: result.seconds,
@@ -615,6 +726,8 @@ async function commandEvaluate(store, targets, flags) {
             word_cardinality: WORD_CARDINALITY,
             database: databaseName(flags),
             constellations_per_image: training ? training.constellationsPerImage : corpusDensity,
+            automatic_training: training?.automatic ?? false,
+            training_ceiling: training?.ceiling ?? null,
             trained_this_run: !skipTrain,
             point_count: settings.sign.pointCount,
             point_patch_relative: settings.sign.pointPatchRelative,
@@ -706,24 +819,22 @@ async function main() {
                 '                        (default from CHEETAH_DATABASE; --database is an alias)',
                 '  --reset               training only: drop the database first, so the run',
                 '                        establishes the corpus instead of adding to it',
-                '  --constellations <n>  signs per image at training time (a ceiling when',
-                '                        adaptive training is on)',
+                '  --constellations <n>  nominal starting target. If omitted, training starts with',
+                '                        one validation chunk; it is not a fixed default count.',
                 '  --adaptive            use as many constellations as each image needs: train in',
                 '                        chunks, validate against the corpus between them, and stop',
-                '                        when more constellations stop improving recall. The',
-                '                        checkpoints are printed as they happen. Off by default: it',
-                '                        only pays when images converge before the ceiling, and on',
-                '                        sample_images/ they do not (+62% for the same output).',
+                '                        when more constellations stop improving recall. This is the',
+                '                        default; checkpoints are printed as they happen.',
                 '  --no-adaptive         force the flat count when the default is adaptive',
                 '  --extend-to <n>       adaptive only: how far an image that is *still* improving',
-                '                        at --constellations may keep going (0 = not at all,',
-                '                        the default; SIGN_TRAIN_EXTEND_TO sets it too)',
+                '                        may keep going (default 8192; 0 makes --constellations a',
+                '                        hard cap; SIGN_TRAIN_EXTEND_TO sets it too)',
                 '  --rehearse            training only: between images, re-probe the ones already',
                 '                        trained and give more constellations to any the corpus can',
                 '                        no longer find. An image is trained against the corpus that',
                 '                        existed at the time; every later image competes for the',
                 '                        same words, so without this the earliest images quietly',
-                '                        stop being answerable as the corpus grows.',
+                '                        stop being answerable as the corpus grows. On by default.',
                 '  --no-rehearse         force it off when the default is on',
                 '  --review-every <n>    images trained between two rehearsal passes (0 = only at',
                 '                        the end)',
@@ -731,8 +842,9 @@ async function main() {
                 '                        (0 = all of them)',
                 '  --review-top-up <n>   constellations one top-up adds',
                 '  --review-ceiling <n>  total constellations an image may reach through top-ups',
-                '  --review-passes <n>   passes after the last image, repeated while any of them',
-                '                        still tops something up',
+                '  --review-passes <n>   clean full-corpus cycles required at the end. Every cycle',
+                '                        rechecks every image with fresh random probes; a top-up',
+                '                        resets the clean streak.',
                 '  --max <n>             ceiling on constellations measured per search',
                 '  --spawn               start the vendored cheetah-server for this command',
                 '  --data-dir <path>     data directory for --spawn',

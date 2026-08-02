@@ -127,7 +127,10 @@ done
 TRAIN_FLAGS=()
 if [ "$ADAPTIVE" -eq 1 ]; then
     TRAIN_FLAGS+=(--adaptive)
-    [ -n "$EXTEND_TO" ] && TRAIN_FLAGS+=(--extend-to "$EXTEND_TO")
+    # The normal CLI has an 8192 automatic safety ceiling. A benchmark's `-c`
+    # is deliberately a controlled ceiling, so spell the zero override instead
+    # of inheriting that operational default.
+    TRAIN_FLAGS+=(--extend-to "${EXTEND_TO:-0}")
 else
     TRAIN_FLAGS+=(--no-adaptive)
     # Refuse rather than ignore: without the checkpoints there is nothing to

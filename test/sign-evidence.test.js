@@ -19,7 +19,9 @@ const assert = require('node:assert/strict');
 const {
     Evidence,
     inverseDocumentFrequency,
+    reviewProbeSeed,
     selectSeeds,
+    selectReviewEntries,
 } = require('../src/signPipeline');
 
 function hit(imageId, filename, words, seeds) {
@@ -151,6 +153,31 @@ test('seed selection drops the unknown and the ubiquitous, rarest first', () => 
         selectSeeds([5, 4, 3, 2], degrees, { corpusSize: 20, stopWordImageRatio: 0.6, limit: 2 }),
         [2, 3]
     );
+});
+
+test('bounded rehearsal is fair and changes its random draw every generation', () => {
+    const tracked = new Map([
+        [1, { imageId: 1, filename: 'first.jpg', reviewedAt: 0 }],
+        [2, { imageId: 2, filename: 'second.jpg', reviewedAt: 0 }],
+        [3, { imageId: 3, filename: 'third.jpg', reviewedAt: 0 }],
+        [4, { imageId: 4, filename: 'fourth.jpg', reviewedAt: 0 }],
+    ]);
+
+    const seen = [];
+    for (let pass = 0; pass < 4; pass += 1) {
+        const selected = selectReviewEntries(tracked, 2);
+        seen.push(...selected.map((entry) => entry.imageId));
+        for (const entry of selected) entry.reviewedAt += 1;
+    }
+
+    assert.deepEqual(seen.slice(0, 4).sort(), [1, 2, 3, 4], 'the first cycle must cover every image');
+    assert.deepEqual(
+        [...tracked.values()].map((entry) => entry.reviewedAt),
+        [2, 2, 2, 2],
+        'no image may receive a third review before every image receives its second'
+    );
+    assert.notEqual(reviewProbeSeed('first.jpg', 0), reviewProbeSeed('first.jpg', 1));
+    assert.equal(reviewProbeSeed('first.jpg', 1), 'review:first.jpg:1');
 });
 
 // A constellation is a *chain*, and until `chainBonus` it was folded as a bag:

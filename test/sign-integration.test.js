@@ -316,6 +316,7 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         const checkpointsSeen = [];
         const result = await trainImageAdaptive(store, file, {
             count: 400,
+            extendTo: 0,
             checkEvery: 100,
             probes: 2,
             minCorpus: 1,
@@ -344,8 +345,9 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
 
         // Every checkpoint is a real measurement of a real corpus.
         for (const checkpoint of result.checkpoints) {
-            assert.ok(checkpoint.constellations > 0 && checkpoint.constellations < 400);
+            assert.ok(checkpoint.constellations > 0 && checkpoint.constellations <= 400);
             assert.ok(checkpoint.hitRate >= 0 && checkpoint.hitRate <= 1);
+            assert.ok(checkpoint.confidentRate >= 0 && checkpoint.confidentRate <= checkpoint.hitRate);
             assert.ok(checkpoint.margin >= -1 && checkpoint.margin <= 1);
             assert.equal(checkpoint.probes, 2);
         }
@@ -357,18 +359,19 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         assert.ok(await store.getSign(result.imageId, result.signs - 1) !== null);
     });
 
-    // `extendTo` is off by default, so the default path must never write more
-    // than it was asked for; when it is on, a still-improving image may.
-    await t.test('extendTo is inert by default and raises the ceiling when set', async () => {
+    // `extendTo: 0` restores a caller-specified hard ceiling; a positive value
+    // is the automatic safety ceiling and lets a still-improving image continue.
+    await t.test('extendTo zero is a hard ceiling and a positive value raises it', async () => {
         const base = await trainImageAdaptive(store, files[2], {
             count: 200,
+            extendTo: 0,
             checkEvery: 100,
             probes: 1,
             minCorpus: 1,
             probeMaxConstellations: 36,
             seed: 'no-extend',
         });
-        assert.equal(base.ceiling, 200, 'the default ceiling is the requested count');
+        assert.equal(base.ceiling, 200, 'zero makes the requested count the ceiling');
         assert.ok(base.signs <= 200);
         assert.equal(base.extended, false);
 
@@ -550,24 +553,61 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         assert.ok(capped.reviewed.every((entry) => entry.reason === 'at-ceiling'));
     });
 
-    // A corpus with nothing to be confused with cannot measure discriminability,
-    // so the stop rule must not fire on it.
-    await t.test('adaptive training writes the full ceiling on a corpus too small to probe', async () => {
+    // A corpus with nothing to be confused with cannot measure discriminability.
+    // It gets one bootstrap chunk and waits for corpus rehearsal rather than
+    // pretending a fixed ceiling was an optimum discovered by validation.
+    await t.test('adaptive training bootstraps one chunk on a corpus too small to probe', async () => {
         const solo = new SignStore({ port, database: 'sign_db_solo_test' });
         try {
             await solo.connect();
             const result = await trainImageAdaptive(solo, files[0], {
                 count: 200,
+                extendTo: 0,
                 checkEvery: 50,
                 minCorpus: 4,
                 seed: 'solo',
             });
-            assert.equal(result.reason, 'corpus-too-small');
-            assert.equal(result.signs, 200);
+            assert.equal(result.reason, 'awaiting-review');
+            assert.equal(result.signs, 50);
             assert.equal(result.checkpoints.length, 0);
-            assert.equal(result.record.training, 'fixed');
+            assert.equal(result.record.training, 'adaptive');
+            assert.equal(result.awaitingReview, true);
         } finally {
             await solo.close();
+        }
+    });
+
+    await t.test('normal training links known filenames and validates them without duplicates', async () => {
+        const linkedStore = new SignStore({ port, database: 'sign_db_linked_test' });
+        try {
+            await linkedStore.connect();
+            const fixedFlags = new Map([
+                ['constellations', '60'],
+                ['no-adaptive', 'true'],
+                ['no-rehearse', 'true'],
+            ]);
+            const first = await commandTrain(linkedStore, [imageDir], fixedFlags);
+            assert.equal(first.images, files.length);
+            const idsBefore = [...(await linkedStore.listImages()).keys()].sort();
+
+            const validated = await commandTrain(linkedStore, [imageDir], new Map([
+                ['constellations', '60'],
+                ['extend-to', '60'],
+                ['review-ceiling', '60'],
+                ['review-passes', '1'],
+                ['review-sample', '2'],
+            ]));
+            const idsAfter = [...(await linkedStore.listImages()).keys()].sort();
+
+            assert.deepEqual(idsAfter, idsBefore, 'rerunning train must not allocate duplicate image ids');
+            assert.equal(validated.linked, files.length);
+            assert.ok(validated.perImage.every((entry) => entry.reused && entry.trainedSigns === 0));
+            const reviewed = new Set(
+                validated.rehearsal.perPass.flatMap((pass) => pass.images.map((entry) => entry.filename))
+            );
+            assert.deepEqual(reviewed, new Set(files.map((file) => path.basename(file))));
+        } finally {
+            await linkedStore.close();
         }
     });
 
@@ -593,7 +633,11 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
                 return putSigns(imageId, signs);
             };
 
-            const result = await commandTrain(resilient, [imageDir], new Map([['constellations', '120']]));
+            const result = await commandTrain(resilient, [imageDir], new Map([
+                ['constellations', '120'],
+                ['no-adaptive', 'true'],
+                ['no-rehearse', 'true'],
+            ]));
 
             assert.equal(result.attempted, listing.length);
             assert.equal(result.images, listing.length - 1);

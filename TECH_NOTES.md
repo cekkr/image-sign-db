@@ -164,43 +164,43 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   `commitGraph` 4.5 s = **6.7 s** into an empty corpus, and ~15 s into a 49-image one — the cost
   grows with the corpus because the trie deepens. Any timing quoted here is against a submodule at
   or after that fix; re-measure rather than trusting an older figure.
-- **Adaptive ingestion (`trainImageAdaptive`, `SIGN_TRAIN_ADAPTIVE`, default off).** With it on,
-  `SIGN_CONSTELLATIONS_PER_IMAGE` is a **ceiling**,
-  not a quota: signs are written in `SIGN_TRAIN_CHECK_EVERY` chunks and, between chunks, the image
-  being written is searched for `SIGN_TRAIN_PROBES` times against the corpus already stored. A run
-  continues only while a checkpoint beats the best so far by `SIGN_TRAIN_MIN_GAIN` in accuracy
-  (hit rate + margin over the best competitor) **or** in search effort. Three constraints hold it
-  together: the probes redraw their own constellations (never the trained ones) so a checkpoint
-  measures recall and not memorisation; their seeds are fixed per image so consecutive checkpoints
-  ask the *same* questions of a better-trained image, without which checkpoint-to-checkpoint noise
-  alone keeps a run alive; and a corpus below `SIGN_TRAIN_MIN_CORPUS` cannot measure
-  discriminability at all, so the ceiling is trained in full (`reason: 'corpus-too-small'`).
-  A fourth guard covers the failure the first three do not: the stop rule is inert until
-  `SIGN_TRAIN_STOP_MIN_HIT_RATE` of the probes actually find the image. On a near-duplicate corpus an
-  image's margin measures exactly −1 (it is not among the candidates at all) for its first ~1000
-  constellations and only then climbs — −1.00 at 1024, −0.34 at 1536, positive at 1792 — so a flat
-  early checkpoint is "not findable yet", not "trained enough", and reading it as convergence stops
-  the image at the bottom of its curve.
+- **Adaptive ingestion (`trainImageAdaptive`, `SIGN_TRAIN_ADAPTIVE`, default on).** Signs are written
+  in `SIGN_TRAIN_CHECK_EVERY` chunks and, between chunks, the image being written is searched for
+  `SIGN_TRAIN_PROBES` times against the corpus already stored. With no CLI count the first chunk is
+  the starting point; `SIGN_TRAIN_EXTEND_TO` (8192) is the finite safety ceiling, and validation
+  chooses the final density. A run continues while a checkpoint improves accuracy (hit rate + margin
+  over the best competitor) or search effort. It may converge only when the required share of probes
+  both ranks the image first and reaches the search engine's own confidence stop. The probe draws are
+  fresh relative to training but fixed across checkpoints of one ingest, so gain is measured on the
+  same questions. Below `SIGN_TRAIN_MIN_CORPUS`, validation has no competitor and is meaningless;
+  those first images receive one bootstrap chunk (`reason: 'awaiting-review'`) and corpus rehearsal
+  determines later how much more they need.
   **What the loop actually found is the opposite of what it was built to find.** It was written to
   cut training time; on `sample_images/` it almost never stops, because the checkpoint curves say
   2048 constellations is at or below where these images become findable, not above it. Probing every
   256 against 28 images: `020.jpg` is absent from the candidate list until 1024 and first reaches a
   perfect hit rate at 1536; `022.jpg` reaches one probe in three at 1792; `021.jpg` never appears at
   all through 1792. So `reason: 'exhausted'` is a **diagnosis** — "still improving when the budget
-  ran out" — and `SIGN_TRAIN_EXTEND_TO` (default `0`, off) is the knob that follows from it: it lets
-  a still-improving image continue past the nominal count to a hard cap, spending training time to
-  buy recall. With nothing converging the probes are pure overhead — paired over 35 images, identical
-  2048 constellations written, 21.1 s against 13.1 s per image (+62%), exactly its 3 checkpoints ×
-  3 probes × ~0.9 s — which is why `SIGN_TRAIN_ADAPTIVE` ships **off** and is enabled per run with
-  `--adaptive`.
+  ran out". The automatic 8192 cap follows from that measurement; `--extend-to 0` is the explicit
+  fixed ceiling for controlled runs. With nothing converging the probes are real overhead — paired
+  over 35 images at 2048, 21.1 s against 13.1 s per image (+62%) — accepted in the normal path because
+  it is the mechanism that avoids silently certifying an under-trained image.
   Chunking needs two things from the store: `SignStore.readWhileIncomplete(imageId)` exempts exactly
   the image being written from the completion filter — the marker itself still flips once, at the
   end — and `commitGraph` is called with **cumulative** per-word counts, since an edge weight is a
   function of how often the word was seen in the whole image, not in one chunk.
+- **Corpus rehearsal (`reviewCorpus`, default on).** `commandTrain` resolves each input filename
+  through `sf:` before writing. A complete linked record is validated and topped up if needed instead
+  of being duplicated under a second image ID. During ingestion, bounded passes select the least-
+  reviewed images first. Review seed generation changes on every pass (`review:<name>:<generation>`),
+  so a lucky draw cannot certify an image forever. After the final image, complete fair cycles probe
+  every tracked image exactly once; any top-up resets the clean streak, and training ends only after
+  `SIGN_TRAIN_REVIEW_FINAL_PASSES` clean cycles. The finite review ceiling guarantees termination.
 - **Search.** Measure a batch of constellations → drop unknown and too-common words
   (`GRAPH_DEGREE`) → seed `GRAPH_RECALL` with the rarest survivors (`hops=1`, `decay=1`,
   `direction=out`, `type=sign`, batched at the server's 32-seed cap) → fold each hit's *per-seed*
-  activations into a running belief, weighted by word idf and divided by `sqrt(image vocabulary)` →
+  activations into a running belief, weighted by word idf and divided by the configured pivoted
+  vocabulary-length norm →
   stop when the leader holds `SIGN_SEARCH_CONFIDENCE` of the belief and leads by
   `SIGN_SEARCH_SEPARATION`. Evidence is accumulated in Node rather than by one large recall because
   the server's noisy-OR saturates: right *inside* a batch, wrong *across* batches.
@@ -217,7 +217,10 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   the command's duration. `--db-name` selects the Cheetah database for training and for search
   (`--database` is an older alias); `--reset` drops it first and is **training only** — `find` and
   `stats` refuse it rather than deleting the corpus they were about to read. `evaluate` re-identifies
-  each trained image from a fresh random draw, and `--report <file>` writes the run as JSON.
+  each trained image from a fresh random draw, and `--report <file>` writes the run as JSON. Normal
+  training is adaptive + rehearsed: no `--constellations` means validation chooses the density;
+  filename-linked records are reused and revalidated instead of duplicated; `--no-adaptive` and
+  `--no-rehearse` are explicit controlled-run escape hatches.
 - **Benchmarking.** `./benchmark.sh` sweeps `(training density × search ceiling)`, one run each,
   building `cheetah-server` if needed and holding one instance for the whole session so start-up
   cost stays out of the timings. Each density gets a fresh Cheetah database. Reports land in
@@ -257,19 +260,19 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
     `SIGN_CONSTELLATIONS_PER_IMAGE` (3600), `SIGN_POINT_COUNT` (7, must be odd; a chain of `n`
     points yields `n − 2` triples, so it scales the cost of every stage),
     `SIGN_POINT_PATCH_REL` (0.004; `0` reads exactly one pixel), `SIGN_WORKING_MAX_SIDE` (1024),
-    `SIGN_WITH_CENTRE_POSITION` (false); under `train` (adaptive ingestion, which makes
-    `SIGN_CONSTELLATIONS_PER_IMAGE` a ceiling rather than a quota): `SIGN_TRAIN_ADAPTIVE` (false),
+    `SIGN_WITH_CENTRE_POSITION` (false); under `train` (validation-driven adaptive ingestion):
+    `SIGN_TRAIN_ADAPTIVE` (true),
     `SIGN_TRAIN_CHECK_EVERY` (512), `SIGN_TRAIN_PROBES` (3), `SIGN_TRAIN_MIN_GAIN` (0.01),
-    `SIGN_TRAIN_MIN_CORPUS` (4), `SIGN_TRAIN_PROBE_MAX` (96), `SIGN_TRAIN_EXTEND_TO` (0);
+    `SIGN_TRAIN_MIN_CORPUS` (4), `SIGN_TRAIN_PROBE_MAX` (96), `SIGN_TRAIN_EXTEND_TO` (8192);
     under `train.review` (rehearsal — re-probe images already trained and top up the ones the
-    growing corpus can no longer find): `SIGN_TRAIN_REVIEW` (false), `SIGN_TRAIN_REVIEW_EVERY` (4),
+    growing corpus can no longer find): `SIGN_TRAIN_REVIEW` (true), `SIGN_TRAIN_REVIEW_EVERY` (4),
     `SIGN_TRAIN_REVIEW_SAMPLE` (8), `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` (1),
     `SIGN_TRAIN_REVIEW_TOP_UP` (512), `SIGN_TRAIN_REVIEW_CEILING` (8192),
     `SIGN_TRAIN_REVIEW_FINAL_PASSES` (2); and under `search`: `SIGN_SEARCH_BATCH` (12),
     `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (720),
     `SIGN_SEARCH_STOPWORD_RATIO` (0.6), `SIGN_SEARCH_SEEDS_PER_ROUND` (96),
-    `SIGN_SEARCH_LENGTH_SLOPE` (0 — but required above 0 whenever training density is
-    uneven, e.g. under `--rehearse`), `SIGN_SEARCH_CHAIN_BONUS` (0 — credits a constellation
+    `SIGN_SEARCH_LENGTH_SLOPE` (0.5 — the measured companion to default uneven rehearsal;
+    fixed uniform experiments may use 0), `SIGN_SEARCH_CHAIN_BONUS` (0 — credits a constellation
     for agreeing with itself instead of folding its triples as an unordered bag),
     `SIGN_SEARCH_CONFIDENCE_MULTIPLE` (2),
     `SIGN_SEARCH_SEPARATION` (1.35), `SIGN_SEARCH_RERANK_TOP` (5), `SIGN_SEARCH_RERANK_SIGNS` (12).

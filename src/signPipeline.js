@@ -1,7 +1,8 @@
 // Training and search for the sign pipeline.
 //
-// Training is dense and one-shot: draw many constellations, write them, publish
-// their vocabulary into the graph, mark the image complete.
+// Training is validation-driven: draw constellations in chunks, publish them,
+// and ask fresh searches whether the image is reliably findable. Corpus-level
+// rehearsal repeats that question after later images add new competition.
 //
 // Search is the opposite shape, and deliberately so — the specification asks for
 // "as much as needed for a good confidence". It draws a small batch of
@@ -121,8 +122,9 @@ async function trainImage(store, imagePath, {
  *   - **There must be something to be confused with.** Discriminability is not
  *     defined against an empty corpus: with fewer than `minCorpus` images
  *     stored, every probe trivially reports a perfect margin and the run would
- *     stop at the first checkpoint. Below that threshold this trains the full
- *     count and says so (`reason: 'corpus-too-small'`).
+ *     stop at the first checkpoint. Below that threshold this writes one
+ *     bootstrap chunk and defers the decision to corpus rehearsal
+ *     (`reason: 'awaiting-review'`).
  *   - **The stop rule only fires from a state of success** (`stopMinHitRate`).
  *     A flat checkpoint on an image the probes cannot even find yet means
  *     "not there yet", not "done"; see the comment on the rule itself for the
@@ -166,22 +168,28 @@ async function trainImageAdaptive(store, imagePath, {
     let signCount = 0;
     let edgeWrites = 0;
     let best = null;
-    let reason = canProbe ? 'exhausted' : 'corpus-too-small';
+    let reason = canProbe ? 'exhausted' : 'awaiting-review';
 
-    // `count` is where an image stops being *asked* to improve; `extendTo` is
-    // how far it may go when it is still visibly improving there. They are
-    // separate because the measurement says they should be: on this corpus most
-    // images are still climbing steeply at the ceiling — one only became
-    // findable at all at 1536 of 2048 — so a run that stops at `count` is not
-    // stopping because it is done. Off by default (`extendTo: 0`), because
-    // turning it on trades training time for recall and that is a decision, not
-    // a default.
-    const ceiling = canProbe ? Math.max(count, extendTo || 0) : count;
+    // `count` is the caller's nominal starting target; `extendTo` is the finite
+    // automatic safety ceiling. The normal CLI deliberately supplies the latter
+    // even when the user supplies no constellation count: validation decides
+    // where to stop, while the cap prevents an indistinguishable pair from
+    // training forever.
+    //
+    // Before `minCorpus` there is no meaningful validation yet. Writing the
+    // whole ceiling into those first images would merely replace a measurement
+    // with a fixed quota, so they receive one chunk and are marked
+    // `awaiting-review`. Corpus rehearsal revisits them once real competitors
+    // exist and tops them up only if fresh searches cannot find them.
+    const ceiling = Math.max(1, count, extendTo || 0);
+    const writeCeiling = canProbe
+        ? ceiling
+        : Math.min(ceiling, Math.max(1, checkEvery));
 
     try {
-        const chunkSize = canProbe ? Math.min(checkEvery, count) : count;
-        while (signCount < ceiling) {
-            const wanted = Math.min(chunkSize, ceiling - signCount);
+        const chunkSize = Math.min(Math.max(1, checkEvery), writeCeiling);
+        while (signCount < writeCeiling) {
+            const wanted = Math.min(chunkSize, writeCeiling - signCount);
             const signs = sampleSigns({ rawPixels, meta, count: wanted, random, ...options });
             if (signs.length === 0) {
                 if (signCount === 0) {
@@ -215,7 +223,7 @@ async function trainImageAdaptive(store, imagePath, {
                 words: cumulativeWords.size,
             });
 
-            if (!canProbe || signCount >= ceiling) continue;
+            if (!canProbe) continue;
 
             // The probe seeds do not depend on how much has been written, so
             // consecutive checkpoints re-ask the *same* three questions of a
@@ -253,7 +261,9 @@ async function trainImageAdaptive(store, imagePath, {
             // three hitting at 1792. A rule that only compared consecutive
             // checkpoints stopped those images at 1024, at the bottom of the
             // curve, and called it convergence.
-            if (best && quality.hitRate >= stopMinHitRate) {
+            if (best
+                && quality.hitRate >= stopMinHitRate
+                && quality.confidentRate >= stopMinHitRate) {
                 // Measured against the best checkpoint so far, not the previous
                 // one: comparing only with the previous lets a run that dipped
                 // and recovered read its recovery as progress and keep going.
@@ -277,7 +287,7 @@ async function trainImageAdaptive(store, imagePath, {
         words: cumulativeWords.size,
         working_width: meta.width,
         working_height: meta.height,
-        training: canProbe ? 'adaptive' : 'fixed',
+        training: 'adaptive',
     });
     onProgress?.({ stage: 'complete', filename, imageId, edges: cumulativeWords.size });
 
@@ -302,6 +312,7 @@ async function trainImageAdaptive(store, imagePath, {
         budget: count,
         ceiling,
         extended: signCount > count,
+        awaitingReview: !canProbe,
     };
 }
 
@@ -309,7 +320,7 @@ async function trainImageAdaptive(store, imagePath, {
  * How well the corpus currently tells this image apart, from `probes` fresh
  * draws off the image itself.
  *
- * Two numbers come back, because "is it improving?" has two answers that do not
+ * Three signals come back, because "is it improving?" has answers that do not
  * move together:
  *
  *   - **`accuracy`** — hit rate plus mean margin, in `[-1, 2]`. Hit rate alone
@@ -320,6 +331,9 @@ async function trainImageAdaptive(store, imagePath, {
  *   - **`effort`** — the share of its ceiling a search had to spend before it
  *     was confident. More training makes a search *cheaper*, and that is a real
  *     gain even in a checkpoint where the ranking did not change.
+ *   - **`confidentRate`** — the share that both ranked the target first and
+ *     reached the search engine's own early-stop confidence. Rank-1 only after
+ *     exhausting the probe ceiling is not the stopping state training wants.
  *
  * The probes deliberately run with the reranker off: it hydrates candidate signs
  * to compare colour fields, costs more than the rest of the search together, and
@@ -345,6 +359,7 @@ async function probeQuality(store, imagePath, {
         const total = mineMass + otherMass;
         runs.push({
             hit: result.candidates[0]?.imageId === imageId ? 1 : 0,
+            confident: result.reason === 'confident' && result.candidates[0]?.imageId === imageId ? 1 : 0,
             margin: total > 0 ? (mineMass - otherMass) / total : 0,
             effort: result.constellations / Math.max(1, maxConstellations),
         });
@@ -355,6 +370,7 @@ async function probeQuality(store, imagePath, {
     return {
         probes: runs.length,
         hitRate,
+        confidentRate: average('confident'),
         margin,
         accuracy: hitRate + margin,
         effort: average('effort'),
@@ -500,11 +516,10 @@ async function extendImage(store, imagePath, {
  * and give more constellations to whichever image the corpus can no longer pick
  * out. Four properties it depends on:
  *
- *   - **The probe seeds are stable per image across passes** (`review:<name>`),
- *     for the same reason the chunked trainer fixes its own: two passes have to
- *     ask the *same* question of a corpus that changed, or the difference
- *     between them is half "the corpus moved" and half "we asked something
- *     else".
+ *   - **Every pass uses a fresh deterministic probe generation**
+ *     (`review:<name>:<generation>`). Checkpoints within one ingest reuse probes
+ *     to measure gain, but corpus rehearsal is certification: repeating the
+ *     same lucky draw forever would never challenge that certificate again.
  *   - **Probing is not free and the pass is bounded.** Each probe is a search;
  *     `sample` caps how many images a pass looks at and the least-recently
  *     reviewed go first, so a large corpus is covered across passes rather than
@@ -519,6 +534,28 @@ async function extendImage(store, imagePath, {
  *     fixes that; without a per-image cap the pass would keep buying evidence
  *     for exactly those.
  */
+/**
+ * A deterministic fresh validation stream for one image.
+ *
+ * Checkpoints within one adaptive ingest intentionally reuse their questions so
+ * gains are comparable. Rehearsal answers a different question — "does this
+ * still work now?" — and must not certify an image forever from the same lucky
+ * three draws. The generation changes after every review while remaining
+ * reproducible in a report or test.
+ */
+function reviewProbeSeed(filename, generation = 0) {
+    return `review:${filename}:${Math.max(0, Number(generation) || 0)}`;
+}
+
+/** Least-reviewed first: a bounded pass is a fair round-robin, not a sample with replacement. */
+function selectReviewEntries(tracked, sample) {
+    const entries = [...tracked.values()].filter((entry) => entry.imageId != null);
+    const order = entries
+        .slice()
+        .sort((left, right) => (left.reviewedAt ?? 0) - (right.reviewedAt ?? 0));
+    return sample > 0 ? order.slice(0, sample) : order;
+}
+
 async function reviewCorpus(store, tracked, {
     probes = settings.sign.train.probes,
     minHitRate = settings.sign.train.review.minHitRate,
@@ -529,31 +566,29 @@ async function reviewCorpus(store, tracked, {
     onReview = null,
     ...overrides
 } = {}) {
-    const entries = [...tracked.values()].filter((entry) => entry.imageId != null);
-    if (entries.length === 0) return { reviewed: [], toppedUp: 0, added: 0 };
-
-    // Least recently reviewed first, so a bounded pass sweeps the corpus over
-    // several passes instead of re-measuring the same head of it every time.
-    const order = entries
-        .slice()
-        .sort((left, right) => (left.reviewedAt ?? -1) - (right.reviewedAt ?? -1));
-    const selected = sample > 0 ? order.slice(0, sample) : order;
+    const selected = selectReviewEntries(tracked, sample);
+    if (selected.length === 0) return { reviewed: [], toppedUp: 0, added: 0 };
 
     const reviewed = [];
     let toppedUp = 0;
     let added = 0;
 
     for (const entry of selected) {
+        const generation = Math.max(0, Number(entry.reviewedAt) || 0);
         const quality = await probeQuality(store, entry.path, {
             imageId: entry.imageId,
             probes,
-            seedPrefix: `review:${entry.filename}`,
+            seedPrefix: reviewProbeSeed(entry.filename, generation),
             maxConstellations: probeMaxConstellations,
         });
-        entry.reviewedAt = (entry.reviewedAt ?? 0) + 1;
+        entry.reviewedAt = generation + 1;
         entry.quality = quality;
 
-        const behind = quality.hitRate < minHitRate;
+        // Rank-1 at the probe ceiling is not an optimum; it only says the image
+        // eventually won. Rehearsal stops spending when every required probe
+        // both finds the image and reaches the search engine's own confidence
+        // stop, which also keeps training density and query effort coupled.
+        const behind = quality.hitRate < minHitRate || quality.confidentRate < minHitRate;
         const room = ceiling <= 0 || entry.signs < ceiling;
         let extension = null;
         if (behind && room && topUp > 0) {
@@ -579,9 +614,11 @@ async function reviewCorpus(store, tracked, {
             filename: entry.filename,
             imageId: entry.imageId,
             hitRate: quality.hitRate,
+            confidentRate: quality.confidentRate,
             margin: quality.margin,
             signs: entry.signs,
             added: extension?.added ?? 0,
+            generation,
             reason: behind ? (extension ? 'topped-up' : 'at-ceiling') : 'findable',
         };
         reviewed.push(outcome);
@@ -1004,8 +1041,10 @@ module.exports = {
     probeQuality,
     rerankWithField,
     reviewCorpus,
+    reviewProbeSeed,
     samplerOptions,
     searchImage,
+    selectReviewEntries,
     selectSeeds,
     storedWordCounts,
     trainImage,

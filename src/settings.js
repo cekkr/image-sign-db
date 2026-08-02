@@ -109,16 +109,10 @@ const signSettings = {
   withCentrePosition: getBoolean('SIGN_WITH_CENTRE_POSITION', false),
   // Adaptive ingestion: train in chunks and stop when more constellations stop
   // buying discriminability (src/signPipeline.js → trainImageAdaptive).
-  // `constellationsPerImage` becomes a ceiling rather than a quota.
+  // This is the normal path; `--no-adaptive` is the explicit fixed-density
+  // escape hatch.
   train: {
-    // **Off by default, on measurement, not on principle.** The loop only pays
-    // when images converge before the ceiling, and on sample_images/ they do
-    // not: paired over 35 images it wrote the identical 2 048 constellations and
-    // cost 21.1 s against 13.1 s per image (+62%), which is exactly the 3
-    // checkpoints x 3 probes x ~0.9 s it spends measuring. Turn it on with
-    // `--adaptive` for a corpus whose images separate early, where the same
-    // measurement is what lets a flat image stop at 512.
-    adaptive: getBoolean('SIGN_TRAIN_ADAPTIVE', false),
+    adaptive: getBoolean('SIGN_TRAIN_ADAPTIVE', true),
     // Constellations between two self-probes. Small enough to stop early on a
     // flat image, large enough that a checkpoint costs less than the chunk.
     checkEvery: getNumber('SIGN_TRAIN_CHECK_EVERY', 512),
@@ -131,21 +125,18 @@ const signSettings = {
     // floor for a thousand constellations and then climb.
     stopMinHitRate: getNumber('SIGN_TRAIN_STOP_MIN_HIT_RATE', 1),
     // Below this many stored images there is nothing to be confused with, so a
-    // probe cannot measure discriminability and the ceiling is trained in full.
+    // probe cannot measure discriminability. Those images get one bootstrap
+    // chunk and corpus rehearsal decides how much more they need later.
     minCorpus: getNumber('SIGN_TRAIN_MIN_CORPUS', 4),
     // A probe is a cost, not a deliverable: it runs to a lower ceiling than a
     // real search and with the reranker off.
     probeMaxConstellations: getNumber('SIGN_TRAIN_PROBE_MAX', 96),
     // Rehearsal: re-probe images already in the corpus and top up the ones it
     // has stopped being able to find (src/signPipeline.js → reviewCorpus).
-    //
-    // An image is trained against the corpus that existed when it was trained,
-    // and every later image is a new competitor for the same words — so the
-    // early images of a growing corpus lose findability without changing. This
-    // is the loop that notices. Off by default because it costs probes; turn it
-    // on with `--rehearse` while a corpus is being built up.
+    // It is on because a per-image checkpoint cannot protect an early image
+    // from competitors added later. `--no-rehearse` is the explicit opt-out.
     review: {
-      enabled: getBoolean('SIGN_TRAIN_REVIEW', false),
+      enabled: getBoolean('SIGN_TRAIN_REVIEW', true),
       // Images trained between two review passes. 0 reviews only at the end.
       every: getNumber('SIGN_TRAIN_REVIEW_EVERY', 4),
       // Images looked at per pass, least recently reviewed first. 0 = all of
@@ -162,16 +153,16 @@ const signSettings = {
       // are genuinely indistinguishable from a near-duplicate and no amount of
       // evidence fixes that; without a cap the pass buys most for exactly those.
       ceiling: getNumber('SIGN_TRAIN_REVIEW_CEILING', 8192),
-      // Final passes after the last image, repeated while any top-up happened.
-      // The last images trained have had the fewest chances to be reviewed.
+      // Consecutive clean full-corpus cycles required after the last image.
+      // A cycle covers every image exactly once with a fresh probe generation;
+      // any top-up resets the clean count and requires another full cycle.
       finalPasses: getNumber('SIGN_TRAIN_REVIEW_FINAL_PASSES', 2),
     },
-    // How far an image that is *still improving* at `constellationsPerImage`
-    // may keep going. `0` disables it, which is the shipped default: extending
-    // buys recall with training time and that is a decision, not a default.
-    // Measured on sample_images/, most images are still climbing steeply at
-    // 2048, so this is the knob the data actually asks for — see README.
-    extendTo: getNumber('SIGN_TRAIN_EXTEND_TO', 0),
+    // Finite safety ceiling for validation-driven training. The normal CLI
+    // starts with one chunk when no constellation count was supplied and lets
+    // validation choose any stopping point up to this cap. `--extend-to 0`
+    // deliberately restores the caller's nominal count as the hard ceiling.
+    extendTo: getNumber('SIGN_TRAIN_EXTEND_TO', 8192),
   },
   search: {
     batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
@@ -184,15 +175,12 @@ const signSettings = {
     // Pivoted length normalisation: 0 ignores how many words an image
     // published, 1 divides its evidence in full proportion to them.
     //
-    // The default is 0 because correcting for length made things monotonically
-    // worse, which was not the expected result. Measured on a 20-image corpus,
-    // rank-1 went 80% (0), 80% (0.25), 60% (0.5), 50% (0.75), 35% (1.0). Idf
-    // weighting already handles selectivity, and an image with few distinct
-    // words already accumulates less raw mass because it has fewer words to be
-    // matched on — dividing again double-counts that and let four flat images
-    // (261-280 words against a corpus mean near 1300) win other images'
-    // searches. The knob stays for a corpus whose vocabulary sizes are uniform.
-    lengthSlope: getNumber('SIGN_SEARCH_LENGTH_SLOPE', 0),
+    // The default is 0.5 because normal training now rehearses selectively and
+    // therefore produces uneven vocabulary sizes. On the measured 20-image
+    // corpus, rehearsal at slope 0 regressed while rehearsal + 0.5 reached
+    // 19/20 rank-1. On a deliberately uniform fixed-density corpus, 0 remains
+    // better; `--no-rehearse` users benchmarking that mode can set it explicitly.
+    lengthSlope: getNumber('SIGN_SEARCH_LENGTH_SLOPE', 0.5),
     // How much a constellation that agrees with *itself* is worth over the same
     // triples arriving separately: each group of seeds from one measured sign is
     // scaled by `1 + chainBonus * (agreeing triples - 1)`.

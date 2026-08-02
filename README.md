@@ -364,22 +364,20 @@ refuses it rather than deleting the corpus it was about to query.
 query constellations are never the trained ones — and reports rank-1 accuracy for both the graph
 recall and the field rerank. Add `--report <file>` to also write the whole run as JSON.
 
-### Adaptive training (`--adaptive`, off by default)
+### Validation-driven training (on by default)
 
-With `--adaptive`, `--constellations` becomes a ceiling rather than a quota: the trainer writes
-`SIGN_TRAIN_CHECK_EVERY` constellations at a time and, between chunks, runs three fresh searches for
-the image it is writing against the corpus already stored. When a checkpoint no longer beats the best
-one so far — in accuracy or in how much a search had to measure — the remaining chunks would be paid
-for nothing, and the run stops.
+Normal `train` does not assume one correct constellation count. It writes
+`SIGN_TRAIN_CHECK_EVERY` constellations at a time and, between chunks, runs fresh searches for the
+image against the corpus already stored. When every probe finds the image *confidently* and another
+chunk no longer improves accuracy or search effort, the image is done. `SIGN_TRAIN_EXTEND_TO`
+(8192 by default) is a finite safety ceiling, not the target.
 
-**It is off by default because it was measured, not because it is unfinished.** It only pays when
-images converge before the ceiling; on `sample_images/` they do not. Paired over 35 images at the
-same corpus position it wrote the identical 2048 constellations and cost **21.1 s against 13.1 s per
-image (+62%)** — precisely the three checkpoints × three probes × ~0.9 s it spends measuring. Turn it
-on for a corpus whose images separate early, where that same measurement is what lets a flat image
-stop at 512 instead of 2048.
+If `--constellations` is omitted, training starts with one chunk and validation chooses the final
+density. If it is supplied, the number is a nominal starting target; an image that remains ambiguous
+may continue up to `--extend-to`. Use `--extend-to 0` to turn that nominal number into a hard cap, or
+`--no-adaptive` to request a genuinely fixed-density ingest.
 
-Three things make the measurement mean what it says:
+Four things make the measurement mean what it says:
 
 - **The probes never replay the training draw.** They redraw from the image with their own seeds,
   exactly as `evaluate` does, so a checkpoint measures recall rather than memorisation.
@@ -389,8 +387,8 @@ Three things make the measurement mean what it says:
   large enough on its own to keep a run going indefinitely.
 - **A corpus with fewer than `SIGN_TRAIN_MIN_CORPUS` images cannot answer the question at all** —
   there is nothing to be confused with, every probe reports a perfect margin, and a stop rule reading
-  those would stop at the first checkpoint. Below that threshold the ceiling is trained in full and
-  the run reports `corpus-too-small`.
+  those would stop at the first checkpoint. Those bootstrap images receive one chunk and report
+  `awaiting-review`; corpus rehearsal revisits them once real competitors exist.
 - **The stop rule may only fire from a state of success** (`SIGN_TRAIN_STOP_MIN_HIT_RATE`). Until
   every probe finds the image, a flat checkpoint means it is not retrievable *yet*, which is the
   opposite of "trained enough". Measured on a near-duplicate corpus, an image's margin sits at
@@ -398,20 +396,24 @@ Three things make the measurement mean what it says:
   climbs (−1.00 at 1024, −0.34 at 1536, positive at 1792). Without this gate the run stopped those
   images at 1024, at the bottom of the curve, and called it convergence.
 
-Each image ends with one of three reasons: `converged` (the stop rule fired), `exhausted` (it was
-still improving when it hit the ceiling), or `corpus-too-small`.
+Each new image ends with `converged` (the stop rule fired), `exhausted` (it was still improving when
+it hit the safety ceiling), or `awaiting-review` (there were not enough competitors yet). A filename
+already present in the database ends as `linked`: no duplicate image ID is written, and the existing
+record enters the same rehearsal cycle as newly trained images.
 
 **Every checkpoint is printed as it happens**, so the validation is readable while the run is going
 rather than only in the JSON report afterwards:
 
     ▸ [6/6] 003__sample-3.jpg
-        ·    32/128  hit 0/3  margin -0.198  acc -0.198 (  n/a)  effort 1.000 (  n/a)
-        ·    64/128  hit 3/3  margin +0.295  acc 1.295 (+1.493)  effort 0.250 (+0.750)
-        ·    96/128  hit 3/3  margin +0.520  acc 1.520 (+0.224)  effort 0.250 (+0.000)
+        ·    32/128  hit 0/3  conf 0/3  margin -0.198  acc -0.198 (  n/a)  effort 1.000 (  n/a)
+        ·    64/128  hit 3/3  conf 2/3  margin +0.295  acc 1.295 (+1.493)  effort 0.250 (+0.750)
+        ·    96/128  hit 3/3  conf 3/3  margin +0.520  acc 1.520 (+0.224)  effort 0.250 (+0.000)
       ✓ [6/6] 003__sample-3.jpg  128 signs, 345 words, 345 edges  (1.2s)  [exhausted]
 
-`hit` is how many of the probes ranked the image first and `margin` is how far ahead of the runner-up
-it was; `acc` is their sum and `effort` the share of a probe's ceiling a search had to spend. Both
+`hit` is how many probes ranked the image first, `conf` is how many also reached the search engine's
+own early confidence stop, and `margin` is how far ahead of the runner-up it was. Rank-1 only at the
+probe ceiling is not considered trained enough. `acc` is hit rate plus margin and `effort` the share
+of a probe's ceiling a search had to spend. Both
 parenthesised gains are signed so that **positive always means better** — accuracy rises, effort
 falls — and both are measured against the best checkpoint so far, not the previous one. The first
 checkpoint has nothing to compare against and reads `n/a`. `--extend-to <n>` (or
@@ -433,14 +435,14 @@ Probing every 256 against a 28-image corpus:
 So the useful output here is not a saving, it is a **diagnosis**: `exhausted` means "this image was
 still getting better when the budget ran out", and an image like `021.jpg` is telling you it is not
 retrievable at any density you have tried. That is what `SIGN_TRAIN_EXTEND_TO` is for — it lets an
-image that is still climbing keep going past the nominal count, up to a hard cap. It is **off by
-default** because it spends training time to buy recall, which is a decision to take deliberately.
+image that is still climbing keep going past the nominal count, up to the shipped 8192 hard cap.
+Set it to `0` for a deliberately bounded experiment.
 
 The cost of the loop is honest too: with nothing converging, the probes are pure overhead — three
 searches per checkpoint, at `SIGN_TRAIN_PROBE_MAX` constellations each. `--no-adaptive` turns the
 whole thing off and writes the flat count.
 
-### Rehearsal: keeping the early images findable (`--rehearse`, off by default)
+### Rehearsal: keeping every image findable (on by default)
 
 Adaptive training answers "has *this* image been trained enough?" against the corpus that exists at
 the moment it is asked. That is the wrong tense for a corpus that is still being built. An image
@@ -450,15 +452,21 @@ answerable without a single byte of their own having changed. Nothing about them
 competition arrived. A one-pass trainer never looks back, so this shows up only at evaluation time,
 as the oldest images failing.
 
-`--rehearse` turns the training run into a cycle instead of a sweep:
+Normal training is therefore a cycle instead of a sweep:
 
-    node src/sign.js train datasets/mine --rehearse --constellations 1200
+    node src/sign.js train datasets/mine
 
-Every `--review-every` images (4 by default) it re-probes images already in the corpus, least
-recently reviewed first, and any image the probes can no longer find gets `--review-top-up` more
-constellations appended to it. After the last image it keeps passing while a pass still tops
-something up, because the images trained last have had the fewest chances to be reviewed. The passes
-print as they happen:
+At startup it links every input filename already present in the database to its canonical image ID.
+Those images are validated and, if needed, extended; they are not ingested again under duplicate
+graph nodes. Every `--review-every` images (4 by default), it re-probes the tracked corpus least-
+reviewed-first, and any image the probes cannot find confidently gets `--review-top-up` more
+constellations appended to it.
+
+After the last image, the scheduler resets its review counters and runs complete fair cycles. Each
+cycle checks every image exactly once, including the first images against the final corpus. Every
+review generation uses a fresh deterministic-random draw. A top-up changes the corpus and resets the
+clean streak; training finishes only after `--review-passes` consecutive full cycles make no changes
+(2 by default). The finite `--review-ceiling` guarantees termination. The passes print as they happen:
 
 ```text
   ✓ [ 8/20] 069__sample-6.jpg  1200 signs, 5147 words, 5147 edges  (16.8s)
@@ -473,16 +481,18 @@ Four things it is careful about, each of which it would otherwise get wrong:
   counts. Publishing the chunk's own counts would *lower* the edge weight of every word it
   re-observed, because a weight is `min(1, tf / TF_SATURATION)` over the whole image. Counts a
   previous session did not leave in memory are rebuilt from the stored constellations.
-- **The probe seeds are stable per image across passes**, for the same reason the chunked trainer
-  fixes its own: two passes must ask the same question of a corpus that changed.
-- **Passes are bounded.** `--review-sample` caps how many images a pass probes, so a large corpus is
-  covered *across* passes rather than fully re-measured after every image.
+- **The probe generation changes on every review.** Adaptive checkpoints reuse questions to compare
+  gains within one ingest; rehearsal is certification, so repeating the same lucky draw forever
+  would be a false guarantee.
+- **Passes are bounded and fair.** `--review-sample` caps one pass, while least-reviewed-first
+  scheduling and full final cycles guarantee eventual equal coverage instead of sampling with
+  replacement.
 - **`--review-ceiling` is what stops it.** Some images are genuinely indistinguishable from a
   near-duplicate, and no amount of constellations fixes that; without a cap the cycle would spend
   most of its budget on exactly those.
 
-It is off by default because every pass is real search work — it buys corpus-wide findability with
-training time, which is a decision rather than a default.
+`--no-rehearse` remains available for controlled fixed-density experiments. It deliberately gives up
+the guarantee that early images are revalidated after later competitors arrive.
 
 #### What it measured, and the assumption it broke
 
@@ -520,8 +530,9 @@ So the pair is the feature: rehearsal creates the inequality, the slope prices i
 together they beat both flat controls **and** the previous best on this corpus (85%, at twice the
 density and twice the search ceiling). Do not enable one without the other.
 
-This is also why `--adaptive` never surfaced any of it: on `sample_images/` its stop rule almost
-never fires, so it writes the same count on every image and the corpus stays uniform by accident.
+This interaction is why the normal defaults now enable rehearsal and pair it with
+`SIGN_SEARCH_LENGTH_SLOPE=0.5`; fixed-density benchmark runs should explicitly use
+`--no-rehearse` and can restore slope `0`.
 
 One separate warning the flat controls make plain: uniform 1020 scored **worse** than uniform 600 at
 `--max 240`, while the same subset scores 85% at 1200 constellations with `--max 480`. **Training
@@ -637,15 +648,12 @@ diff rather than as a number nobody wrote down.
 
     SIGN_SEARCH_SEPARATION=1.2 ./benchmark.sh -l loose   # any SIGN_* knob sweeps this way
 
-**Training is adaptive here by default**, unlike the CLI: `-c` is a ceiling, each image gets as many
-constellations as it needs, and the checkpoints stream to the console so an under-trained corpus is
-visible while the sweep runs. `--adaptive`/`--no-adaptive` is always passed to `src/sign.js`
-explicitly, so a run is never silently reinterpreted by whatever `SIGN_TRAIN_ADAPTIVE` says in the
-environment; the mode also lands in the run id (`-fixed`, `-x<n>`, `-rehearsed`) and in the CSV,
-because two rows named `c600-m240` that were trained differently are a comparison waiting to be read
-wrong. `-r/--rehearse` composes with either mode — it is about what happens to the images *already*
-trained — and is passed explicitly for the same reason, so `SIGN_TRAIN_REVIEW` never decides a run's
-meaning behind its back.
+Training is adaptive in both the CLI and benchmark, but the benchmark makes `-c` a controlled hard
+ceiling by explicitly passing `--extend-to 0` unless `-e` was supplied. It always spells
+`--adaptive`/`--no-adaptive` and `--rehearse`/`--no-rehearse`, so a benchmark is never silently
+reinterpreted by environment defaults. The mode also lands in the run id (`-fixed`, `-x<n>`,
+`-rehearsed`) and CSV because two rows named `c600-m240` that were trained differently are easy to
+compare incorrectly.
 
 Progress is counted at both levels, because a sweep over a real dataset is otherwise a long silence:
 the banner says which run of how many is starting and over how many images (`▸ 2 run(s) over 6
@@ -674,32 +682,32 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SIGN_CONSTELLATIONS_PER_IMAGE` | `3600` | Signs drawn per image at training time. A **ceiling** when adaptive training is on. |
+| `SIGN_CONSTELLATIONS_PER_IMAGE` | `3600` | Fixed-density fallback used by `--no-adaptive`. Normal automatic training starts with one `SIGN_TRAIN_CHECK_EVERY` chunk when no count is supplied. |
 | `SIGN_POINT_COUNT` | `7` | Points per constellation. Must be odd. A chain of `n` points yields `n − 2` triples, so the cost of every stage scales with it — see [Five points or seven](#five-points-or-seven). |
 | `SIGN_POINT_PATCH_REL` | `0.004` | Side of the square averaged per point, as a fraction of the shorter side. `0` reads exactly one pixel. |
 | `SIGN_WORKING_MAX_SIDE` | `1024` | Longest side the sampler decodes to. |
 | `SIGN_WITH_CENTRE_POSITION` | `false` | Record where the constellation centre sits in the frame. |
-| `SIGN_TRAIN_ADAPTIVE` | `false` | Train in chunks and stop when more constellations stop improving recall. Off because on `sample_images/` it costs +62% and saves nothing — see below. `--adaptive` / `--no-adaptive` override it per run. |
+| `SIGN_TRAIN_ADAPTIVE` | `true` | Train in chunks and let live validation choose each image's density. `--no-adaptive` requests the fixed fallback. |
 | `SIGN_TRAIN_CHECK_EVERY` | `512` | Constellations between two self-probes. |
-| `SIGN_TRAIN_PROBES` | `3` | Searches per checkpoint. Their seeds are fixed per image, so consecutive checkpoints re-ask the same questions. |
+| `SIGN_TRAIN_PROBES` | `3` | Searches per checkpoint/review. Checkpoint seeds stay fixed within one ingest; rehearsal changes generation on every review. |
 | `SIGN_TRAIN_MIN_GAIN` | `0.01` | A checkpoint must beat the best so far by this much, in accuracy **or** in search effort, or the run stops. |
-| `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of the probes finds the image. Below it, a flat checkpoint means "not findable yet", not "trained enough". |
-| `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so the ceiling is trained in full. |
+| `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of probes both finds the image and reaches the search confidence stop. Below it, a flat checkpoint means "not findable yet", not "trained enough". |
+| `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so one bootstrap chunk is written and rehearsal decides later. |
 | `SIGN_TRAIN_PROBE_MAX` | `96` | Ceiling on one probe search. Probes also run with the reranker off. |
-| `SIGN_TRAIN_EXTEND_TO` | `0` (off) | How far an image still improving at `SIGN_CONSTELLATIONS_PER_IMAGE` may keep training. Buys recall with training time. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
-| `SIGN_TRAIN_REVIEW` | `false` | Rehearsal: between images, re-probe the ones already trained and top up any the corpus can no longer find. `--rehearse` / `--no-rehearse` override it per run. See [Rehearsal](#rehearsal-keeping-the-early-images-findable). |
+| `SIGN_TRAIN_EXTEND_TO` | `8192` | Finite automatic safety ceiling. `0` makes the nominal count a hard cap. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
+| `SIGN_TRAIN_REVIEW` | `true` | Re-probe linked and newly trained images while the corpus grows, and top up any that are not found confidently. `--no-rehearse` opts out. See [Rehearsal](#rehearsal-keeping-every-image-findable-on-by-default). |
 | `SIGN_TRAIN_REVIEW_EVERY` | `4` | Images trained between two rehearsal passes. `0` rehearses only after the last image. |
 | `SIGN_TRAIN_REVIEW_SAMPLE` | `8` | Images probed per pass, least recently reviewed first. `0` reviews all of them, which is quadratic in corpus size. |
-| `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` | `1` | Below this probe hit rate an image is topped up — the same "every probe must find it" bar the chunked trainer stops on. |
+| `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` | `1` | Below this rank-1 *or confident rank-1* rate an image is topped up. |
 | `SIGN_TRAIN_REVIEW_TOP_UP` | `512` | Constellations one top-up adds. One chunk, then the image is measured again on a later pass. |
 | `SIGN_TRAIN_REVIEW_CEILING` | `8192` | Total constellations an image may reach through top-ups. Some images are genuinely indistinguishable from a near-duplicate and no amount of evidence fixes that. |
-| `SIGN_TRAIN_REVIEW_FINAL_PASSES` | `2` | Passes after the last image, repeated while any pass still tops something up. |
+| `SIGN_TRAIN_REVIEW_FINAL_PASSES` | `2` | Consecutive clean full-corpus cycles required at the end. A top-up resets the streak. |
 | `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
 | `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |
 | `SIGN_SEARCH_MAX_CONSTELLATIONS` | `720` | Ceiling on one search. |
 | `SIGN_SEARCH_STOPWORD_RATIO` | `0.6` | A word carried by more than this share of the corpus is not worth a seed. |
 | `SIGN_SEARCH_SEEDS_PER_ROUND` | `96` | Recall seeds per round, rarest first. |
-| `SIGN_SEARCH_LENGTH_SLOPE` | `0` | Pivoted correction for how many words an image published. `0` ignores it, `1` is fully proportional. On a **uniform** corpus correcting made accuracy monotonically worse, which is why `0` is the default — but on an **uneven** one it is required: with `--rehearse` it took rank-1 from 70% to 95%. Raise it whenever anything spends constellations selectively. |
+| `SIGN_SEARCH_LENGTH_SLOPE` | `0.5` | Pivoted correction for how many words an image published. This is the measured companion to default selective rehearsal (19/20 versus 14/20 at slope 0). Uniform fixed-density experiments can set `0`. |
 | `SIGN_SEARCH_CHAIN_BONUS` | `0` | How much a constellation that agrees with itself outweighs the same triples arriving separately: each group of seeds from one measured sign is scaled by `1 + bonus × (agreeing triples − 1)`. `0` is the historical bag-of-words fold. **Raising it widens the leader/runner-up ratio, so `SIGN_SEARCH_SEPARATION` must be raised with it** — left at 1.35, a bonus of 1 stopped the median search after 24 constellations instead of 480. See [Five points or seven](#five-points-or-seven). |
 | `SIGN_SEARCH_CONFIDENCE_MULTIPLE` | `2` | How far above an even split (`1/corpus`) the leader must be to stop. A multiple, not a share — a share cannot survive a change of corpus size. |
 | `SIGN_SEARCH_SEPARATION` | `1.35` | How far ahead of the runner-up the leader must be. The criterion that actually carries the signal. |
