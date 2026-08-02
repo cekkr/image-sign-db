@@ -157,3 +157,4 @@ benchmarks/*/
 # the developer's convenient default for the benchmark runner.
 sample_images/
 /samples_image_backups
+/sample_images_old
