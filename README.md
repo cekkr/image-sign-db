@@ -395,6 +395,16 @@ Four things make the measurement mean what it says:
   exactly −1 — absent from the candidate list — for its first ~1000 constellations and only then
   climbs (−1.00 at 1024, −0.34 at 1536, positive at 1792). Without this gate the run stopped those
   images at 1024, at the bottom of the curve, and called it convergence.
+- **The bar is the hit rate, and deliberately not `conf`.** The confidence count reports whether the
+  search's own early stop fired, which requires `SIGN_SEARCH_SEPARATION` over the runner-up — a
+  statement about how crowded the corpus is, not about how well this image is trained. Requiring it
+  as well made the rule unsatisfiable at any budget on a real corpus: on the 199-image `sample_images/`
+  superset, separation *falls* as evidence accumulates (1.24 at 24 constellations, 1.03 at 192, 1.07
+  at 288) because by 288 constellations 198 of the 199 images carry mass, so `004.jpg` is ranked first
+  by 3 of 3 probes at both 96 and 480 constellations and still reports `conf 0/3`. Every image was
+  therefore permanently behind, every rehearsal cycle topped up all of them, and the run could not
+  end until all of them reached the ceiling. `conf` is still measured and printed — it is a useful
+  reading of the corpus — but nothing gates on it.
 
 Each new image ends with `converged` (the stop rule fired), `exhausted` (it was still improving when
 it hit the safety ceiling), or `awaiting-review` (there were not enough competitors yet). A filename
@@ -466,7 +476,8 @@ After the last image, the scheduler resets its review counters and runs complete
 cycle checks every image exactly once, including the first images against the final corpus. Every
 review generation uses a fresh deterministic-random draw. A top-up changes the corpus and resets the
 clean streak; training finishes only after `--review-passes` consecutive full cycles make no changes
-(2 by default). The finite `--review-ceiling` guarantees termination. The passes print as they happen:
+(2 by default). The finite `--review-ceiling` guarantees termination and `--review-patience` bounds
+how long it takes. The passes print as they happen:
 
 ```text
   ✓ [ 8/20] 069__sample-6.jpg  1200 signs, 5147 words, 5147 edges  (16.8s)
@@ -487,9 +498,16 @@ Four things it is careful about, each of which it would otherwise get wrong:
 - **Passes are bounded and fair.** `--review-sample` caps one pass, while least-reviewed-first
   scheduling and full final cycles guarantee eventual equal coverage instead of sampling with
   replacement.
-- **`--review-ceiling` is what stops it.** Some images are genuinely indistinguishable from a
-  near-duplicate, and no amount of constellations fixes that; without a cap the cycle would spend
-  most of its budget on exactly those.
+- **`--review-ceiling` is what stops it, and `--review-patience` is what stops it *in time*.** Some
+  images are genuinely indistinguishable from a near-duplicate, and no amount of constellations
+  fixes that; without a cap the cycle would spend most of its budget on exactly those. The ceiling
+  alone bounds that at `(ceiling - density) / top-up` top-ups **per image**, which on a 199-image
+  corpus at the shipped defaults is nine 512-constellation top-ups for every image a probe misses —
+  hours of writing to buy nothing. Patience stops as soon as the top-ups stop paying: an image that
+  has absorbed `--review-patience` of them without improving on its own best accuracy reports `no
+  gain from top-ups` and is left alone. The two give-up states are counted separately in the summary,
+  because `at ceiling` argues for a bigger budget and `no gain` argues that the budget was never the
+  problem.
 
 `--no-rehearse` remains available for controlled fixed-density experiments. It deliberately gives up
 the guarantee that early images are revalidated after later competitors arrive.
@@ -691,16 +709,17 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 | `SIGN_TRAIN_CHECK_EVERY` | `512` | Constellations between two self-probes. |
 | `SIGN_TRAIN_PROBES` | `3` | Searches per checkpoint/review. Checkpoint seeds stay fixed within one ingest; rehearsal changes generation on every review. |
 | `SIGN_TRAIN_MIN_GAIN` | `0.01` | A checkpoint must beat the best so far by this much, in accuracy **or** in search effort, or the run stops. |
-| `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of probes both finds the image and reaches the search confidence stop. Below it, a flat checkpoint means "not findable yet", not "trained enough". |
+| `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of probes ranks the image first. Below it, a flat checkpoint means "not findable yet", not "trained enough". Deliberately not also gated on the confidence stop — see [Adaptive training](#adaptive-training-validation-chooses-the-density). |
 | `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so one bootstrap chunk is written and rehearsal decides later. |
 | `SIGN_TRAIN_PROBE_MAX` | `96` | Ceiling on one probe search. Probes also run with the reranker off. |
 | `SIGN_TRAIN_EXTEND_TO` | `8192` | Finite automatic safety ceiling. `0` makes the nominal count a hard cap. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
 | `SIGN_TRAIN_REVIEW` | `true` | Re-probe linked and newly trained images while the corpus grows, and top up any that are not found confidently. `--no-rehearse` opts out. See [Rehearsal](#rehearsal-keeping-every-image-findable-on-by-default). |
 | `SIGN_TRAIN_REVIEW_EVERY` | `4` | Images trained between two rehearsal passes. `0` rehearses only after the last image. |
 | `SIGN_TRAIN_REVIEW_SAMPLE` | `8` | Images probed per pass, least recently reviewed first. `0` reviews all of them, which is quadratic in corpus size. |
-| `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` | `1` | Below this rank-1 *or confident rank-1* rate an image is topped up. |
+| `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` | `1` | Below this rank-1 rate an image is topped up. |
 | `SIGN_TRAIN_REVIEW_TOP_UP` | `512` | Constellations one top-up adds. One chunk, then the image is measured again on a later pass. |
 | `SIGN_TRAIN_REVIEW_CEILING` | `8192` | Total constellations an image may reach through top-ups. Some images are genuinely indistinguishable from a near-duplicate and no amount of evidence fixes that. |
+| `SIGN_TRAIN_REVIEW_PATIENCE` | `2` | Top-ups an image may absorb without improving on its own best accuracy before rehearsal gives up on it (`no gain from top-ups`). The ceiling alone bounds spending at `(ceiling - density) / top-up` per image — on a 199-image corpus, nine 512-constellation top-ups for every image any probe misses. `0` restores ceiling-only termination. |
 | `SIGN_TRAIN_REVIEW_FINAL_PASSES` | `2` | Consecutive clean full-corpus cycles required at the end. A top-up resets the streak. |
 | `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
 | `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |

@@ -261,9 +261,18 @@ async function trainImageAdaptive(store, imagePath, {
             // three hitting at 1792. A rule that only compared consecutive
             // checkpoints stopped those images at 1024, at the bottom of the
             // curve, and called it convergence.
-            if (best
-                && quality.hitRate >= stopMinHitRate
-                && quality.confidentRate >= stopMinHitRate) {
+            // The bar is *findability*, deliberately not `confidentRate`. That
+            // signal reports whether the search's own early stop fired, which
+            // needs `SIGN_SEARCH_SEPARATION` over the runner-up — a property of
+            // the corpus, not of this image's training. Measured on the 199-image
+            // sample corpus: separation falls as evidence accumulates (1.24 at 24
+            // constellations, 1.03 at 192, 1.07 at 288, against a 1.35 target)
+            // because by 288 constellations 198 of 199 images carry mass and the
+            // runner-up is a real near-duplicate. Gating on it made the rule
+            // unsatisfiable at any budget — `004.jpg` is rank 1 on 3 of 3 probes
+            // at both 96 and 480 constellations and still scores `confidentRate`
+            // 0 — so every image trained to the ceiling and the run never ended.
+            if (best && quality.hitRate >= stopMinHitRate) {
                 // Measured against the best checkpoint so far, not the previous
                 // one: comparing only with the previous lets a run that dipped
                 // and recovered read its recovery as progress and keep going.
@@ -562,6 +571,8 @@ async function reviewCorpus(store, tracked, {
     topUp = settings.sign.train.review.topUp,
     ceiling = settings.sign.train.review.ceiling,
     sample = settings.sign.train.review.sample,
+    patience = settings.sign.train.review.patience,
+    minGain = settings.sign.train.minGain,
     probeMaxConstellations = settings.sign.train.probeMaxConstellations,
     onReview = null,
     ...overrides
@@ -584,14 +595,38 @@ async function reviewCorpus(store, tracked, {
         entry.reviewedAt = generation + 1;
         entry.quality = quality;
 
-        // Rank-1 at the probe ceiling is not an optimum; it only says the image
-        // eventually won. Rehearsal stops spending when every required probe
-        // both finds the image and reaches the search engine's own confidence
-        // stop, which also keeps training density and query effort coupled.
-        const behind = quality.hitRate < minHitRate || quality.confidentRate < minHitRate;
+        // The bar is findability by every required probe. It deliberately does
+        // *not* also require `confidentRate` — that reports whether the search's
+        // own early stop fired, which needs `SIGN_SEARCH_SEPARATION` over the
+        // runner-up and is therefore a statement about how crowded the corpus
+        // is, not about how well this image is trained. On the 199-image sample
+        // corpus separation asymptotes near 1.05 against a 1.35 target, so that
+        // conjunction was unsatisfiable at any budget: every image stayed
+        // permanently `behind` and every cycle topped up all of them, which no
+        // amount of waiting resolves.
+        const behind = quality.hitRate < minHitRate;
         const room = ceiling <= 0 || entry.signs < ceiling;
+
+        // Did the last top-up buy anything? Compared against the best value ever
+        // measured for this image rather than the previous pass, because each
+        // pass asks a fresh probe generation and two consecutive answers differ
+        // by noise as well as by learning. An image that has absorbed `patience`
+        // top-ups without improving on its own best is not being helped by more
+        // constellations — on a near-duplicate corpus it is precisely the image
+        // that would otherwise absorb the entire budget — so spending stops and
+        // says why, exactly as the per-image ceiling does.
+        const improved = entry.bestAccuracy === undefined
+            || quality.accuracy >= entry.bestAccuracy + minGain;
+        if (improved) {
+            entry.bestAccuracy = Math.max(quality.accuracy, entry.bestAccuracy ?? -Infinity);
+            entry.staleReviews = 0;
+        } else if (entry.toppedUpLastPass) {
+            entry.staleReviews = (entry.staleReviews || 0) + 1;
+        }
+        const stalled = patience > 0 && (entry.staleReviews || 0) >= patience;
+
         let extension = null;
-        if (behind && room && topUp > 0) {
+        if (behind && room && !stalled && topUp > 0) {
             const wanted = ceiling > 0 ? Math.min(topUp, ceiling - entry.signs) : topUp;
             extension = await extendImage(store, entry.path, {
                 imageId: entry.imageId,
@@ -609,6 +644,7 @@ async function reviewCorpus(store, tracked, {
             toppedUp += 1;
             added += extension.added;
         }
+        entry.toppedUpLastPass = extension !== null;
 
         const outcome = {
             filename: entry.filename,
@@ -619,7 +655,12 @@ async function reviewCorpus(store, tracked, {
             signs: entry.signs,
             added: extension?.added ?? 0,
             generation,
-            reason: behind ? (extension ? 'topped-up' : 'at-ceiling') : 'findable',
+            // Two ways to stop spending on an image the corpus cannot find, and
+            // they are different diagnoses: `at-ceiling` is "it ran out of
+            // allowance", `no-gain` is "the allowance was not the problem".
+            reason: behind
+                ? (extension ? 'topped-up' : (stalled ? 'no-gain' : 'at-ceiling'))
+                : 'findable',
         };
         reviewed.push(outcome);
         onReview?.(outcome);

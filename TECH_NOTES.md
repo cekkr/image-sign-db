@@ -195,7 +195,13 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
   reviewed images first. Review seed generation changes on every pass (`review:<name>:<generation>`),
   so a lucky draw cannot certify an image forever. After the final image, complete fair cycles probe
   every tracked image exactly once; any top-up resets the clean streak, and training ends only after
-  `SIGN_TRAIN_REVIEW_FINAL_PASSES` clean cycles. The finite review ceiling guarantees termination.
+  `SIGN_TRAIN_REVIEW_FINAL_PASSES` clean cycles. The finite review ceiling guarantees termination and
+  `SIGN_TRAIN_REVIEW_PATIENCE` bounds how long it takes: an image that has absorbed that many top-ups
+  without improving on its own best accuracy is left alone (`reason: 'no-gain'`). The gate is the
+  probe **hit rate** alone; it deliberately does not also require the search's confidence stop, which
+  depends on `SIGN_SEARCH_SEPARATION` over the runner-up and is therefore a property of the corpus.
+  Requiring both made the gate unsatisfiable at any budget on the 199-image `sample_images/`
+  superset, where separation asymptotes near 1.05 against a 1.35 target.
 - **Search.** Measure a batch of constellations → drop unknown and too-common words
   (`GRAPH_DEGREE`) → seed `GRAPH_RECALL` with the rarest survivors (`hops=1`, `decay=1`,
   `direction=out`, `type=sign`, batched at the server's 32-seed cap) → fold each hit's *per-seed*
@@ -268,7 +274,7 @@ A second, independent recognition engine, Cheetah-native end to end. It shares n
     growing corpus can no longer find): `SIGN_TRAIN_REVIEW` (true), `SIGN_TRAIN_REVIEW_EVERY` (4),
     `SIGN_TRAIN_REVIEW_SAMPLE` (8), `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` (1),
     `SIGN_TRAIN_REVIEW_TOP_UP` (512), `SIGN_TRAIN_REVIEW_CEILING` (8192),
-    `SIGN_TRAIN_REVIEW_FINAL_PASSES` (2); and under `search`: `SIGN_SEARCH_BATCH` (12),
+    `SIGN_TRAIN_REVIEW_PATIENCE` (2), `SIGN_TRAIN_REVIEW_FINAL_PASSES` (2); and under `search`: `SIGN_SEARCH_BATCH` (12),
     `SIGN_SEARCH_MIN_CONSTELLATIONS` (24), `SIGN_SEARCH_MAX_CONSTELLATIONS` (720),
     `SIGN_SEARCH_STOPWORD_RATIO` (0.6), `SIGN_SEARCH_SEEDS_PER_ROUND` (96),
     `SIGN_SEARCH_LENGTH_SLOPE` (0.5 — the measured companion to default uneven rehearsal;

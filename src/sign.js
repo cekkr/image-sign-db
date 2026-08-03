@@ -138,6 +138,7 @@ async function runReviewPass(store, tracked, review, label) {
         topUp: review.topUp,
         ceiling: review.ceiling,
         sample: review.sample,
+        patience: review.patience,
         onReview: (result) => {
             if (result.reason === 'findable') return;
             console.log(
@@ -146,7 +147,10 @@ async function runReviewPass(store, tracked, review, label) {
                 `margin ${result.margin >= 0 ? '+' : ''}${result.margin.toFixed(3)}  ` +
                 (result.added > 0
                     ? `+${result.added} → ${result.signs} constellations`
-                    : `at ceiling (${result.signs})`)
+                    // Why it stopped, not just that it stopped: "the allowance
+                    // ran out" and "the allowance was not the problem" call for
+                    // different responses from whoever reads the run.
+                    : `${result.reason === 'no-gain' ? 'no gain from top-ups' : 'at ceiling'} (${result.signs})`)
             );
         },
     });
@@ -187,6 +191,7 @@ async function commandTrain(store, targets, flags) {
     review.sample = numberFlag(flags, 'review-sample', review.sample);
     review.topUp = numberFlag(flags, 'review-top-up', review.topUp);
     review.ceiling = numberFlag(flags, 'review-ceiling', review.ceiling);
+    review.patience = numberFlag(flags, 'review-patience', review.patience);
     review.finalPasses = numberFlag(flags, 'review-passes', review.finalPasses);
     const images = targets.flatMap(collectImages);
     if (images.length === 0) throw new Error('no images found');
@@ -407,13 +412,20 @@ async function commandTrain(store, targets, flags) {
         const toppedUp = new Set(
             reviews.flatMap((pass) => pass.reviewed.filter((r) => r.added > 0).map((r) => r.filename))
         );
-        const stuck = new Set(
-            reviews.flatMap((pass) => pass.reviewed.filter((r) => r.reason === 'at-ceiling').map((r) => r.filename))
+        // Both give-up states, counted apart. An image the budget could not
+        // reach and an image the budget did not help are different problems:
+        // the first argues for a higher ceiling, the second argues that this
+        // corpus cannot separate it and no ceiling will change that.
+        const filenamesWhere = (reason) => new Set(
+            reviews.flatMap((pass) => pass.reviewed.filter((r) => r.reason === reason).map((r) => r.filename))
         );
+        const stuck = filenamesWhere('at-ceiling');
+        const noGain = filenamesWhere('no-gain');
         console.log(
             `  rehearsal: ${reviews.length} pass(es), ${toppedUp.size} image(s) topped up ` +
             `(+${added} constellations)` +
-            (stuck.size > 0 ? `, ${stuck.size} still unfindable at the ceiling` : '')
+            (stuck.size > 0 ? `, ${stuck.size} still unfindable at the ceiling` : '') +
+            (noGain.size > 0 ? `, ${noGain.size} unfindable and not improving` : '')
         );
     }
     if (adaptive) {
@@ -467,6 +479,7 @@ async function commandTrain(store, targets, flags) {
                 every: review.every,
                 topUp: review.topUp,
                 ceiling: review.ceiling,
+                patience: review.patience,
                 minHitRate: review.minHitRate,
                 requiredCleanCycles: Math.max(1, Math.trunc(review.finalPasses) || 1),
                 added: reviews.reduce((sum, pass) => sum + pass.added, 0),
@@ -842,6 +855,8 @@ async function main() {
                 '                        (0 = all of them)',
                 '  --review-top-up <n>   constellations one top-up adds',
                 '  --review-ceiling <n>  total constellations an image may reach through top-ups',
+                '  --review-patience <n> top-ups an image may absorb without improving on its own',
+                '                        best accuracy before rehearsal gives up on it (0 = never)',
                 '  --review-passes <n>   clean full-corpus cycles required at the end. Every cycle',
                 '                        rechecks every image with fresh random probes; a top-up',
                 '                        resets the clean streak.',

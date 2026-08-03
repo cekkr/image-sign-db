@@ -153,6 +153,14 @@ const signSettings = {
       // are genuinely indistinguishable from a near-duplicate and no amount of
       // evidence fixes that; without a cap the pass buys most for exactly those.
       ceiling: getNumber('SIGN_TRAIN_REVIEW_CEILING', 8192),
+      // Consecutive top-ups an image may absorb without improving on its own
+      // best measured accuracy before rehearsal stops spending on it
+      // (`reason: 'no-gain'`). The ceiling alone bounds the work at
+      // (ceiling - density) / topUp per image, which on the 199-image sample
+      // corpus is nine 512-constellation top-ups for every image that any probe
+      // misses — hours of writes to buy nothing. 0 disables the guard and
+      // restores ceiling-only termination.
+      patience: getNumber('SIGN_TRAIN_REVIEW_PATIENCE', 2),
       // Consecutive clean full-corpus cycles required after the last image.
       // A cycle covers every image exactly once with a fresh probe generation;
       // any top-up resets the clean count and requires another full cycle.

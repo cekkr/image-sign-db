@@ -553,6 +553,131 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         assert.ok(capped.reviewed.every((entry) => entry.reason === 'at-ceiling'));
     });
 
+    // The gate is findability, and *only* findability. It used to also require
+    // `confidentRate`, which reports whether the search's own early stop fired —
+    // a property of how crowded the corpus is, not of how well this image is
+    // trained. On the 199-image sample corpus separation asymptotes near 1.05
+    // against the 1.35 target, so images that every probe ranked first still
+    // scored `confidentRate` 0, stayed permanently `behind`, and were topped up
+    // every cycle until each one hit the ceiling — a run that cannot terminate.
+    await t.test('an image every probe finds is findable regardless of confidence', async () => {
+        // Its own database: the shared store has by now accumulated several
+        // copies of these three fixtures under different image IDs, and an image
+        // competing with a duplicate of itself is never ranked first, which
+        // would make the assertions below vacuous rather than wrong.
+        const gateStore = new SignStore({ port, database: 'sign_db_gate_test' });
+        try {
+            await gateStore.connect();
+            const tracked = new Map();
+            for (const [index, file] of files.entries()) {
+                const result = await trainImage(gateStore, file, { count: 150, seed: `gate:${index}` });
+                tracked.set(result.imageId, {
+                    imageId: result.imageId,
+                    filename: result.filename,
+                    path: file,
+                    signs: result.signs,
+                    words: result.words,
+                    wordCounts: result.wordCounts,
+                    reviewedAt: 0,
+                });
+            }
+
+            // A separation target no corpus can reach is what a crowded real
+            // corpus looks like from the probe's side: the early stop never
+            // fires, so every probe reports `confidentRate` 0 while still
+            // ranking the image first. Three synthetic images separate far too
+            // easily to reproduce that on their own, and a test that cannot
+            // reproduce the condition proves nothing about the gate.
+            const target = settings.sign.search.separationTarget;
+            settings.sign.search.separationTarget = Infinity;
+            let outcome;
+            try {
+                outcome = await reviewCorpus(gateStore, tracked, {
+                    probes: 1,
+                    minHitRate: 1,
+                    topUp: 50,
+                    ceiling: 0,
+                    sample: 0,
+                    probeMaxConstellations: 36,
+                });
+            } finally {
+                settings.sign.search.separationTarget = target;
+            }
+
+            assert.ok(
+                outcome.reviewed.every((entry) => entry.confidentRate === 0),
+                'the unreachable separation target must suppress every confident stop'
+            );
+            const found = outcome.reviewed.filter((entry) => entry.hitRate >= 1);
+            assert.ok(found.length > 0, 'no image was found by every probe: the assertions below are vacuous');
+            for (const entry of found) {
+                assert.equal(
+                    entry.reason,
+                    'findable',
+                    `${entry.filename} was found by every probe (confidence ${entry.confidentRate}) ` +
+                    'and must not be topped up'
+                );
+                assert.equal(entry.added, 0);
+            }
+        } finally {
+            await gateStore.close();
+        }
+    });
+
+    // Termination has to survive a corpus that genuinely cannot separate an
+    // image. The ceiling alone bounds spending at (ceiling - density) / topUp
+    // top-ups *per image*, which is hours of writes to buy nothing; patience
+    // stops as soon as the top-ups stop paying.
+    await t.test('rehearsal stops topping up an image the top-ups do not help', async () => {
+        const tracked = new Map();
+        for (const [index, file] of files.entries()) {
+            const result = await trainImage(store, file, { count: 120, seed: `patience:${index}` });
+            tracked.set(result.imageId, {
+                imageId: result.imageId,
+                filename: result.filename,
+                path: file,
+                signs: result.signs,
+                words: result.words,
+                wordCounts: result.wordCounts,
+                reviewedAt: 0,
+            });
+        }
+
+        // An unreachable hit rate keeps every image `behind`, and a minGain no
+        // measurement can clear makes every top-up count as unproductive. The
+        // first pass must still spend — patience is about repeated failure, not
+        // about refusing to try.
+        const options = {
+            probes: 1,
+            minHitRate: 2,
+            topUp: 50,
+            ceiling: 0,
+            sample: 0,
+            patience: 1,
+            minGain: 10,
+            probeMaxConstellations: 36,
+        };
+        const first = await reviewCorpus(store, tracked, options);
+        assert.equal(first.toppedUp, tracked.size);
+        assert.ok(first.reviewed.every((entry) => entry.reason === 'topped-up'));
+
+        // Second pass: the top-up bought nothing, so spending stops and says so.
+        const second = await reviewCorpus(store, tracked, options);
+        assert.equal(second.toppedUp, 0);
+        assert.equal(second.added, 0);
+        assert.ok(second.reviewed.every((entry) => entry.reason === 'no-gain'));
+
+        // And it stays stopped: an unbounded ceiling must not resume spending.
+        const third = await reviewCorpus(store, tracked, options);
+        assert.equal(third.added, 0);
+        assert.ok(third.reviewed.every((entry) => entry.reason === 'no-gain'));
+
+        // Patience is opt-out, so a caller that wants ceiling-only termination
+        // still gets it.
+        const unbounded = await reviewCorpus(store, tracked, { ...options, patience: 0 });
+        assert.equal(unbounded.toppedUp, tracked.size);
+    });
+
     // A corpus with nothing to be confused with cannot measure discriminability.
     // It gets one bootstrap chunk and waits for corpus rehearsal rather than
     // pretending a fixed ceiling was an optimum discovered by validation.
