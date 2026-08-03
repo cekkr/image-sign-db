@@ -3,28 +3,28 @@
 # Benchmark the sign pipeline: train a corpus, re-identify every image from a
 # fresh random draw, and record the scores.
 #
-#   ./benchmark.sh                                   # defaults, sample_images/
+#   ./benchmark.sh                                   # automatic adaptive training, sample_images/
 #   ./benchmark.sh -c 200,600,1200                   # sweep the training ceiling
 #   ./benchmark.sh -c 600 -m 60,120,240              # sweep the search ceiling
 #   ./benchmark.sh -i datasets/mine -o benchmarks    # another corpus
 #   ./benchmark.sh --no-adaptive                     # fixed density instead
 #
-# Training is **adaptive** by default: each image gets as many constellations as
-# it needs rather than a flat quota. `--constellations` is therefore a ceiling —
-# the trainer writes in chunks, re-searches for the image it is writing against
-# everything already stored, and stops once more constellations no longer buy
-# accuracy or a cheaper search. Those checkpoints stream to the console as they
-# happen (`· 512/2048  hit 3/3  margin +0.21  acc … effort …`), so an under-
-# trained corpus is visible while the run is going rather than afterwards, and
-# `--extend-to` lets an image that is still climbing at the ceiling continue.
+# Training is **automatic and adaptive** by default, exactly like invoking
+# `src/sign.js` without `--constellations`: it starts with one validation chunk
+# and lets the trainer choose how much each image needs, up to the configured
+# safety ceiling. Supplying `-c` turns this into a controlled ceiling sweep; the
+# trainer writes in chunks, re-searches the image against everything already
+# stored, and stops once more constellations no longer buy accuracy or a cheaper
+# search. Those checkpoints stream to the console as they happen
+# (`· 512/2048  hit 3/3  margin +0.21  acc … effort …`), so an under-trained
+# corpus is visible while the run is going rather than afterwards.
 #
-# Each (training ceiling x search ceiling) pair is one run. A run writes a full
+# Each (training configuration x search ceiling) pair is one run. A run writes a full
 # JSON report under --out and appends one row to benchmarks/scores.csv, so
 # results accumulate across sessions and a regression shows up as a diff rather
 # than as a number nobody wrote down. Under adaptive training the row records
-# both what was allowed (`constellations_per_image`) and what the images took
-# (`mean_trained_constellations`); they are the same number only with
-# `--no-adaptive`.
+# both whether the trainer chose the allowance automatically and what the images
+# took (`mean_trained_constellations`).
 #
 # Three things this deliberately does *not* do:
 #
@@ -49,7 +49,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
 IMAGES="sample_images"
-CONSTELLATIONS="600"
+CONSTELLATIONS=""
 MAX_LIST=""
 OUT_DIR="benchmarks"
 DATA_DIR=""
@@ -66,14 +66,15 @@ usage() {
 usage: ./benchmark.sh [options]
 
   -i, --images DIR          image directory or file (default: sample_images)
-  -c, --constellations LIST comma-separated training ceilings (default: 600)
+  -c, --constellations LIST comma-separated training ceilings
+                            (default: automatic adaptive training)
   -m, --max LIST            comma-separated search ceilings (default: SIGN_SEARCH_MAX_CONSTELLATIONS)
   -o, --out DIR             where reports and scores.csv go (default: benchmarks)
   -l, --label TEXT          prefix for run ids inside the reports
-  -a, --adaptive            as many constellations as needed, up to -c (default)
-      --no-adaptive         write exactly -c constellations per image instead
-  -e, --extend-to N         adaptive only: let an image still improving at -c
-                            keep going up to N constellations
+  -a, --adaptive            let validation choose the density (default); -c caps it
+      --no-adaptive         use a fixed density (-c or the configured fallback)
+  -e, --extend-to N         adaptive only: safety ceiling for automatic mode,
+                            or let an image still improving at -c continue to N
   -r, --rehearse            between images, re-probe the ones already trained and
                             top up any the corpus can no longer find (--review-*
                             knobs come from the environment; see settings.js)
@@ -123,14 +124,19 @@ done
 
 # The training flags, decided once. `--adaptive`/`--no-adaptive` is always sent
 # rather than left to SIGN_TRAIN_ADAPTIVE: a benchmark whose meaning depends on
-# an unstated environment variable is not a benchmark.
+# an unstated environment variable is not a benchmark. In automatic mode, omit
+# both count flags so sign.js applies the same start chunk and finite safety
+# ceiling as its normal CLI path.
 TRAIN_FLAGS=()
 if [ "$ADAPTIVE" -eq 1 ]; then
     TRAIN_FLAGS+=(--adaptive)
-    # The normal CLI has an 8192 automatic safety ceiling. A benchmark's `-c`
-    # is deliberately a controlled ceiling, so spell the zero override instead
-    # of inheriting that operational default.
-    TRAIN_FLAGS+=(--extend-to "${EXTEND_TO:-0}")
+    if [ -n "$CONSTELLATIONS" ]; then
+        # An explicit benchmark sweep needs a controlled ceiling. Preserve the
+        # historical -c contract unless -e deliberately raises that boundary.
+        TRAIN_FLAGS+=(--extend-to "${EXTEND_TO:-0}")
+    elif [ -n "$EXTEND_TO" ]; then
+        TRAIN_FLAGS+=(--extend-to "$EXTEND_TO")
+    fi
 else
     TRAIN_FLAGS+=(--no-adaptive)
     # Refuse rather than ignore: without the checkpoints there is nothing to
@@ -176,7 +182,7 @@ fi
 # way, so a typo would name a row after itself just as permanently. Checked here
 # with the other half of the sweep — before the server starts, so a bad flag
 # costs nothing.
-if ! printf '%s' "$CONSTELLATIONS" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then
+if [ -n "$CONSTELLATIONS" ] && ! printf '%s' "$CONSTELLATIONS" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then
     echo "benchmark: --constellations must be a comma-separated list of integers, got: $(printf '%q' "$CONSTELLATIONS")" >&2
     exit 1
 fi
@@ -244,7 +250,17 @@ export CHEETAH_PORT="$PORT"
 # -- runs --------------------------------------------------------------------
 
 REPORTS=()
-IFS=',' read -r -a DENSITIES <<< "$CONSTELLATIONS"
+if [ -n "$CONSTELLATIONS" ]; then
+    IFS=',' read -r -a DENSITIES <<< "$CONSTELLATIONS"
+elif [ "$ADAPTIVE" -eq 1 ]; then
+    # A label, not a value passed to sign.js. The absence of --constellations is
+    # precisely what selects automatic training there.
+    DENSITIES=(auto)
+else
+    # Fixed mode cannot choose a density adaptively. Resolve the CLI fallback
+    # now so the run id and database name record the actual quota.
+    DENSITIES=("$(node -e 'process.stdout.write(String(require("./src/settings").sign.constellationsPerImage))')")
+fi
 IFS=',' read -r -a CEILINGS <<< "$MAX_LIST"
 
 # The training mode belongs in the run id, not only in the report: scores.csv
@@ -258,11 +274,15 @@ MODE_TAG=""
 # a row that hid one of the two would be compared against the wrong baseline.
 [ "$REHEARSE" -eq 0 ] || MODE_TAG="${MODE_TAG}-rehearsed"
 
-if [ "$ADAPTIVE" -eq 1 ]; then
+if [ "$ADAPTIVE" -eq 1 ] && [ -z "$CONSTELLATIONS" ]; then
+    AUTO_CEILING="${EXTEND_TO:-$(node -e 'process.stdout.write(String(require("./src/settings").sign.train.extendTo))')}"
+    echo "▸ automatic adaptive training: validation chooses each image's density (safety ceiling $AUTO_CEILING)"
+    echo "  validation runs every $(node -e 'process.stdout.write(String(require("./src/settings").sign.train.checkEvery))') constellations and is printed as it happens"
+elif [ "$ADAPTIVE" -eq 1 ]; then
     echo "▸ adaptive training: up to ${CONSTELLATIONS} constellations per image${EXTEND_TO:+, extending to $EXTEND_TO while still improving}"
     echo "  validation runs every $(node -e 'process.stdout.write(String(require("./src/settings").sign.train.checkEvery))') constellations and is printed as it happens"
 else
-    echo "▸ fixed training: exactly ${CONSTELLATIONS} constellations per image"
+    echo "▸ fixed training: exactly ${DENSITIES[*]} constellations per image"
 fi
 
 # How many (density x ceiling) pairs this invocation will do, counted up front so
@@ -277,11 +297,13 @@ IMAGE_TOTAL=$(node -e '
 echo "▸ $RUN_TOTAL run(s) over $IMAGE_TOTAL image(s)"
 
 for density in "${DENSITIES[@]}"; do
-    database="bench_${STAMP}_c${density}${MODE_TAG}"
+    density_tag="c${density}"
+    [ "$density" = auto ] && density_tag="auto"
+    database="bench_${STAMP}_${density_tag}${MODE_TAG}"
     trained=0
     for ceiling in "${CEILINGS[@]}"; do
         RUN_INDEX=$((RUN_INDEX + 1))
-        name="${LABEL:+${LABEL}-}c${density}${MODE_TAG}-m${ceiling}"
+        name="${LABEL:+${LABEL}-}${density_tag}${MODE_TAG}-m${ceiling}"
         report="$RUN_DIR/$name.json"
         echo
         echo "════ [$RUN_INDEX/$RUN_TOTAL] $name ═══════════════════════════════════════════"
@@ -297,14 +319,19 @@ for density in "${DENSITIES[@]}"; do
             # Unbuffered through `tee` on purpose: the adaptive checkpoints are
             # the run's live validation, and a benchmark that only showed them
             # once training finished would be no better than reading the report.
-            node src/sign.js evaluate "$IMAGES" \
-                --db-name "$database" \
-                --reset \
-                --constellations "$density" \
-                "${TRAIN_FLAGS[@]}" \
-                --max "$ceiling" \
-                --label "$name" \
-                --report "$report" | tee "$RUN_DIR/$name.log"
+            EVALUATE_ARGS=(
+                "$IMAGES"
+                --db-name "$database"
+                --reset
+            )
+            [ "$density" = auto ] || EVALUATE_ARGS+=(--constellations "$density")
+            EVALUATE_ARGS+=(
+                "${TRAIN_FLAGS[@]}"
+                --max "$ceiling"
+                --label "$name"
+                --report "$report"
+            )
+            node src/sign.js evaluate "${EVALUATE_ARGS[@]}" | tee "$RUN_DIR/$name.log"
             trained=1
         else
             # No --constellations here on purpose: with nothing trained this

@@ -660,12 +660,12 @@ against 18/20 without it, on identical corpora.
 
 ### Benchmarking
 
-`./benchmark.sh` trains, validates, and records the scores. Each *(training ceiling × search
+`./benchmark.sh` trains, validates, and records the scores. Each *(training configuration × search
 ceiling)* pair is one run; a run writes a full JSON report under `benchmarks/<timestamp>/` and
 appends one row to `benchmarks/scores.csv`, so results accumulate and a regression shows up as a
 diff rather than as a number nobody wrote down.
 
-    ./benchmark.sh                                # defaults, over sample_images/
+    ./benchmark.sh                                # automatic adaptive training, sample_images/
     ./benchmark.sh -c 200,600,1200                # sweep the training ceiling
     ./benchmark.sh -c 600 -m 60,120,240           # sweep the search ceiling
     ./benchmark.sh -i datasets/mine -l nightly    # another corpus, labelled
@@ -675,12 +675,14 @@ diff rather than as a number nobody wrote down.
 
     SIGN_SEARCH_SEPARATION=1.2 ./benchmark.sh -l loose   # any SIGN_* knob sweeps this way
 
-Training is adaptive in both the CLI and benchmark, but the benchmark makes `-c` a controlled hard
-ceiling by explicitly passing `--extend-to 0` unless `-e` was supplied. It always spells
+Training is automatic and adaptive in both the CLI and benchmark. With no `-c`, the benchmark omits
+`--constellations` and `--extend-to`, so it starts with one validation chunk and uses the same finite
+safety ceiling as `src/sign.js`. Supplying `-c` makes it a controlled hard ceiling by explicitly
+passing `--extend-to 0` unless `-e` was supplied. It always spells
 `--adaptive`/`--no-adaptive` and `--rehearse`/`--no-rehearse`, so a benchmark is never silently
 reinterpreted by environment defaults. The mode also lands in the run id (`-fixed`, `-x<n>`,
-`-rehearsed`) and CSV because two rows named `c600-m240` that were trained differently are easy to
-compare incorrectly.
+`-rehearsed`) and CSV; an automatic run uses `auto-m<n>` rather than pretending it requested a flat
+density.
 
 Progress is counted at both levels, because a sweep over a real dataset is otherwise a long silence:
 the banner says which run of how many is starting and over how many images (`▸ 2 run(s) over 6
