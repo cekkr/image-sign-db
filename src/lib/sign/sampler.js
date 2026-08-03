@@ -1,8 +1,8 @@
 // Drawing signs off a real image. The only module in src/lib/sign/ that needs
 // an image library; everything above it works on plain numbers.
 
-const sharp = require('sharp');
 const { getRawPixels } = require('../gridStats');
+const { openImage } = require('../imageLoader');
 const { DEFAULT_POINT_COUNT, POINT_PATCH_REL } = require('./constants');
 const { sampleConstellation } = require('./geometry');
 const { measureConstellation } = require('./measure');
@@ -28,18 +28,12 @@ const DEFAULT_WORKING_MAX_SIDE = 1024;
  * that some other tool has already straightened.
  */
 async function loadImagePixels(imagePath, { workingMaxSide = DEFAULT_WORKING_MAX_SIDE } = {}) {
-    let pipeline = sharp(imagePath, { failOn: 'none' }).rotate();
-    const metadata = await pipeline.metadata();
-    if (workingMaxSide > 0 && Math.max(metadata.width, metadata.height) > workingMaxSide) {
-        pipeline = pipeline.resize({
-            width: workingMaxSide,
-            height: workingMaxSide,
-            fit: 'inside',
-            withoutEnlargement: true,
-        });
-    }
+    const { image: pipeline, source, decoder } = await openImage(imagePath, {
+        autoOrient: true,
+        workingMaxSide,
+    });
     const { rawPixels, meta } = await getRawPixels(pipeline);
-    return { rawPixels, meta, source: { width: metadata.width, height: metadata.height } };
+    return { rawPixels, meta, source, decoder };
 }
 
 /**

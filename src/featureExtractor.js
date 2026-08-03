@@ -1,5 +1,4 @@
 // --- LIBRARIES ---
-const sharp = require('sharp');
 const fs = require('fs/promises');
 const path = require('path');
 const mysql = require('mysql2/promise');
@@ -15,6 +14,7 @@ const settings = require('./settings');
 const { selectTopDescriptors } = require('./lib/knowledge');
 const { normalizeResolutionLevel } = require('./lib/resolutionLevel');
 const { createCheetahStore } = require('./lib/cheetah/store');
+const { openImage } = require('./lib/imageLoader');
 
 const MAX_OPERATION_RETRIES = parseRetryEnv(process.env.DB_OPERATION_MAX_RETRIES, 4);
 const OPERATION_RETRY_BASE_MS = parseRetryEnv(process.env.DB_OPERATION_RETRY_BASE_MS, 40);
@@ -384,7 +384,7 @@ async function storeFeatures(imagePath, featureBatches) {
 
 async function extractFeatures(imagePath, augmentations = AUGMENTATION_ORDER) {
     await fs.access(imagePath);
-    const originalImage = sharp(imagePath);
+    const { image: originalImage } = await openImage(imagePath);
     const batches = await collectFeaturesForAugmentations(originalImage, imagePath, augmentations);
     return {
         batches,
@@ -400,7 +400,7 @@ async function extractAndStoreFeaturesProgressive(imagePath, options = {}) {
 
     const augmentations = options.augmentations ?? AUGMENTATION_ORDER;
     await fs.access(imagePath);
-    const originalImage = sharp(imagePath);
+    const { image: originalImage } = await openImage(imagePath);
 
     const cycles = Math.max(1, Number(settings?.training?.progressive?.cycles ?? 3));
     const randomPerAug = Math.max(0, Number(settings?.training?.progressive?.randomPerAug ?? 300));
@@ -491,7 +491,7 @@ async function extractAndStoreFeaturesProgressive(imagePath, options = {}) {
 async function extractAndStoreFeaturesProgressiveCheetah(imagePath, options = {}) {
     const augmentations = options.augmentations ?? AUGMENTATION_ORDER;
     await fs.access(imagePath);
-    const originalImage = sharp(imagePath);
+    const { image: originalImage } = await openImage(imagePath);
     const randomPerAug = Math.max(0, Number(settings?.training?.progressive?.randomPerAug ?? 300));
     const guidedPerCycle = Math.max(0, Number(settings?.training?.progressive?.guidedPerCycle ?? 300));
     const cycles = Math.max(1, Number(settings?.training?.progressive?.cycles ?? 3));

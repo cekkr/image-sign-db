@@ -423,19 +423,17 @@ One answer to "is this file an image we can read", shared by **both** pipelines 
 deliberately share besides the database. It is the exception to "the two pipelines share nothing",
 and it exists because they used to disagree by accident.
 
-- **Key symbols:** `IMAGE_EXTENSIONS` (the single accepted set), `KNOWN_UNSUPPORTED_EXTENSIONS`
-  (extension → why, so a skip can explain itself), `isImageFile`, `partitionImageNames`
+- **Key symbols:** `IMAGE_EXTENSIONS` (the single accepted candidate set), `isImageFile`, `partitionImageNames`
   (`{accepted, skipped}`), `describeSkipped` (one line per extension, not per file).
 - **Why it exists:** `src/sign.js` accepted `.tif/.tiff/.gif` and `src/train.js` did not, so the same
   directory was a different corpus depending on which command read it — silently, because both just
-  filtered. The list is now the **union**, since both decode through `sharp` and `sharp` reads all of
-  them; a pipeline that genuinely needs a narrower set passes one to `isImageFile` rather than
-  keeping a second copy.
-- **`.heic` is excluded on purpose.** `sharp.format.heif.input` reports `true`, but the prebuilt
-  binaries declare `.avif` only — Apple HEIC is HEVC-coded and the bundled libheif generally lacks
-  that decoder. Accepting it would turn a silent skip into a crash mid-corpus. `sample_images/`
-  contains one (`IMG_4965.heic`), which is why the corpus is **29 images to the sign pipeline, not
-  the 30 files on disk**.
+  filtered. The list is now the **union**, since both decode through `imageLoader`; a pipeline that
+  genuinely needs a narrower set passes one to `isImageFile` rather than keeping a second copy.
+- **HEIC/HEIF and other optional-codec formats are candidates.** Candidacy is deliberately wider
+  than the codecs in one Sharp binary. [`src/lib/imageLoader.js`](src/lib/imageLoader.js) probes
+  formats whose pixel decoder is commonly optional and falls back to ImageMagick, macOS `sips`, or
+  FFmpeg. A real decode failure is reported by the ingest/search path with every decoder diagnostic;
+  it is no longer silently removed from a directory listing.
 - **The module never prints; callers do.** `collectImages` in [`src/sign.js`](src/sign.js) reports via
   `console.warn` (**stderr**) because `benchmark.sh` captures its image count from stdout.
 - **Called by:** [`src/sign.js`](src/sign.js) (`collectImages`), [`src/train.js`](src/train.js)
@@ -444,6 +442,27 @@ and it exists because they used to disagree by accident.
   again.
 - **Common mistakes:** widening the set is a corpus change — a directory that trained N images will
   train more without anything failing. Add the extension *and* re-baseline.
+
+### [`src/lib/imageLoader.js`](src/lib/imageLoader.js)
+
+Shared codec boundary for both pipelines. `openImage` returns `{image, source, decoder}`, where
+`image` is a Sharp pipeline, `source` is the original pixel size when it could be read, and `decoder`
+names the path that succeeded.
+
+- **Normal formats do not pay for a probe.** JPEG/PNG/WebP/etc. return a lazy Sharp pipeline just as
+  before. Only `FALLBACK_IMAGE_EXTENSIONS` performs a 1×1 pixel decode first, because libheif can
+  parse HEIC metadata and still fail later when its build lacks the HEVC pixel decoder.
+- **Fallback order:** ImageMagick `magick`, macOS `/usr/bin/sips`, then `ffmpeg`. Missing programs
+  are ordinary failed attempts. Each converter produces a lossless PNG; the sign caller supplies
+  `workingMaxSide` so conversion is bounded before bytes return to Node. Converter stdout is capped
+  at 128 MiB and diagnostics at 64 KiB.
+- **The delta pipeline also uses it.** [`src/featureExtractor.js`](src/featureExtractor.js) and
+  [`src/lib/vectorGenerators.js`](src/lib/vectorGenerators.js) request an unbounded, unoriented
+  pipeline to preserve their prior sampling semantics; the sign sampler requests EXIF orientation
+  and `SIGN_WORKING_MAX_SIDE`.
+- **Tests:** [`test/image-loader.test.js`](test/image-loader.test.js) covers the Sharp path, injected
+  fallback path, resizing, and aggregate errors. [`test/image-files.test.js`](test/image-files.test.js)
+  owns extension/discovery behavior.
 
 ### [`src/lib/descriptor.js`](src/lib/descriptor.js)
 
@@ -661,7 +680,8 @@ The primary operator entry point: dataset ingestion, online learning, self-evalu
 
 - **Key functions and subparts:**
   - `parseArgs` — flags: `--discover`, `--bootstrap`, `--reprobe`, `--shuffle`, `--threads`, `--evaluate`, `--evaluate-runs`, `--evaluate-top`, `--evaluate-filters`, `--augmentations`/`--aug`, `--aug-per-pass`, `--aug-seed`. `--pattern` is parsed into `options.pattern` and **never read** — dead.
-  - `walkDir` — recursive async generator filtered by `SUPPORTED_IMAGE_EXTENSIONS` (`.jpg/.jpeg/.png/.webp/.bmp`).
+  - `walkDir` — recursive async generator filtered by the shared `SUPPORTED_IMAGE_EXTENSIONS` from
+    `src/lib/imageFiles.js`, including HEIF-family and optional-codec candidates.
   - `sampleResources` / `computeDesiredWorkerCount` — the adaptive pool policy: target ≈ 75% of CPUs, reduced on load average > 0.9/1.1 or free memory < 18%/10%, increased when idle; hard-capped at `min(cpuCount, 8)` or `--threads` (max 32).
   - `ingestFilesConcurrently` — the pool itself: spawns/terminates workers on a `RESOURCE_SAMPLE_INTERVAL_MS` timer, drives `cli-progress` when TTY, and invokes `onImageIngested` per success. `selectAugmentationsForFile` picks `--aug-per-pass` augmentations per file with a seeded Fisher–Yates shuffle, **always including `original`**.
   - `OnlineCorrelationRunner` — serialized queue of discovery batches (`enqueue`/`process`/`drain`), with per-batch averages and the `TRAINING_CORRELATION_DEBUG_LOG` top-match dump.

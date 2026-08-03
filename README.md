@@ -355,6 +355,15 @@ quantised into one integer **word** out of a frozen vocabulary of 73 728. Words 
     node src/sign.js find photo.jpg --db-name my_corpus
     node src/sign.js stats --db-name my_corpus
 
+Image input is not limited to the codecs bundled with Sharp. JPEG, PNG, WebP, TIFF, GIF, SVG and
+other ordinary formats stay on Sharp's in-process path. HEIC/HEIF/AVIF, JPEG 2000/JPEG XL, common
+camera RAW formats, PSD and similar less-common inputs first try Sharp and then fall back, in order,
+to ImageMagick (`magick`), macOS `sips`, or FFmpeg. The fallback converts only the first image/page
+to lossless PNG and respects `SIGN_WORKING_MAX_SIDE`, so a phone HEIC is not expanded at full camera
+resolution in Node. macOS supplies `sips`; on other systems install ImageMagick or FFmpeg with the
+codec needed by the dataset. If every decoder fails, the error names each attempted decoder and its
+diagnostic instead of reporting only an unsupported extension.
+
 `--db-name` selects the Cheetah database for both training and search (`--database` is an older
 alias, and `CHEETAH_DATABASE` sets the default). `--reset` drops that database before ingesting, so
 a training run establishes the corpus rather than adding to it; it is **training only** and `find`

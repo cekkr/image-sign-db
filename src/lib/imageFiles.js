@@ -7,8 +7,9 @@
 // a list is written twice.
 //
 // The list is the union, because there is no property of either pipeline that
-// makes a TIFF readable by one and not the other: both decode through `sharp`,
-// and `sharp` reads every extension below (verified against `sharp.format`).
+// makes a TIFF readable by one and not the other: both decode through the
+// shared image loader. Sharp is the fast path; optional host converters cover
+// formats such as HEVC-backed HEIC that Sharp's prebuilt codec stack omits.
 // If a pipeline ever does need a narrower set, it should pass one explicitly
 // rather than keep a second copy of the default.
 //
@@ -18,28 +19,25 @@
 // row whose image count nobody can reproduce.
 
 const path = require('path');
+const { FALLBACK_IMAGE_EXTENSIONS } = require('./imageLoader');
 
-// Extensions `sharp` can decode and both pipelines accept. Lowercase, with the
-// dot, because that is what `path.extname` returns.
+// Image candidates both pipelines accept. Lowercase, with the dot, because
+// that is what `path.extname` returns. Some use the fallback codec chain rather
+// than the bundled Sharp decoder.
 const IMAGE_EXTENSIONS = new Set([
     '.jpg',
     '.jpeg',
+    '.jpe',
+    '.jfif',
     '.png',
     '.webp',
     '.tif',
     '.tiff',
     '.bmp',
     '.gif',
-]);
-
-// Deliberately *not* in the set. `sharp.format.heif.input` reports true, but the
-// prebuilt binaries declare `.avif` only: Apple's HEIC is HEVC-coded and the
-// bundled libheif is generally built without that decoder, so accepting `.heic`
-// here would turn a silent skip into a crash mid-corpus. Kept as data so the
-// skip message can explain itself instead of just counting.
-const KNOWN_UNSUPPORTED_EXTENSIONS = new Map([
-    ['.heic', 'HEIC needs an HEVC-capable libheif, which the bundled sharp does not ship'],
-    ['.heif', 'HEIF needs an HEVC-capable libheif, which the bundled sharp does not ship'],
+    '.svg',
+    '.svgz',
+    ...FALLBACK_IMAGE_EXTENSIONS,
 ]);
 
 function isImageFile(name, extensions = IMAGE_EXTENSIONS) {
@@ -64,7 +62,7 @@ function partitionImageNames(names, extensions = IMAGE_EXTENSIONS) {
         skipped.push({
             name,
             extension,
-            reason: KNOWN_UNSUPPORTED_EXTENSIONS.get(extension) || 'not a supported image extension',
+            reason: 'not a supported image extension',
         });
     }
     return { accepted, skipped };
@@ -88,7 +86,6 @@ function describeSkipped(skipped) {
 
 module.exports = {
     IMAGE_EXTENSIONS,
-    KNOWN_UNSUPPORTED_EXTENSIONS,
     isImageFile,
     partitionImageNames,
     describeSkipped,

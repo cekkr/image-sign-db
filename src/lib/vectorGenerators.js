@@ -1,7 +1,7 @@
-const sharp = require('sharp');
 const { CONSTELLATION_CONSTANTS } = require('./constants');
 const { applyAugmentation } = require('./augmentations');
 const { calculateStatsForRegion, getRawPixels } = require('./gridStats');
+const { openImage } = require('./imageLoader');
 const { createDescriptorKey } = require('./descriptor');
 const {
     generateBaseParameters,
@@ -163,7 +163,7 @@ async function generateSpecificVector(imagePath, spec, options = {}) {
     const channel = specChannel ?? descriptor?.channel;
     if (!channel) return null;
 
-    let workingImage = sharp(imagePath);
+    let { image: workingImage } = await openImage(imagePath);
     if (options && typeof options.imageTransform === 'function') {
         const transformed = await options.imageTransform(workingImage.clone());
         if (transformed && typeof transformed.metadata === 'function') {

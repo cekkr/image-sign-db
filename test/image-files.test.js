@@ -8,7 +8,6 @@ const path = require('node:path');
 
 const {
     IMAGE_EXTENSIONS,
-    KNOWN_UNSUPPORTED_EXTENSIONS,
     isImageFile,
     partitionImageNames,
     describeSkipped,
@@ -38,11 +37,15 @@ test('the shared list is what sharp can actually decode', () => {
     const formatFor = {
         '.jpg': 'jpeg',
         '.jpeg': 'jpeg',
+        '.jpe': 'jpeg',
+        '.jfif': 'jpeg',
         '.png': 'png',
         '.webp': 'webp',
         '.tif': 'tiff',
         '.tiff': 'tiff',
         '.gif': 'gif',
+        '.svg': 'svg',
+        '.svgz': 'svg',
     };
     for (const extension of IMAGE_EXTENSIONS) {
         const format = formatFor[extension];
@@ -57,20 +60,21 @@ test('the shared list is what sharp can actually decode', () => {
     }
 });
 
-test('an unreadable extension is skipped with a reason, not dropped in silence', () => {
+test('HEIF-family files are candidates and unrelated extensions are reported', () => {
     const { accepted, skipped } = partitionImageNames([
         'a.jpg',
         'b.JPG',
         'c.heic',
-        'd.heic',
+        'd.heif',
+        'e.avif',
         'notes.md',
     ]);
 
-    assert.deepStrictEqual(accepted, ['a.jpg', 'b.JPG'], 'case must not decide readability');
-
-    const heic = skipped.filter((entry) => entry.extension === '.heic');
-    assert.strictEqual(heic.length, 2);
-    assert.match(heic[0].reason, /libheif/, 'a known-unsupported format must explain itself');
+    assert.deepStrictEqual(
+        accepted,
+        ['a.jpg', 'b.JPG', 'c.heic', 'd.heif', 'e.avif'],
+        'case and HEIF codec spelling must not decide candidacy'
+    );
 
     const markdown = skipped.find((entry) => entry.extension === '.md');
     assert.ok(markdown, 'an unknown extension is still reported');
@@ -84,10 +88,10 @@ test('an extensionless file is not reported as a rejected image', () => {
 });
 
 test('the skip notice counts per extension, not per file', () => {
-    const { skipped } = partitionImageNames(['1.heic', '2.heic', '3.heic', '4.md']);
+    const { skipped } = partitionImageNames(['1.xyz', '2.xyz', '3.xyz', '4.md']);
     const lines = describeSkipped(skipped).split('\n');
     assert.strictEqual(lines.length, 2, 'forty photos of one kind are one line, not forty');
-    assert.ok(lines.some((line) => line.startsWith('3 .heic file(s) skipped')), lines.join(' | '));
+    assert.ok(lines.some((line) => line.startsWith('3 .xyz file(s) skipped')), lines.join(' | '));
     assert.ok(lines.some((line) => line.startsWith('1 .md file(s) skipped')), lines.join(' | '));
     assert.strictEqual(describeSkipped([]), '', 'nothing skipped says nothing');
 });
@@ -99,12 +103,9 @@ test('isImageFile accepts a caller-supplied narrower set', () => {
     assert.ok(isImageFile('a.jpg'), 'and the default is still the shared list');
 });
 
-test('every known-unsupported extension is genuinely absent from the accepted set', () => {
-    for (const extension of KNOWN_UNSUPPORTED_EXTENSIONS.keys()) {
-        assert.ok(
-            !IMAGE_EXTENSIONS.has(extension),
-            `${extension} is listed as unsupported and accepted at the same time`
-        );
+test('common fallback formats are present in the shared candidate set', () => {
+    for (const extension of ['.heic', '.heif', '.avif', '.jxl', '.jp2', '.dng']) {
+        assert.ok(IMAGE_EXTENSIONS.has(extension), `${extension} must reach the shared decoder`);
     }
 });
 
@@ -113,7 +114,7 @@ test('every known-unsupported extension is genuinely absent from the accepted se
 test('collectImages reports skips on stderr and returns only readable files', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'image-files-test-'));
     try {
-        for (const name of ['b.jpg', 'a.jpg', 'skip.heic', '.DS_Store']) {
+        for (const name of ['b.jpg', 'a.jpg', 'phone.heic', 'skip.md', '.DS_Store']) {
             fs.writeFileSync(path.join(dir, name), '');
         }
         const { collectImages } = require('../src/sign');
@@ -134,12 +135,12 @@ test('collectImages reports skips on stderr and returns only readable files', ()
 
         assert.deepStrictEqual(
             files.map((file) => path.basename(file)),
-            ['a.jpg', 'b.jpg'],
-            'the listing is sorted and holds only what can be read'
+            ['a.jpg', 'b.jpg', 'phone.heic'],
+            'the listing is sorted and holds image candidates for the decoder'
         );
         assert.strictEqual(logs.length, 0, 'the notice must not land on stdout; benchmark.sh parses it');
         assert.strictEqual(warnings.length, 1);
-        assert.match(warnings[0], /\.heic/);
+        assert.match(warnings[0], /\.md/);
 
         const quietWarnings = [];
         console.warn = (...args) => quietWarnings.push(args.join(' '));
