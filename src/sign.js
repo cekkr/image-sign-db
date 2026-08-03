@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const settings = require('./settings');
 const { SIGN_LAYOUT_VERSION, WORD_CARDINALITY } = require('./lib/sign/constants');
+const { partitionImageNames, describeSkipped } = require('./lib/imageFiles');
 const { createSignStore } = require('./lib/cheetah/signStore');
 const { startServer } = require('./lib/cheetah/server');
 const {
@@ -23,16 +24,19 @@ const {
     trainImageAdaptive,
 } = require('./signPipeline');
 
-const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.tif', '.tiff', '.bmp', '.gif']);
-
-function collectImages(target) {
+// collectImages says what it left behind. A corpus that silently drops a file
+// is a run whose image count cannot be reproduced from the directory, and the
+// benchmark writes that count into scores.csv. The notice goes to stderr
+// because benchmark.sh captures the count from stdout.
+function collectImages(target, { quiet = false } = {}) {
     const resolved = path.resolve(target);
     const stat = fs.statSync(resolved);
     if (stat.isFile()) return [resolved];
-    return fs.readdirSync(resolved)
-        .filter((name) => IMAGE_EXTENSIONS.has(path.extname(name).toLowerCase()))
-        .sort()
-        .map((name) => path.join(resolved, name));
+    const { accepted, skipped } = partitionImageNames(fs.readdirSync(resolved));
+    if (!quiet && skipped.length > 0) {
+        console.warn(`⚠ ${resolved}\n  ${describeSkipped(skipped).split('\n').join('\n  ')}`);
+    }
+    return accepted.sort().map((name) => path.join(resolved, name));
 }
 
 function parseArgs(argv) {
@@ -193,7 +197,7 @@ async function commandTrain(store, targets, flags) {
     review.ceiling = numberFlag(flags, 'review-ceiling', review.ceiling);
     review.patience = numberFlag(flags, 'review-patience', review.patience);
     review.finalPasses = numberFlag(flags, 'review-passes', review.finalPasses);
-    const images = targets.flatMap(collectImages);
+    const images = targets.flatMap((target) => collectImages(target));
     if (images.length === 0) throw new Error('no images found');
 
     // Training only. `--reset` on a search would delete the corpus it was about
@@ -567,7 +571,7 @@ async function commandFind(store, target, flags) {
  * nothing.
  */
 async function commandEvaluate(store, targets, flags) {
-    const images = targets.flatMap(collectImages);
+    const images = targets.flatMap((target) => collectImages(target));
     if (images.length === 0) throw new Error('no images found');
     const startedAt = new Date();
     const maxConstellations = numberFlag(flags, 'max', settings.sign.search.maxConstellations);

@@ -17,6 +17,9 @@ const { euclideanDistance } = require('./lib/correlationMetrics');
 const { parseDescriptor } = require('./lib/descriptor');
 const { extendConstellationPath, descriptorToSpec } = require('./lib/constellation');
 const { collectElasticMatches } = require('./lib/elasticMatcher');
+// Shared with the sign pipeline: one list, one answer to "can we read this".
+// See src/lib/imageFiles.js for why it is not two.
+const { IMAGE_EXTENSIONS: SUPPORTED_IMAGE_EXTENSIONS } = require('./lib/imageFiles');
 const {
   normalizeProbeSpec,
   resolveEvaluationFilters,
@@ -54,7 +57,6 @@ const EVALUATION_DEFAULT_OPTIONS = {
   top: 5,
   filters: ['original', 'gaussian_blur', 'cropping'],
 };
-const SUPPORTED_IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.bmp']);
 const WORKER_SCRIPT = path.resolve(__dirname, 'workers/ingestWorker.js');
 const RESOURCE_SAMPLE_INTERVAL_MS = settings.training.resourceSampleIntervalMs;
 

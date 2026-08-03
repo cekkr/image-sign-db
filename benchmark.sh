@@ -152,8 +152,33 @@ fi
 
 # The search ceiling defaults to whatever settings.js resolves, so an unset
 # --max benchmarks the configuration the project actually ships.
+#
+# The capture is validated rather than trusted. A ceiling goes into the run id,
+# the run id goes into the report filename and into the `run` column of
+# scores.csv — so anything a required module prints on stdout ends up welded
+# into a file format that accumulates across sessions. That is not theoretical:
+# dotenv v17 used to print a load banner here, and two rows of scores.csv
+# carried it as their run label until they were relabelled from the reports'
+# own recorded config. `src/settings.js` now loads dotenv with `quiet: true`,
+# which is the fix; this check is the guard, because the next module to print
+# will not announce itself either.
 if [ -z "$MAX_LIST" ]; then
     MAX_LIST="$(node -e 'process.stdout.write(String(require("./src/settings").sign.search.maxConstellations))')"
+fi
+if ! printf '%s' "$MAX_LIST" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then
+    echo "benchmark: refusing an unusable search ceiling: $(printf '%q' "$MAX_LIST")" >&2
+    echo "  --max must be a comma-separated list of integers. When it is left unset it is read" >&2
+    echo "  from src/settings.js, so a module printing to stdout on require will land here." >&2
+    exit 1
+fi
+
+# `-c` only ever comes from the command line, but it lands in the run id the same
+# way, so a typo would name a row after itself just as permanently. Checked here
+# with the other half of the sweep — before the server starts, so a bad flag
+# costs nothing.
+if ! printf '%s' "$CONSTELLATIONS" | grep -Eq '^[0-9]+(,[0-9]+)*$'; then
+    echo "benchmark: --constellations must be a comma-separated list of integers, got: $(printf '%q' "$CONSTELLATIONS")" >&2
+    exit 1
 fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"

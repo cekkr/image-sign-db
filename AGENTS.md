@@ -365,6 +365,8 @@ CLI: `train`, `find`, `evaluate`, `stats`. `--spawn` runs the vendored `cheetah-
 - **`null` must never render as `0`.** A `--skip-train` run has no training time, which is not training that took no time. Covered by [`test/benchmark-report.test.js`](test/benchmark-report.test.js). The same rule governs the adaptive columns (`adaptive_training`, `mean_trained_constellations`, `constellations_saved`): they read from `report.training`, which is `null` on a `--skip-train` run.
 - The script runs **one** `cheetah-server` for the whole session rather than letting each command `--spawn` its own, so start-up cost stays out of the timings; each density gets a fresh database, because a corpus trained at 200 and topped up to 600 is not a corpus trained at 600.
 - `benchmarks/*/` is git-ignored (reports plus the server log, all reproducible); `benchmarks/scores.csv` is deliberately **not** — it is the artefact worth committing.
+- **A run id is welded into a file format, so the values that build it are validated before use.** `name` becomes the report filename *and* the `run` column of `scores.csv`, which is appended to forever — so anything that reaches `${density}` or `${ceiling}` is permanent. When `--max` is unset the ceiling is captured from `node -e "…require('./src/settings')…"`, and anything that module prints on **stdout** lands inside it. That is not hypothetical: dotenv v17 printed a load banner on require, and two rows of `scores.csv` carried it as their run label (`c2048-m[dotenv@17.2.3] injecting env (0)…`) together with two report files named after it. [`src/settings.js`](src/settings.js) now loads dotenv with `quiet: true` — that is the fix — and `benchmark.sh` rejects a `--max`/`-c` that is not a comma-separated list of integers, which is the guard, because the next module to print will not announce itself either. The two damaged rows were relabelled `c2048-m240` from their own reports' `config.search.maxConstellations`, not from a guess.
+- **Anything a pipeline module prints on `require` is a benchmark hazard, not just a cosmetic one.** Keep new `console.log` out of module top level; `collectImages` reports skipped files with `console.warn` (stderr) for exactly this reason — `IMAGE_TOTAL` is captured from its stdout.
 
 ### [`test/`](test)
 
@@ -414,6 +416,34 @@ Frozen descriptor-space constants. Change nothing here casually — these values
   - `STOCHASTIC_AUGMENTATIONS` — `random_combo_0..2`.
 - **Dead constants:** `TREE_DEPTHS` and `SPAN_SCALE` are exported but referenced nowhere. `TREE_DEPTHS` is the vestige of the unimplemented quadtree feature.
 - **Called by / depends on:** [`src/lib/constellation.js`](src/lib/constellation.js), [`src/lib/vectorGenerators.js`](src/lib/vectorGenerators.js), [`src/lib/augmentations.js`](src/lib/augmentations.js), [`src/evaluate.js`](src/evaluate.js), [`src/index.js`](src/index.js), [`src/train.js`](src/train.js), [`src/lib/knowledge.js`](src/lib/knowledge.js).
+
+### [`src/lib/imageFiles.js`](src/lib/imageFiles.js)
+
+One answer to "is this file an image we can read", shared by **both** pipelines — the only module they
+deliberately share besides the database. It is the exception to "the two pipelines share nothing",
+and it exists because they used to disagree by accident.
+
+- **Key symbols:** `IMAGE_EXTENSIONS` (the single accepted set), `KNOWN_UNSUPPORTED_EXTENSIONS`
+  (extension → why, so a skip can explain itself), `isImageFile`, `partitionImageNames`
+  (`{accepted, skipped}`), `describeSkipped` (one line per extension, not per file).
+- **Why it exists:** `src/sign.js` accepted `.tif/.tiff/.gif` and `src/train.js` did not, so the same
+  directory was a different corpus depending on which command read it — silently, because both just
+  filtered. The list is now the **union**, since both decode through `sharp` and `sharp` reads all of
+  them; a pipeline that genuinely needs a narrower set passes one to `isImageFile` rather than
+  keeping a second copy.
+- **`.heic` is excluded on purpose.** `sharp.format.heif.input` reports `true`, but the prebuilt
+  binaries declare `.avif` only — Apple HEIC is HEVC-coded and the bundled libheif generally lacks
+  that decoder. Accepting it would turn a silent skip into a crash mid-corpus. `sample_images/`
+  contains one (`IMG_4965.heic`), which is why the corpus is **29 images to the sign pipeline, not
+  the 30 files on disk**.
+- **The module never prints; callers do.** `collectImages` in [`src/sign.js`](src/sign.js) reports via
+  `console.warn` (**stderr**) because `benchmark.sh` captures its image count from stdout.
+- **Called by:** [`src/sign.js`](src/sign.js) (`collectImages`), [`src/train.js`](src/train.js)
+  (`walkDir` via `SUPPORTED_IMAGE_EXTENSIONS`). **Tests:**
+  [`test/image-files.test.js`](test/image-files.test.js), which fails if either file declares the set
+  again.
+- **Common mistakes:** widening the set is a corpus change — a directory that trained N images will
+  train more without anything failing. Add the extension *and* re-baseline.
 
 ### [`src/lib/descriptor.js`](src/lib/descriptor.js)
 
@@ -1009,7 +1039,21 @@ Tests including the live Cheetah round-trip (builds the submodule binary, spawns
 npm run test:integration
 ```
 
-Not available: lint, format, typecheck, benchmark, packaging, and deployment. Do not invent them.
+Benchmark the sign pipeline — trains a corpus, re-identifies every image from a fresh random draw, writes a JSON report per run and appends a row to `benchmarks/scores.csv`. This is the accuracy/performance gate; see [`benchmark.sh` and `scripts/benchmark-report.js`](#benchmarksh-and-scriptsbenchmark-reportjs) for what it deliberately refuses to do:
+
+```bash
+./benchmark.sh -c 600 -m 120
+```
+
+Sweep the training and search ceilings (one run per pair; each density trains its own database from scratch):
+
+```bash
+./benchmark.sh -c 200,600,1200 -m 60,120,240
+```
+
+**Run it before and after a change that could move accuracy or cost, and commit both rows.** `scores.csv` accumulates across sessions precisely so a regression shows up as a diff rather than as a number nobody wrote down — a change measured only after the fact has not been measured.
+
+Not available: lint, format, typecheck, packaging, and deployment. Do not invent them. (Benchmarking *is* available — it is `./benchmark.sh`, and this line used to deny it while the section above documented it.)
 
 ### Cheetah submodule (migration work only)
 
@@ -1070,6 +1114,7 @@ document that concerns the **MySQL pipeline** remains unprotected by executable 
 | [`test/sign-field.test.js`](test/sign-field.test.js) | The four claims `studies/continuous_colors_function.md` makes: exact interpolation at reference points, confidence decaying away from samples, geometry (not just nearest distance) deciding confidence, and the `β(1−C)` term stopping a candidate from winning by being uncertain | yes |
 | [`test/sign-words.test.js`](test/sign-words.test.js) | Vocabulary codec: level monotonicity, edge-tolerance sweeps in both directions and their `MAX_WORD_VARIANTS` cap, turn-angle wrap, determinism, and every word inside `WORD_CARDINALITY` under 4 000 random triples | yes |
 | [`test/sign-keys.test.js`](test/sign-keys.test.js) | The `si:`/`sn:`/`sc:`/`sw:` layout: round-trip, the posting **prefix hierarchy** the reranker depends on, byte-order == numeric-order, out-of-range refusal, and that no namespace is a prefix of another | yes |
+| [`test/image-files.test.js`](test/image-files.test.js) | The one accepted-extension list: that neither `src/sign.js` nor `src/train.js` declares its own again, that every accepted extension is one `sharp` reports it can read, that an unreadable file is skipped *with a reason* instead of in silence, that the notice counts per extension rather than per file, and that `collectImages` puts it on **stderr** — `benchmark.sh` captures its image count from stdout | yes |
 | [`test/benchmark-report.test.js`](test/benchmark-report.test.js) | `scores.csv` as a file format: header written once, every row the width the header claims, column order stable, `null` as an empty field and as `-` in the table (never `0`), CSV escaping, and refusing a document that is not a report | yes |
 | [`test/sign-integration.test.js`](test/sign-integration.test.js) | The sign pipeline against a live server: ingestion/recall round trips, fresh-query identification, completion gating, adaptive chunking/bootstrap, rehearsal append/ceiling/fair selection, the rehearsal gate ignoring `confidentRate` (forced by an unreachable `separationTarget`, in its own database so duplicate fixtures cannot make it vacuous), the patience guard giving up on unproductive top-ups, and repeated CLI training filename-linking existing records without allocating duplicate image IDs | **no** — gated on `CHEETAH_INTEGRATION=1` |
 
