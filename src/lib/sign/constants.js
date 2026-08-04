@@ -25,8 +25,11 @@
 /**
  * Bump on any change below. Stored at `cfg:sign_layout_version`; a database
  * written by a different layout is rejected rather than silently misread.
+ *
+ * v2 removed the hop scale band and the turn angle from the word. See
+ * "What a word is made of" below for the measurement that forced it.
  */
-const SIGN_LAYOUT_VERSION = 1;
+const SIGN_LAYOUT_VERSION = 2;
 
 /** Points per constellation. Must be odd so that a single centre exists. */
 const DEFAULT_POINT_COUNT = 5;
@@ -54,29 +57,53 @@ const POINT_PATCH_REL = 0.004;
 // Vocabulary quantisation (see words.js)
 // ---------------------------------------------------------------------------
 //
-// A *word* is a triple of consecutive constellation points reduced to one
-// integer. The level tables are deliberately non-uniform: colour deltas between
-// two points a tenth of an image apart pile up near zero, so uniform bins would
-// put most of the corpus in one cell and the vocabulary would not separate
-// anything.
+// ## What a word is made of
 //
-// Distances are NOT part of a word. The radius of every hop is drawn at
-// sampling time, so a distance describes the sampler, not the image; only the
-// coarse SCALE band survives, and only because it conditions how large a colour
-// delta means something.
+// A *word* is a triple of consecutive constellation points reduced to one
+// integer: the six quantised colour-delta magnitudes of its two hops, and
+// nothing else. The level tables are deliberately non-uniform, because colour
+// deltas between two points a tenth of an image apart pile up near zero and
+// uniform bins would put most of the corpus in one cell.
+//
+// **Neither hop length nor turn angle is part of a word, and that is a
+// measurement, not a preference.** `geometry.hopFrom` draws each hop's radius
+// uniformly from a circumference range and each bearing uniformly from the
+// circle, so the mean hop length and the turn between two hops are properties of
+// the *draw*, not of the picture. Putting them in the word did not add
+// information; it shattered every real observation across 18 arbitrary cells, so
+// a fresh sample of an image almost never re-landed in the cell its own training
+// had written. Measured on `sample_images/`, 100 images at 512 constellations,
+// ranked by tf-idf cosine over exactly the same measurements:
+//
+//     scale3 · turn6 · delta4^6  (73728 cells)   rank-1  45/100
+//     scale3 ·         delta4^6  (12288 cells)   rank-1  73/100
+//               turn2 · delta4^6  (8192 cells)   rank-1  81/100
+//                       delta4^6   (4096 cells)  rank-1  93/100
+//
+// The turn's defence in the earlier revision — that it is invariant to the
+// constellation's absolute orientation — is true and beside the point: an
+// invariant of a random draw is still a random draw. What survives of the
+// geometry lives in `words.tripleFeatures`, which keeps scale and turn as
+// *continuous* values for the reranker, where they are compared rather than
+// used as a partition.
 
 /** Upper edges of the four |dH| / |dS| / |dV| levels. */
 const DELTA_LEVEL_EDGES = Object.freeze([0.035, 0.10, 0.25]);
-/** Upper edges of the three mean-hop-length bands, in half-diagonal units. */
-const SCALE_LEVEL_EDGES = Object.freeze([0.11, 0.17]);
-/** Uniform bins of the turn angle between the two hops of a triple. */
-const TURN_LEVELS = 6;
 
 const DELTA_LEVELS = DELTA_LEVEL_EDGES.length + 1;
-const SCALE_LEVELS = SCALE_LEVEL_EDGES.length + 1;
 
-/** |vocabulary| = 3 * 6 * 4^6 = 73728, comfortably inside 5 hex digits. */
-const WORD_CARDINALITY = SCALE_LEVELS * TURN_LEVELS * DELTA_LEVELS ** 6;
+/**
+ * |vocabulary| = 4^6 = 4096.
+ *
+ * Small on purpose. A word is now a cell that a fresh draw actually re-enters,
+ * which means an image's signature is a *distribution* over the vocabulary
+ * rather than a sparse set of near-unique tokens — and the resolver has to
+ * compare distributions. See `signPipeline.Evidence`: with the old vocabulary,
+ * set membership was nearly all the information there was; with this one,
+ * counts are, and a resolver that ignores them scores 10/100 where one that
+ * uses them scores 94/100.
+ */
+const WORD_CARDINALITY = DELTA_LEVELS ** 6;
 
 /**
  * How close to a level edge a measured value has to be before the query also
@@ -85,8 +112,6 @@ const WORD_CARDINALITY = SCALE_LEVELS * TURN_LEVELS * DELTA_LEVELS ** 6;
  */
 const WORD_EDGE_TOLERANCE = Object.freeze({
     delta: 0.02,
-    scale: 0.012,
-    turn: 0.13,
 });
 
 /** Hard cap on the words one measured triple may ask for. */
@@ -128,10 +153,7 @@ module.exports = Object.freeze({
     MAX_WORD_VARIANTS,
     POINT_PATCH_REL,
     RADIUS_SHRINK_FACTOR,
-    SCALE_LEVELS,
-    SCALE_LEVEL_EDGES,
     SIGN_LAYOUT_VERSION,
-    TURN_LEVELS,
     WORD_CARDINALITY,
     WORD_EDGE_TOLERANCE,
 });

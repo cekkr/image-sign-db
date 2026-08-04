@@ -86,8 +86,12 @@ const HEX_WIDTH = Object.freeze({
     anchor: 4,
     offset: 4,
     order: 2,
-    // 5 hex digits hold 1048576 words against a frozen vocabulary of 73728.
-    word: 5,
+    // 3 hex digits hold 4096 words, which is the whole frozen vocabulary. It
+    // is exact rather than generous on purpose: every posting key carries this
+    // width, and the pair trie walks it two bytes at a time, so a digit that
+    // can never be anything but zero is a trie level every scan descends for
+    // nothing.
+    word: 3,
     // Constellations per image, hex: 65536 signs is far above any useful count.
     constellation: 4,
 });

@@ -2,43 +2,36 @@
 //
 // Why a triple and not a whole constellation, and not a single hop:
 //
-//   - A whole 5-point sign is 8 quantised dimensions of geometry and colour.
-//     Two independently sampled constellations would essentially never land in
-//     the same cell, so the vocabulary would never collide and nothing would
-//     ever be recalled.
-//   - A single hop is four dimensions and a few hundred cells. Every image
-//     covers nearly all of them, so nothing would ever be *discriminated*.
-//   - A triple — two hops, their turn angle, and the six colour deltas — sits
-//     in a vocabulary of 73728 cells. An image trained with a few hundred
-//     constellations occupies a characteristic subset of it, and a fresh sample
-//     from the same image lands in that subset far more often than in another
-//     image's. Recall is statistical, not a geometric correspondence: the query
-//     never re-finds the pixels the training used.
+//   - A whole 5-point sign is a dozen quantised dimensions. Two independently
+//     sampled constellations would essentially never land in the same cell, so
+//     the vocabulary would never collide and nothing would ever be recalled.
+//   - A single hop is three colour deltas and 64 cells. Every image covers all
+//     of them at almost the same rate, so nothing would be *discriminated*.
+//   - A triple is the two hops that meet at a point: six colour deltas, 4096
+//     cells. A fresh sample of an image reproduces that image's *distribution*
+//     over those cells far more closely than another image's. Recall is
+//     statistical, not a geometric correspondence — the query never re-finds
+//     the pixels the training used.
 //
-// The turn angle is the reason a triple is used rather than two independent
-// hops: it is invariant to the constellation's absolute orientation, so it says
-// something about the image rather than about the draw.
+// The triple is still what makes this relative rather than a colour histogram:
+// the six values are two colour changes that share a point, so a word says
+// "here, a change of this size was followed by a change of that size", which a
+// per-pixel or per-patch statistic cannot express.
 //
-// Hop *lengths* are almost absent on purpose — only a three-band scale survives.
-// The radius of every hop is drawn from a distribution at sampling time, so a
-// length describes the sampler, not the picture; quantising it finely would
-// shatter the vocabulary along an axis that carries no signal. The band is kept
-// because it conditions the colour deltas: a strong |dV| across a short hop and
-// the same |dV| across a long one are different events.
+// **Neither the hop lengths nor the turn angle enter the word.** Both are drawn
+// by the sampler rather than read off the image, and including them cost more
+// than half the recall — see `constants.js`, "What a word is made of", for the
+// numbers. They survive as continuous values in `tripleFeatures`, for a
+// comparison rather than a partition.
 
 const {
     DELTA_LEVELS,
     DELTA_LEVEL_EDGES,
     MAX_WORD_VARIANTS,
-    SCALE_LEVELS,
-    SCALE_LEVEL_EDGES,
-    TURN_LEVELS,
     WORD_CARDINALITY,
     WORD_EDGE_TOLERANCE,
 } = require('./constants');
-const { edgesFromLocal, wrapAngle, TWO_PI } = require('./geometry');
-
-const TURN_BIN = TWO_PI / TURN_LEVELS;
+const { edgesFromLocal, wrapAngle } = require('./geometry');
 
 /** Level of `value` against ascending upper edges, plus its distance to the
  *  nearest edge and the level on the other side of it. */
@@ -62,40 +55,20 @@ function levelWithNeighbour(value, edges, tolerance) {
     return { level, alternative, gap: bestGap };
 }
 
-/** The same, for the cyclic turn angle: uniform bins that wrap at +/- pi. */
-function turnLevelWithNeighbour(turn) {
-    const wrapped = wrapAngle(turn);
-    const position = (wrapped + Math.PI) / TURN_BIN;
-    const level = Math.min(TURN_LEVELS - 1, Math.max(0, Math.floor(position)));
-    const lower = (position - level) * TURN_BIN;
-    const upper = TURN_BIN - lower;
-    if (!(Math.min(lower, upper) < WORD_EDGE_TOLERANCE.turn)) {
-        return { level, alternative: null, gap: Infinity };
-    }
-    const goDown = lower <= upper;
-    return {
-        level,
-        alternative: (level + (goDown ? TURN_LEVELS - 1 : 1)) % TURN_LEVELS,
-        gap: Math.min(lower, upper),
-    };
-}
-
 /**
- * The eight quantised dimensions of one triple, in word order.
- * `edges[k]` and `edges[k+1]` are the two hops; `deltas` are their colour
- * deltas, chain-forward.
+ * The six quantised dimensions of one triple, in word order: the colour deltas
+ * of its two hops, chain-forward.
+ *
+ * The two edges stay in the signature because a triple *is* the pair of hops —
+ * a caller that had only the deltas could not tell which pair it held — but
+ * their geometry no longer reaches the word. See the module header.
  */
 function tripleDimensions(firstEdge, secondEdge, firstDelta, secondDelta) {
-    const scale = (firstEdge.length + secondEdge.length) / 2;
-    return [
-        { ...levelWithNeighbour(scale, SCALE_LEVEL_EDGES, WORD_EDGE_TOLERANCE.scale), radix: SCALE_LEVELS },
-        { ...turnLevelWithNeighbour(secondEdge.direction - firstEdge.direction), radix: TURN_LEVELS },
-        ...[firstDelta[0], firstDelta[1], firstDelta[2], secondDelta[0], secondDelta[1], secondDelta[2]]
-            .map((value) => ({
-                ...levelWithNeighbour(value, DELTA_LEVEL_EDGES, WORD_EDGE_TOLERANCE.delta),
-                radix: DELTA_LEVELS,
-            })),
-    ];
+    return [firstDelta[0], firstDelta[1], firstDelta[2], secondDelta[0], secondDelta[1], secondDelta[2]]
+        .map((value) => ({
+            ...levelWithNeighbour(value, DELTA_LEVEL_EDGES, WORD_EDGE_TOLERANCE.delta),
+            radix: DELTA_LEVELS,
+        }));
 }
 
 /** Mixed-radix pack of one level vector into a single word id. */
@@ -175,7 +148,11 @@ function constellationWordsFromLocal(local, edgeDeltas) {
  * threw away, and they are what lets a rerank distinguish two candidates that
  * the vocabulary cannot.
  *
- * Order matches `tripleDimensions`, so the two can be read side by side.
+ * The first two — mean hop length and turn angle — are here and *only* here.
+ * They are drawn by the sampler, so quantising them into the vocabulary buys
+ * nothing and costs a great deal (see the module header); comparing two
+ * measured values of them is a different question and a legitimate one.
+ * The remaining six line up with `tripleDimensions` in order.
  */
 function tripleFeatures(edges, edgeDeltas, index) {
     const first = edges[index];
@@ -216,7 +193,6 @@ function allWords(triples) {
 }
 
 module.exports = {
-    TURN_BIN,
     allWords,
     constellationWords,
     constellationWordsFromLocal,
@@ -227,5 +203,4 @@ module.exports = {
     tripleFeatureDistance,
     tripleFeatures,
     tripleWords,
-    turnLevelWithNeighbour,
 };

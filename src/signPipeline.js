@@ -20,6 +20,7 @@
 
 const path = require('path');
 const settings = require('./settings');
+const { SignStore } = require('./lib/cheetah/signStore');
 const { createRandom } = require('./lib/sign/rng');
 const { loadImagePixels, sampleSigns } = require('./lib/sign/sampler');
 const {
@@ -82,10 +83,11 @@ async function trainImage(store, imagePath, {
     const { wordCounts, written } = await store.putSigns(imageId, signs);
     onProgress?.({ stage: 'stored', filename, records: written, words: wordCounts.size });
 
-    const { edges } = await store.commitGraph(imageId, filename, wordCounts);
+    const { edges, maxCount } = await store.commitGraph(imageId, filename, wordCounts);
     const record = await store.markComplete(imageId, {
         constellations: signs.length,
         words: wordCounts.size,
+        signature_norm: SignStore.signatureNorm(wordCounts, maxCount),
         working_width: meta.width,
         working_height: meta.height,
     });
@@ -201,13 +203,17 @@ async function trainImageAdaptive(store, imagePath, {
             }
 
             const chunk = await store.putSigns(imageId, signs, { startOrdinal: signCount });
-            const touched = new Map();
             for (const [word, observations] of chunk.wordCounts) {
-                const total = (cumulativeWords.get(word) || 0) + observations;
-                cumulativeWords.set(word, total);
-                touched.set(word, total);
+                cumulativeWords.set(word, (cumulativeWords.get(word) || 0) + observations);
             }
-            const published = await store.commitGraph(imageId, filename, touched);
+            // The **whole** signature is republished, not only the words this
+            // chunk touched. A weight is relative to the image's most frequent
+            // word, and that maximum moves as chunks arrive: republishing a
+            // subset would leave the untouched words divided by a stale one.
+            // Affordable only because the vocabulary is 4096 words — the
+            // signature has a bounded size, so "publish the signature" is a
+            // bounded operation no matter how long the image trains.
+            const published = await store.commitGraph(imageId, filename, cumulativeWords);
 
             signCount += signs.length;
             written += chunk.written;
@@ -215,6 +221,10 @@ async function trainImageAdaptive(store, imagePath, {
             await store.updateImage(imageId, {
                 constellations: signCount,
                 words: cumulativeWords.size,
+                // Updated every chunk because the probes below search against
+                // this record: a stale norm would measure the image the corpus
+                // held one chunk ago.
+                signature_norm: SignStore.signatureNorm(cumulativeWords, published.maxCount),
             });
             onProgress?.({
                 stage: 'chunk',
@@ -294,6 +304,7 @@ async function trainImageAdaptive(store, imagePath, {
     const record = await store.markComplete(imageId, {
         constellations: signCount,
         words: cumulativeWords.size,
+        signature_norm: SignStore.signatureNorm(cumulativeWords),
         working_width: meta.width,
         working_height: meta.height,
         training: 'adaptive',
@@ -476,17 +487,17 @@ async function extendImage(store, imagePath, {
     const { record: reopened, release } = await store.reopenImage(imageId);
     try {
         const chunk = await store.putSigns(imageId, signs, { startOrdinal: from });
-        const touched = new Map();
         for (const [word, observations] of chunk.wordCounts) {
-            const total = (cumulative.get(word) || 0) + observations;
-            cumulative.set(word, total);
-            touched.set(word, total);
+            cumulative.set(word, (cumulative.get(word) || 0) + observations);
         }
-        const published = await store.commitGraph(imageId, filename, touched);
+        // The whole signature, for the reason the chunked trainer documents:
+        // the weights are relative to a maximum this top-up has just moved.
+        const published = await store.commitGraph(imageId, filename, cumulative);
         const signCount = from + signs.length;
         const record = await store.markComplete(imageId, {
             constellations: signCount,
             words: cumulative.size,
+            signature_norm: SignStore.signatureNorm(cumulative, published.maxCount),
             // How the image was originally trained is not changed by extending
             // it; how often it has been extended is worth keeping, because "this
             // image has been topped up four times and is still behind" is the
@@ -681,23 +692,30 @@ function inverseDocumentFrequency(documentFrequency, corpusSize) {
 /**
  * Running per-image evidence, folded one recall batch at a time.
  *
- * Two corrections are applied to what the graph reports, and neither is
- * something the graph could apply itself:
+ * This is a tf-idf cosine, assembled from the three pieces that live in three
+ * different places, and every one of them is load-bearing:
  *
- *   - **Rarity.** A converging seed is worth its idf, not one vote. Without it
- *     a search is decided by whichever words happen to be common.
- *   - **Length.** An image that published many distinct words is more likely to
- *     be hit by *any* query word, so its raw mass is divided by a length norm.
+ *   - **The image's term frequency** arrives as the seed's `activation`, which
+ *     is the graph edge weight, which `SignStore.commitGraph` set to the word's
+ *     frequency relative to that image's most frequent word.
+ *   - **The query's term frequency** is counted here, per round, the same way
+ *     ingestion counts: once per constellation that produced the word. Treating
+ *     the query as a *set* instead is what the previous revision did, and on a
+ *     dense vocabulary it is fatal — a 96-constellation query touches nearly
+ *     every word at least once, so membership distinguishes nothing.
+ *   - **Rarity** is `idf`, from the word's out-degree in the graph, applied to
+ *     both sides of the product as in the textbook form.
  *
- * The length norm is **pivoted**, not `sqrt(vocabulary)`, and that is a fix for
- * a measured failure rather than a preference. Vocabulary size across a real
- * corpus is not smooth: on `sample_images/` four flat images publish 261-280
- * words while the rest publish 788-1696, a 6.5x spread. Dividing by `sqrt` hands
- * the small end a ~2.5x advantage, and those four images were involved in six of
- * eight rank-1 failures — three of them won searches belonging to other images
- * outright. Pivoted normalisation interpolates between "no correction" and
- * "fully proportional" with a slope, which is the standard remedy for exactly
- * this over-correction.
+ * The sum is then divided by the image's own `signature_norm`. Without it an
+ * image simply collects more terms for being larger. Measured on 100 images at
+ * 1024 constellations, ranking by exactly these numbers:
+ *
+ *     membership x idf / pivoted word count   (what shipped)   10/100
+ *     query tf x weight x idf, unnormalised                    19/100
+ *     query tf x weight x idf / signature norm                 94/100
+ *
+ * `lengthSlope` survives as an escape hatch for a corpus without stored norms:
+ * at slope 0 it is inert, which is the default now that the real norm exists.
  */
 /**
  * How many of these matched triples are *independent* evidence.
@@ -747,10 +765,20 @@ class Evidence {
         this.seeds = 0;
     }
 
-    /** `(1 - s) + s * |d| / avg|d|`: s = 0 ignores length, s = 1 is proportional. */
-    lengthNorm(words) {
+    /**
+     * The cosine denominator: the image's own signature norm, times the pivoted
+     * word-count correction when one was asked for.
+     *
+     * `(1 - s) + s * |d| / avg|d|` is inert at s = 0, which is the default. It
+     * is kept because it is the only correction available against a record
+     * written before `signature_norm` existed.
+     */
+    lengthNorm(words, norm) {
+        const stored = Number(norm);
+        const base = Number.isFinite(stored) && stored > 0 ? stored : 1;
+        if (this.lengthSlope === 0) return base;
         const relative = (Number(words) || 0) / this.averageWords;
-        return Math.max(1e-6, (1 - this.lengthSlope) + this.lengthSlope * relative);
+        return base * Math.max(1e-6, (1 - this.lengthSlope) + this.lengthSlope * relative);
     }
 
     /**
@@ -778,13 +806,14 @@ class Evidence {
      * them, so at `chainBonus = 0` this is arithmetically the old sum, to the
      * last bit — the knob is off by default and turning it off is exact.
      */
-    fold(results, degrees, origins = null) {
+    fold(results, degrees, origins = null, queryCounts = null) {
         const grouped = this.chainBonus > 0 && origins;
         for (const result of results) {
             const current = this.byImage.get(result.imageId) || {
                 imageId: result.imageId,
                 filename: result.filename,
                 words: result.words,
+                norm: result.norm,
                 rawMass: 0,
                 sources: 0,
                 // How much of this image's evidence came from constellations
@@ -793,10 +822,17 @@ class Evidence {
             };
             const perSign = grouped ? new Map() : null;
             for (const seed of result.seeds) {
-                const weight = seed.activation * inverseDocumentFrequency(
+                const idf = inverseDocumentFrequency(
                     degrees.get(seed.word) || 1,
                     this.corpusSize
                 );
+                // idf on both sides, as in the cosine of two tf-idf vectors:
+                // one factor belongs to the stored term, one to the measured
+                // one. The query's own norm is constant across candidates and
+                // therefore left out of the ranking entirely.
+                const queryTf = queryCounts ? (queryCounts.get(seed.word) || 0) : 1;
+                if (queryTf === 0) continue;
+                const weight = queryTf * seed.activation * idf * idf;
                 const producers = grouped ? origins.get(seed.word) : null;
                 if (!producers || producers.length === 0) {
                     current.rawMass += weight;
@@ -827,7 +863,7 @@ class Evidence {
         const entries = [...this.byImage.values()]
             .map((entry) => ({
                 ...entry,
-                mass: entry.rawMass / this.lengthNorm(entry.words),
+                mass: entry.rawMass / this.lengthNorm(entry.words, entry.norm),
             }))
             .sort((left, right) => right.mass - left.mass);
         const total = entries.reduce((sum, entry) => sum + entry.mass, 0);
@@ -843,19 +879,31 @@ class Evidence {
  *
  * A word no image has ever produced has nothing to activate, and a word nearly
  * every image produces activates the whole corpus equally — both only spend
- * budget. What is left is ordered by rarity, so that when the round's seed
- * allowance runs out it is the least informative words that get dropped.
+ * budget. What is left is ordered by how much evidence it would carry, so that
+ * when the round's seed allowance runs out it is the least informative words
+ * that get dropped.
+ *
+ * Ordering is by `query frequency x idf`, not by rarity alone. Rarity alone was
+ * right when a word was a near-unique token and seeing it once was the whole
+ * signal; with a vocabulary a query re-enters many times, a common word the
+ * query produced nine times says more than a rare one it produced once, and
+ * dropping the former to keep the latter throws away most of the round.
  *
  * The ceiling has a floor of two images: on a small corpus almost every word
  * is "common", and filtering by share alone would leave a search with nothing
  * to ask about.
  */
-function selectSeeds(words, degrees, { corpusSize, stopWordImageRatio, limit }) {
+function selectSeeds(words, degrees, { corpusSize, stopWordImageRatio, limit, queryCounts = null }) {
     const ceiling = Math.max(2, Math.round(corpusSize * stopWordImageRatio));
     return words
-        .map((word) => ({ word, degree: degrees.get(word) || 0 }))
+        .map((word) => ({
+            word,
+            degree: degrees.get(word) || 0,
+            value: (queryCounts ? (queryCounts.get(word) || 1) : 1)
+                * inverseDocumentFrequency(degrees.get(word) || 1, corpusSize),
+        }))
         .filter((entry) => entry.degree > 0 && entry.degree <= ceiling)
-        .sort((left, right) => left.degree - right.degree)
+        .sort((left, right) => right.value - left.value)
         .slice(0, limit)
         .map((entry) => entry.word);
 }
@@ -963,9 +1011,19 @@ async function rerankWithField(store, evidence, querySigns, {
  * much measuring it took — the last one being the number the specification
  * actually cares about.
  */
+/**
+ * `rerank` is **off by default**, and that is a measurement rather than a
+ * preference. The field scores never reorder the ranking — they ride along as
+ * evidence about it — and they have never once beaten the graph they annotate:
+ * 5/20, 6/20 and 8/20 against 16/20 on the old representation, 19/100, 27/100
+ * and 29/100 against 87/100 on the current one. They cost 7.0 s of a 7.8 s
+ * search at corpus 100, because each one hydrates candidate constellations to
+ * compare colour fields. `--rerank` asks for them when the question is "what do
+ * the field scores say", which is the only question they answer.
+ */
 async function searchImage(store, imagePath, {
     onRound = null,
-    rerank = true,
+    rerank = false,
     ...overrides
 } = {}) {
     const search = { ...settings.sign.search, ...overrides };
@@ -1012,7 +1070,13 @@ async function searchImage(store, imagePath, {
         // takes — but the fold needs to know which of them came from the same
         // chain, or a chain is worth no more than its triples scattered.
         const origins = new Map();
+        // How many of this round's constellations asked for each word — the
+        // query side's term frequency. Counted once per constellation, exactly
+        // as `putSigns` counts the stored side, so the two are the same
+        // measurement and their product means something.
+        const queryCounts = new Map();
         batch.forEach((sign, signIndex) => {
+            const seenBySign = new Set();
             for (const triple of sign.triples) {
                 for (const word of triple.words) {
                     const producers = origins.get(word) || [];
@@ -1020,6 +1084,9 @@ async function searchImage(store, imagePath, {
                         producers.push({ sign: signIndex + evidence.rounds * search.batchSize, triple: triple.index });
                     }
                     origins.set(word, producers);
+                    if (seenBySign.has(word)) continue;
+                    seenBySign.add(word);
+                    queryCounts.set(word, (queryCounts.get(word) || 0) + 1);
                 }
             }
         });
@@ -1033,10 +1100,17 @@ async function searchImage(store, imagePath, {
             corpusSize: corpus.size,
             stopWordImageRatio: search.stopWordImageRatio,
             limit: search.seedsPerRound,
+            queryCounts,
         });
         evidence.seeds += seeds.length;
 
-        if (seeds.length > 0) evidence.fold(await store.recallImages(seeds), degreeCache, origins);
+        if (seeds.length > 0) {
+            // The recall must be able to answer for the whole corpus: the
+            // caller ranks the answer itself, so an image the graph left out of
+            // its own top-N is an image this search can never choose.
+            const results = await store.recallImages(seeds, { limit: Math.max(64, corpus.size) });
+            evidence.fold(results, degreeCache, origins, queryCounts);
+        }
 
         const ranked = evidence.ranked();
         onRound?.({

@@ -317,15 +317,18 @@ Training draws many constellations per image; searching draws as few as it can g
 
 ### How an image is found
 
-Each triple of consecutive points — two hops, their turn angle, and their six colour deltas — is
-quantised into one integer **word** out of a frozen vocabulary of 73 728. Words are the join key:
+Each triple of consecutive points — the six colour deltas of the two hops that meet at a point — is
+quantised into one integer **word** out of a frozen vocabulary of 4 096. Words are the join key:
 
 - Ingestion writes each constellation under `sc:` and one posting per word under `sw:`, then
   publishes the image's vocabulary into Cheetah's property graph as `word --sign--> image` edges.
-- A search measures a small batch of constellations, drops the words that are too common or unknown,
-  and hands the rest to **`GRAPH_RECALL` as seeds**. Activation spreads from all of them at once and
-  the graph answers which images they converge on, saying for each hit *which* seeds reached it.
-- The result is reweighted by word rarity and image vocabulary size, folded into a running belief,
+- A search measures a batch of constellations, counts how often each word came up, drops the words
+  no image has ever published, and hands the most informative to **`GRAPH_RECALL` as seeds**.
+  Activation spreads from all of them at once and the graph answers which images they converge on,
+  saying for each hit *which* seeds reached it and how strongly — and "how strongly" is the stored
+  word's own frequency, because that is what the edge weight holds.
+- The result is a tf-idf cosine: the query's count for a word times the image's, times the word's
+  rarity squared, divided by the image's stored signature norm. It is folded into a running belief,
   and the search stops as soon as one image is both dominant and clearly separated — or keeps
   measuring until the ceiling. This is the "as much as needed for a good confidence" loop.
 - The surviving candidates are scored with a **continuous colour field**: the constellation's three
@@ -711,33 +714,33 @@ All of these are read by [`src/settings.js`](src/settings.js) into `settings.sig
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SIGN_CONSTELLATIONS_PER_IMAGE` | `3600` | Fixed-density fallback used by `--no-adaptive`. Normal automatic training starts with one `SIGN_TRAIN_CHECK_EVERY` chunk when no count is supplied. |
+| `SIGN_CONSTELLATIONS_PER_IMAGE` | `1024` | Fixed-density fallback used by `--no-adaptive`. Normal automatic training starts with one `SIGN_TRAIN_CHECK_EVERY` chunk when no count is supplied. |
 | `SIGN_POINT_COUNT` | `7` | Points per constellation. Must be odd. A chain of `n` points yields `n − 2` triples, so the cost of every stage scales with it — see [Five points or seven](#five-points-or-seven). |
 | `SIGN_POINT_PATCH_REL` | `0.004` | Side of the square averaged per point, as a fraction of the shorter side. `0` reads exactly one pixel. |
 | `SIGN_WORKING_MAX_SIDE` | `1024` | Longest side the sampler decodes to. |
 | `SIGN_WITH_CENTRE_POSITION` | `false` | Record where the constellation centre sits in the frame. |
 | `SIGN_TRAIN_ADAPTIVE` | `true` | Train in chunks and let live validation choose each image's density. `--no-adaptive` requests the fixed fallback. |
-| `SIGN_TRAIN_CHECK_EVERY` | `512` | Constellations between two self-probes. |
-| `SIGN_TRAIN_PROBES` | `3` | Searches per checkpoint/review. Checkpoint seeds stay fixed within one ingest; rehearsal changes generation on every review. |
+| `SIGN_TRAIN_CHECK_EVERY` | `512` | Constellations between two self-probes. A checkpoint is `SIGN_TRAIN_PROBES` searches against the whole corpus, so its cost grows with the corpus while the chunk's does not. |
+| `SIGN_TRAIN_PROBES` | `2` | Searches per checkpoint/review. Checkpoint seeds stay fixed within one ingest; rehearsal changes generation on every review. |
 | `SIGN_TRAIN_MIN_GAIN` | `0.01` | A checkpoint must beat the best so far by this much, in accuracy **or** in search effort, or the run stops. |
 | `SIGN_TRAIN_STOP_MIN_HIT_RATE` | `1` | The stop rule only applies once this share of probes ranks the image first. Below it, a flat checkpoint means "not findable yet", not "trained enough". Deliberately not also gated on the confidence stop — see [Adaptive training](#adaptive-training-validation-chooses-the-density). |
 | `SIGN_TRAIN_MIN_CORPUS` | `4` | Below this many stored images there is nothing to be confused with, so one bootstrap chunk is written and rehearsal decides later. |
 | `SIGN_TRAIN_PROBE_MAX` | `96` | Ceiling on one probe search. Probes also run with the reranker off. |
-| `SIGN_TRAIN_EXTEND_TO` | `8192` | Finite automatic safety ceiling. `0` makes the nominal count a hard cap. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
+| `SIGN_TRAIN_EXTEND_TO` | `2048` | Finite automatic safety ceiling. `0` makes the nominal count a hard cap. `--extend-to <n>` (`benchmark.sh -e <n>`) overrides it per run. |
 | `SIGN_TRAIN_REVIEW` | `true` | Re-probe linked and newly trained images while the corpus grows, and top up any that are not found confidently. `--no-rehearse` opts out. See [Rehearsal](#rehearsal-keeping-every-image-findable-on-by-default). |
 | `SIGN_TRAIN_REVIEW_EVERY` | `4` | Images trained between two rehearsal passes. `0` rehearses only after the last image. |
 | `SIGN_TRAIN_REVIEW_SAMPLE` | `8` | Images probed per pass, least recently reviewed first. `0` reviews all of them, which is quadratic in corpus size. |
 | `SIGN_TRAIN_REVIEW_MIN_HIT_RATE` | `1` | Below this rank-1 rate an image is topped up. |
-| `SIGN_TRAIN_REVIEW_TOP_UP` | `512` | Constellations one top-up adds. One chunk, then the image is measured again on a later pass. |
-| `SIGN_TRAIN_REVIEW_CEILING` | `8192` | Total constellations an image may reach through top-ups. Some images are genuinely indistinguishable from a near-duplicate and no amount of evidence fixes that. |
+| `SIGN_TRAIN_REVIEW_TOP_UP` | `256` | Constellations one top-up adds. One chunk, then the image is measured again on a later pass. |
+| `SIGN_TRAIN_REVIEW_CEILING` | `2048` | Total constellations an image may reach through top-ups. Some images are genuinely indistinguishable from a near-duplicate and no amount of evidence fixes that. |
 | `SIGN_TRAIN_REVIEW_PATIENCE` | `2` | Top-ups an image may absorb without improving on its own best accuracy before rehearsal gives up on it (`no gain from top-ups`). The ceiling alone bounds spending at `(ceiling - density) / top-up` per image — on a 199-image corpus, nine 512-constellation top-ups for every image any probe misses. `0` restores ceiling-only termination. |
 | `SIGN_TRAIN_REVIEW_FINAL_PASSES` | `2` | Consecutive clean full-corpus cycles required at the end. A top-up resets the streak. |
-| `SIGN_SEARCH_BATCH` | `12` | Constellations measured per search round. |
-| `SIGN_SEARCH_MIN_CONSTELLATIONS` | `24` | Never stop before this many have been measured. |
-| `SIGN_SEARCH_MAX_CONSTELLATIONS` | `720` | Ceiling on one search. |
-| `SIGN_SEARCH_STOPWORD_RATIO` | `0.6` | A word carried by more than this share of the corpus is not worth a seed. |
-| `SIGN_SEARCH_SEEDS_PER_ROUND` | `96` | Recall seeds per round, rarest first. |
-| `SIGN_SEARCH_LENGTH_SLOPE` | `0.5` | Pivoted correction for how many words an image published. This is the measured companion to default selective rehearsal (19/20 versus 14/20 at slope 0). Uniform fixed-density experiments can set `0`. |
+| `SIGN_SEARCH_BATCH` | `96` | Constellations measured per search round. Not just a granularity knob: the resolver scores on the query's *term frequency*, and a round too small to have one measures nothing. Measured at a 192 ceiling on 37 images — batch 24: 32/37 at 0.95 s, batch 48: 34/37 at 0.52 s, batch 96: 35/37 at 0.37 s. |
+| `SIGN_SEARCH_MIN_CONSTELLATIONS` | `96` | Never stop before this many have been measured. |
+| `SIGN_SEARCH_MAX_CONSTELLATIONS` | `192` | Ceiling on one search. Measured on 100 images at 1024 constellations each — 48: 80/100, 96: 95/100, 192: 96/100, 480: 97/100. |
+| `SIGN_SEARCH_STOPWORD_RATIO` | `1` | A word carried by more than this share of the corpus is not worth a seed. `1` disables the filter, which is right now that a word is a cell of a 4 096-cell distribution: a word every image produces still separates them by *how often* each produces it, and `idf` already discounts it. |
+| `SIGN_SEARCH_SEEDS_PER_ROUND` | `192` | Recall seeds per round, ordered by `query frequency × idf`. Cheetah takes 32 seeds per `GRAPH_RECALL`, so this is also the round-trip count. |
+| `SIGN_SEARCH_LENGTH_SLOPE` | `0` | Pivoted correction for how many words an image published, applied **on top of** the image's stored `signature_norm`. `0` because that norm is now a real cosine denominator and stacking the two over-corrects; this knob was its stand-in while the resolver had no access to one. |
 | `SIGN_SEARCH_CHAIN_BONUS` | `0` | How much a constellation that agrees with itself outweighs the same triples arriving separately: each group of seeds from one measured sign is scaled by `1 + bonus × (agreeing triples − 1)`. `0` is the historical bag-of-words fold. **Raising it widens the leader/runner-up ratio, so `SIGN_SEARCH_SEPARATION` must be raised with it** — left at 1.35, a bonus of 1 stopped the median search after 24 constellations instead of 480. See [Five points or seven](#five-points-or-seven). |
 | `SIGN_SEARCH_CONFIDENCE_MULTIPLE` | `2` | How far above an even split (`1/corpus`) the leader must be to stop. A multiple, not a share — a share cannot survive a change of corpus size. |
 | `SIGN_SEARCH_SEPARATION` | `1.35` | How far ahead of the runner-up the leader must be. The criterion that actually carries the signal. |

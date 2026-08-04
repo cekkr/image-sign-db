@@ -235,7 +235,12 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
     // would encode a property the pipeline does not have — the rerank rides
     // along as evidence and reorders nothing.
     await t.test('the field rerank reports a score for every candidate it sees', async () => {
-        const result = await searchImage(store, files[1], { seed: 'rerank', maxConstellations: 120 });
+        // `rerank: true` explicitly, because it is opt-in: the scores cost more
+        // than the rest of a search and have never beaten the ranking they
+        // annotate, so nothing computes them unless it was asked to.
+        const result = await searchImage(store, files[1], {
+            seed: 'rerank', maxConstellations: 120, rerank: true,
+        });
         const scored = result.candidates.filter((candidate) => Number.isFinite(candidate.fieldScore));
         assert.ok(scored.length > 0, 'the rerank produced no field scores at all');
         for (const candidate of scored) {
@@ -413,7 +418,8 @@ test('sign pipeline round-trip', { skip: ENABLED ? false : 'set CHEETAH_INTEGRAT
         // quantisation edge comes back in the neighbouring cell: measured at
         // ~0.15% of triples. Every such flip moves one observation from one word
         // to another, so each affected count is off by exactly one — an edge
-        // weight moved by at most 1/TF_SATURATION for a handful of words. What
+        // weight moved by one observation out of the image's maximum, for a
+        // handful of words out of thousands. What
         // must hold is that the rebuild is faithful in bulk and never silently
         // collapses; asserting bit-equality here would be asserting something
         // the stored record cannot deliver.

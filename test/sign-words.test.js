@@ -25,14 +25,11 @@ const {
     tripleFeatureDistance,
     tripleFeatures,
     tripleWords,
-    turnLevelWithNeighbour,
 } = require('../src/lib/sign/words');
 const {
     DELTA_LEVELS,
     DELTA_LEVEL_EDGES,
     MAX_WORD_VARIANTS,
-    SCALE_LEVEL_EDGES,
-    TURN_LEVELS,
     WORD_CARDINALITY,
     WORD_EDGE_TOLERANCE,
 } = require('../src/lib/sign/constants');
@@ -70,18 +67,48 @@ test('only a value near an edge offers the neighbouring level', () => {
     assert.equal(levelWithNeighbour(first, DELTA_LEVEL_EDGES, 0).alternative, null);
 });
 
-test('the turn angle wraps at both ends of its range', () => {
-    const bin = (Math.PI * 2) / TURN_LEVELS;
-    assert.equal(turnLevelWithNeighbour(-Math.PI + bin / 2).level, 0);
-    assert.equal(turnLevelWithNeighbour(Math.PI - bin / 2).level, TURN_LEVELS - 1);
+test('hop geometry does not reach the word', () => {
+    // The sampler draws every hop's radius and bearing, so the mean hop length
+    // and the turn between two hops describe the draw. A word that moved with
+    // them scattered each real observation across 18 arbitrary cells: measured
+    // on 100 images, rank-1 45/100 with them against 93/100 without.
+    const deltaA = [0.01, 0.20, 0.40];
+    const deltaB = [0.30, 0.05, 0.60];
+    const reference = tripleWords(
+        { length: 0.05, direction: 0 },
+        { length: 0.06, direction: 0.1 },
+        deltaA,
+        deltaB
+    );
+    for (const [first, second] of [
+        [{ length: 0.4, direction: 2 }, { length: 0.02, direction: -3 }],
+        [{ length: 0.19, direction: -1.2 }, { length: 0.3, direction: 3.1 }],
+        [{ length: 0.11, direction: Math.PI }, { length: 0.17, direction: -Math.PI }],
+    ]) {
+        assert.deepEqual(
+            tripleWords(first, second, deltaA, deltaB),
+            reference,
+            'only the colour deltas may decide a word'
+        );
+    }
 
-    // Just inside the lowest bin: the neighbour across the wrap is the highest.
-    const low = turnLevelWithNeighbour(-Math.PI + WORD_EDGE_TOLERANCE.turn / 2);
-    assert.equal(low.level, 0);
-    assert.equal(low.alternative, TURN_LEVELS - 1);
+    // And the colours alone must still move it.
+    assert.notDeepEqual(
+        tripleWords({ length: 0.05, direction: 0 }, { length: 0.06, direction: 0.1 }, deltaB, deltaA),
+        reference
+    );
+});
 
-    // The middle of a bin has no neighbour within tolerance.
-    assert.equal(turnLevelWithNeighbour(-Math.PI + bin / 2).alternative, null);
+test('the vocabulary is the six colour-delta levels and nothing else', () => {
+    assert.equal(WORD_CARDINALITY, DELTA_LEVELS ** 6);
+    const dimensions = tripleDimensions(
+        { length: 0.1, direction: 0 },
+        { length: 0.1, direction: 1 },
+        [0.5, 0.5, 0.5],
+        [0.5, 0.5, 0.5]
+    );
+    assert.equal(dimensions.length, 6);
+    assert.ok(dimensions.every((dimension) => dimension.radix === DELTA_LEVELS));
 });
 
 test('every word is inside the frozen vocabulary and stable', () => {
@@ -103,8 +130,8 @@ test('every word is inside the frozen vocabulary and stable', () => {
 });
 
 test('the primary word is the cell the measurement fell in', () => {
-    const first = edge(SCALE_LEVEL_EDGES[0] / 2, 0);
-    const second = edge(SCALE_LEVEL_EDGES[0] / 2, 0);
+    const first = edge(0.05, 0);
+    const second = edge(0.05, 0);
     const flat = [0.5, 0.5, 0.5];
     const dimensions = tripleDimensions(first, second, flat, flat);
     const expected = packWord(dimensions, dimensions.map((dimension) => dimension.level));
@@ -114,8 +141,7 @@ test('the primary word is the cell the measurement fell in', () => {
 test('a measurement on a level edge asks for both sides', () => {
     const onEdge = DELTA_LEVEL_EDGES[1] - WORD_EDGE_TOLERANCE.delta / 4;
     const clear = 0.5;
-    // A turn in the middle of its bin and a scale far from any band edge, so
-    // the colour delta is the only sweepable dimension.
+    // Every other delta sits far from an edge, so one dimension is sweepable.
     const first = edge(0.05, 0);
     const second = edge(0.05, Math.PI / 6);
 
@@ -136,12 +162,7 @@ test('a measurement on a level edge asks for both sides', () => {
 test('the sweep is capped even when everything sits on an edge', () => {
     const nudge = WORD_EDGE_TOLERANCE.delta / 4;
     const onEdge = DELTA_LEVEL_EDGES.map((value) => value - nudge);
-    const words = tripleWords(
-        edge(SCALE_LEVEL_EDGES[0] - WORD_EDGE_TOLERANCE.scale / 4, 0),
-        edge(SCALE_LEVEL_EDGES[0] - WORD_EDGE_TOLERANCE.scale / 4, 0),
-        onEdge,
-        onEdge
-    );
+    const words = tripleWords(edge(0.1, 0), edge(0.1, 0), onEdge, onEdge);
     assert.equal(words.length, MAX_WORD_VARIANTS);
 });
 

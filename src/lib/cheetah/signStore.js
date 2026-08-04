@@ -36,14 +36,29 @@ const DEFAULT_SCAN_LIMIT = 500;
 const EDGE_BATCH_SIZE = 250;
 
 /**
- * Observations of a word inside one image at which its edge weight saturates.
+ * An edge weight is the word's **relative** frequency inside the image:
+ * `count / max(count)`, so the most frequent word of an image weighs 1 and
+ * everything else sits below it in proportion.
  *
  * Cheetah clamps an edge weight into [0,1] before using it as activation
- * (graph_recall.go → graphRecallAffinity), so a raw count would be flattened to
- * 1 the moment it exceeded one. Saturating explicitly keeps the difference
- * between "seen once, possibly noise" and "seen repeatedly" visible.
+ * (graph_recall.go → graphRecallAffinity), so a raw count cannot travel; the
+ * question is only what to divide by. It used to be a constant 3 — anything
+ * seen three times or more weighed the same as anything seen a thousand times —
+ * and that is the whole of the term frequency, thrown away. At the densities
+ * this pipeline trains at, nearly every word of an image clears 3, so nearly
+ * every edge weighed exactly 1 and the graph could only answer "does this image
+ * contain this word", which on a 4096-word vocabulary is true of almost every
+ * pair. Measured on `sample_images/`, 100 images at 1024 constellations: a
+ * resolver reading membership scores 10/100, one reading these weights 94/100.
+ *
+ * Dividing by the image's own maximum, rather than by its total, is what makes
+ * the scale comparable between an image trained at 512 constellations and one
+ * topped up to 4096. The per-image scale factor it leaves behind is divided out
+ * by `signature_norm` at query time.
  */
-const TF_SATURATION = 3;
+function relativeFrequency(count, maxCount) {
+    return count / Math.max(1, maxCount);
+}
 
 const EDGE_TYPE = 'sign';
 
@@ -72,8 +87,9 @@ class SignStore extends CheetahDatabase {
             writeBatchSize: options.writeBatchSize,
             scanLimit: DEFAULT_SCAN_LIMIT,
         });
-        this.tfSaturation = Math.max(1, Number(options.tfSaturation) || TF_SATURATION);
         this.imageRecords = new Map();
+        // word -> how many images publish it. See `wordDegrees`.
+        this.degreeCache = new Map();
         // Images the read path surfaces even though their record is still
         // incomplete. See `readWhileIncomplete`.
         this.incompleteReadable = new Set();
@@ -81,6 +97,7 @@ class SignStore extends CheetahDatabase {
 
     clearCaches() {
         this.imageRecords.clear();
+        this.degreeCache.clear();
     }
 
     /**
@@ -273,8 +290,18 @@ class SignStore extends CheetahDatabase {
      * Edges are word -> image so that a search seeds words and spreads *out* to
      * images in a single hop. The reverse direction would make every recall walk
      * an image node's thousands of edges.
+     *
+     * `wordCounts` must be the image's **cumulative** counts, not one chunk's:
+     * a weight is relative to the image's most frequent word, so republishing a
+     * chunk's own counts would rescale every word the chunk touched against the
+     * wrong maximum. Both callers already carry the running totals for the
+     * separate reason that a weight must never fall; this is the second.
+     *
+     * `maxCount` is the maximum over the **whole** image, which is why it is a
+     * parameter: a top-up publishes only the words it touched and cannot see the
+     * others' counts, but it must still divide by the same number they did.
      */
-    async commitGraph(imageId, filename, wordCounts) {
+    async commitGraph(imageId, filename, wordCounts, { maxCount = null } = {}) {
         const imageNode = keys.imageNodeId(imageId);
         await this.setNode({
             id: imageNode,
@@ -282,10 +309,13 @@ class SignStore extends CheetahDatabase {
             props: { filename },
         });
 
+        const peak = maxCount === null
+            ? Math.max(1, ...wordCounts.values())
+            : Math.max(1, maxCount);
         const items = [...wordCounts.entries()].map(([word, count]) => ({
             from: keys.wordNodeId(word),
             to: imageNode,
-            weight: Math.min(1, count / this.tfSaturation),
+            weight: relativeFrequency(count, peak),
         }));
 
         let applied = 0;
@@ -301,9 +331,44 @@ class SignStore extends CheetahDatabase {
                     `for image ${imageId}; the word index would have holes in it`
                 );
             }
+            // A degree changes only when an edge is *created*: re-publishing a
+            // word this image already had moves its weight, not the number of
+            // images that carry it. The batch reports how many it created but
+            // not which, so a batch that created any evicts all of its words —
+            // conservative, and still exact. This is what keeps the degree
+            // table warm through the later chunks of a long ingest, where every
+            // edge is an update and nothing needs evicting at all.
+            if (result.created > 0) {
+                for (const item of batch) this.degreeCache.delete(keys.parseWordNodeId(item.from));
+            }
             applied += result.applied;
         }
-        return { edges: items.length, applied };
+        return { edges: items.length, applied, maxCount: peak };
+    }
+
+    /**
+     * The L2 norm of an image's published weight vector.
+     *
+     * A search sums `query tf x edge weight x idf` over the words it measured,
+     * and an image that published more words — because it is busier, or because
+     * rehearsal topped it up — collects more of those terms for no reason other
+     * than its own size. Dividing by this is the cosine denominator, and it is
+     * the difference between 19/100 and 93/100 on the measured corpus; the
+     * pivoted word-count norm it replaces was a proxy for it that only worked
+     * while the vocabulary was sparse enough for membership to be the signal.
+     *
+     * Computed here, from the same cumulative counts the edges were published
+     * from, so it always describes the vector the graph actually holds.
+     */
+    static signatureNorm(wordCounts, maxCount = null) {
+        const peak = maxCount === null
+            ? Math.max(1, ...wordCounts.values())
+            : Math.max(1, maxCount);
+        let total = 0;
+        for (const count of wordCounts.values()) {
+            total += relativeFrequency(count, peak) ** 2;
+        }
+        return Math.sqrt(total) || 1;
     }
 
     // -- retrieval ----------------------------------------------------------
@@ -314,23 +379,48 @@ class SignStore extends CheetahDatabase {
      * This is the document frequency, and it is what makes a search selective:
      * a word carried by most of the corpus says nothing about which image is in
      * front of us, and seeding a recall with it only spends budget.
+     *
+     * **Cached across searches, and it has to be.** A degree is one
+     * `GRAPH_DEGREE` per word, and the server answers it by counting that
+     * word's adjacency — so the cost of asking is proportional to the corpus,
+     * and a search asks for ~250 of them per round. Measured at corpus 100 with
+     * an uncached table, `wordDegrees` was **1.86 s of a 3.68 s search**: half
+     * the search spent re-deriving numbers that had not changed since the last
+     * one. The vocabulary is 4 096 words, so the whole table is 4 096 integers
+     * and holding it is not a trade-off.
+     *
+     * Correctness comes from `commitGraph` being the only thing that can change
+     * a degree, and from it evicting exactly the words it published. A word no
+     * commit has touched keeps its count for as long as the process runs.
      */
     async wordDegrees(words) {
         const unique = [...new Set(words)];
-        const degrees = await Promise.all(unique.map((word) =>
-            this.degree({ id: keys.wordNodeId(word), direction: 'out', type: EDGE_TYPE })
-        ));
-        return new Map(unique.map((word, index) => [word, degrees[index].degree]));
+        const missing = unique.filter((word) => !this.degreeCache.has(word));
+        if (missing.length > 0) {
+            const degrees = await Promise.all(missing.map((word) =>
+                this.degree({ id: keys.wordNodeId(word), direction: 'out', type: EDGE_TYPE })
+            ));
+            missing.forEach((word, index) => this.degreeCache.set(word, degrees[index].degree));
+        }
+        return new Map(unique.map((word) => [word, this.degreeCache.get(word)]));
     }
 
     /**
      * Ask the graph which images these words have in common.
      *
      * `hops: 1` and `decay: 1` because the walk is exactly one edge long — word
-     * to image — so there is no distance to discount; the ranking that matters
-     * is the server's noisy-OR over how many seeds converged.
+     * to image — so there is no distance to discount. The server's own noisy-OR
+     * ranking is *not* what is read back: the caller re-weights every `sources`
+     * entry by rarity, query frequency and image norm, so what this needs from
+     * the graph is the posting lists, complete.
+     *
+     * "Complete" is why `limit` defaults high and `precision` low. A cut-off
+     * here is invisible downstream — the image simply never appears — and with
+     * a vocabulary this dense every corpus member is legitimately touched by
+     * almost every seed, so a `limit` of 32 silently answered a different
+     * question on any corpus larger than that. Pass the corpus size.
      */
-    async recallImages(words, { limit = 32, minSources = 1, precision = 0.05 } = {}) {
+    async recallImages(words, { limit = 512, minSources = 1, precision = 0.0005 } = {}) {
         const associations = await this.recall({
             seeds: words.map((word) => keys.wordNodeId(word)),
             hops: 1,
@@ -340,6 +430,20 @@ class SignStore extends CheetahDatabase {
             type: EDGE_TYPE,
             limit,
             minSources,
+            // Exact ids only. A seed here is `w<hex3>`, built by `wordNodeId`
+            // from an integer — there is no free text to resolve, no synonym to
+            // follow, and (ROADMAP §3.3) no lexical term index to resolve
+            // against, because hex ids sharing a token cross-match at score
+            // 0.33 and the index is switched off for that reason.
+            //
+            // `GRAPH_RECALL` expands lexically and through synonyms by default,
+            // which is right for a caller typing a word and wrong for every
+            // seed this pipeline sends: it tokenises the id, reads document
+            // frequencies, scans candidates, and falls through to trigram fuzzy
+            // matching when that finds nothing — which, with the index off, is
+            // always. Measured against a 12-image corpus, per recall of 32
+            // seeds: 20.1 ms with the default expansion, 2.7 ms with this.
+            expand: 'none',
         });
         const results = [];
         for (const association of associations) {
@@ -363,6 +467,10 @@ class SignStore extends CheetahDatabase {
                 imageId,
                 filename: image.filename,
                 words: Number(image.words) || 0,
+                // The cosine denominator, written by whichever path last
+                // published this image's edges. A record without one predates
+                // the norm and falls back to 1 in `Evidence.lengthNorm`.
+                norm: Number(image.signature_norm) || 1,
                 score: association.score,
                 sourceCount: association.sourceCount,
                 seeds,
@@ -445,6 +553,6 @@ module.exports = {
     EDGE_TYPE,
     LAYOUT_KEY,
     SignStore,
-    TF_SATURATION,
     createSignStore,
+    relativeFrequency,
 };

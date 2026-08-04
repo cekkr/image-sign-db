@@ -12,6 +12,13 @@
 //   2. **Rarity has to beat quantity.** A single rare seed must be able to
 //      outweigh several common ones, or the ranking is decided by whichever
 //      words happen to be everywhere.
+//   3. **Both term frequencies have to be there.** The vocabulary is 4096 cells
+//      and a query re-enters them many times, so "did this image ever produce
+//      this word" is true of nearly every pair and decides nothing. What
+//      separates images is how often each side produced it, divided by the
+//      image's own norm. Measured on 100 images at 1024 constellations:
+//      membership 10/100, both frequencies unnormalised 19/100, both
+//      frequencies over the signature norm 94/100.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -23,6 +30,7 @@ const {
     selectSeeds,
     selectReviewEntries,
 } = require('../src/signPipeline');
+const { SignStore, relativeFrequency } = require('../src/lib/cheetah/signStore');
 
 function hit(imageId, filename, words, seeds) {
     return {
@@ -254,4 +262,133 @@ test('chain agreement is worth more than the same triples scattered', () => {
     const single = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0, chainBonus: 0 });
     single.fold([hit(15, 'single.jpg', 1000, [{ word: 1, activation: 1 }])], degrees);
     assert.ok(Math.abs(shared.ranked()[0].mass - single.ranked()[0].mass) < 1e-12);
+});
+
+// The query is a distribution, not a set. Two images that both published a word
+// are separated by how often each of them did and by how often the query asked
+// — and an image that published more of everything must not win for that alone.
+test('both term frequencies count, and the image norm divides them out', () => {
+    const degrees = new Map([[1, 2], [2, 2]]);
+    const build = (queryCounts, norms) => {
+        const evidence = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0 });
+        evidence.fold([
+            { imageId: 1, filename: 'often.jpg', words: 1000, norm: norms[0], sourceCount: 1, seeds: [{ word: 1, activation: 0.8 }] },
+            { imageId: 2, filename: 'rarely.jpg', words: 1000, norm: norms[1], sourceCount: 1, seeds: [{ word: 2, activation: 0.1 }] },
+        ], degrees, null, queryCounts);
+        return evidence.ranked();
+    };
+
+    // Equal query frequency: the image that produced its word more often wins,
+    // because that is the whole of what the edge weight carries.
+    const equal = build(new Map([[1, 4], [2, 4]]), [1, 1]);
+    assert.equal(equal[0].filename, 'often.jpg');
+    assert.ok(Math.abs(equal[0].mass / equal[1].mass - 8) < 1e-9);
+
+    // The query's own frequency is the other half of the product: asking for
+    // the weak word forty times against the strong word once flips the answer.
+    const skewed = build(new Map([[1, 1], [2, 40]]), [1, 1]);
+    assert.equal(skewed[0].filename, 'rarely.jpg');
+
+    // And the norm is a real divisor, not a tie-break: an image with eight
+    // times the norm needs eight times the evidence to stay level.
+    const normed = build(new Map([[1, 4], [2, 4]]), [8, 1]);
+    assert.ok(Math.abs(normed[0].mass - normed[1].mass) < 1e-9);
+
+    // A record written before the norm existed must not evaluate to zero mass.
+    const legacy = build(new Map([[1, 1], [2, 1]]), [undefined, null]);
+    assert.ok(legacy.every((entry) => Number.isFinite(entry.mass) && entry.mass > 0));
+});
+
+// A word the query never asked for cannot weigh in even if the graph returns
+// it: the recall is seeded per round, and a stale seed would be counted with a
+// frequency it does not have.
+test('a seed the round did not ask for contributes nothing', () => {
+    const evidence = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0 });
+    evidence.fold([
+        { imageId: 1, filename: 'a.jpg', words: 1000, norm: 1, sourceCount: 2, seeds: [
+            { word: 1, activation: 1 },
+            { word: 99, activation: 1 },
+        ] },
+    ], new Map([[1, 1], [99, 1]]), null, new Map([[1, 1]]));
+    const only = new Evidence({ corpusSize: 20, averageWords: 1000, lengthSlope: 0 });
+    only.fold([
+        { imageId: 1, filename: 'a.jpg', words: 1000, norm: 1, sourceCount: 2, seeds: [{ word: 1, activation: 1 }] },
+    ], new Map([[1, 1]]), null, new Map([[1, 1]]));
+    assert.equal(evidence.ranked()[0].mass, only.ranked()[0].mass);
+});
+
+// Ordering by rarity alone was right while a word was a near-unique token. On a
+// vocabulary a query re-enters, a common word asked for nine times carries more
+// than a rare one asked for once, and the seed budget has to spend on it.
+test('seeds are ordered by what they would contribute, not by rarity alone', () => {
+    const degrees = new Map([[1, 1], [2, 15]]);
+    const byRarity = selectSeeds([1, 2], degrees, {
+        corpusSize: 20, stopWordImageRatio: 1, limit: 1,
+    });
+    assert.deepEqual(byRarity, [1], 'with nothing to weigh them, the rarest still wins');
+
+    const byValue = selectSeeds([1, 2], degrees, {
+        corpusSize: 20, stopWordImageRatio: 1, limit: 1, queryCounts: new Map([[1, 1], [2, 9]]),
+    });
+    assert.deepEqual(byValue, [2], 'nine observations of a common word beat one of a rare word');
+});
+
+// The edge weight is the only channel a term frequency has: Cheetah clamps a
+// weight into [0,1] before using it as activation.
+test('relative frequency stays inside the activation range and keeps its order', () => {
+    assert.equal(relativeFrequency(7, 7), 1);
+    assert.ok(relativeFrequency(1, 100) > 0);
+    assert.ok(relativeFrequency(4, 10) > relativeFrequency(3, 10));
+    // A count above the declared maximum cannot exceed 1 in practice because the
+    // maximum is taken over the same map; a zero maximum must not divide by zero.
+    assert.ok(Number.isFinite(relativeFrequency(3, 0)));
+
+    // The norm is the L2 length of exactly those weights.
+    const counts = new Map([[1, 10], [2, 5], [3, 1]]);
+    const expected = Math.sqrt(1 + 0.5 ** 2 + 0.1 ** 2);
+    assert.ok(Math.abs(SignStore.signatureNorm(counts) - expected) < 1e-12);
+
+    // A top-up publishes only the words it touched but must divide by the whole
+    // image's maximum, so the maximum is a parameter rather than a re-derivation.
+    assert.ok(Math.abs(SignStore.signatureNorm(new Map([[1, 5]]), 10) - 0.5) < 1e-12);
+    assert.equal(SignStore.signatureNorm(new Map()), 1, 'an empty signature must not be zero');
+});
+
+// The degree table is the search's other half and it is worth caching: a degree
+// is one `GRAPH_DEGREE` per word, answered by counting that word's adjacency, so
+// asking costs more as the corpus grows and a search asks for hundreds per
+// round. Measured at corpus 100, an uncached table was 1.86 s of a 3.68 s
+// search. What makes caching safe is that exactly one thing changes a degree.
+test('the degree cache is refilled once and evicted only by a new edge', async () => {
+    const asked = [];
+    const store = Object.create(SignStore.prototype);
+    store.degreeCache = new Map();
+    store.imageRecords = new Map();
+    store.degree = async ({ id }) => { asked.push(id); return { degree: 7 }; };
+
+    assert.deepEqual([...(await store.wordDegrees([1, 2, 1]))], [[1, 7], [2, 7]]);
+    assert.equal(asked.length, 2, 'a repeated word in one call is asked once');
+    await store.wordDegrees([1, 2]);
+    assert.equal(asked.length, 2, 'and never again while nothing has changed');
+
+    // A batch that only updated existing edges cannot have moved a degree.
+    store.setEdgeBatch = async (batch) => ({
+        requested: batch.length, applied: batch.length, created: 0, updated: batch.length, failed: 0,
+    });
+    store.setNode = async () => {};
+    await store.commitGraph(1, 'a.jpg', new Map([[1, 3], [2, 1]]));
+    await store.wordDegrees([1, 2]);
+    assert.equal(asked.length, 2, 'an update-only commit must not invalidate anything');
+
+    // A created edge does move it, and the words of that batch are refetched.
+    store.setEdgeBatch = async (batch) => ({
+        requested: batch.length, applied: batch.length, created: 1, updated: 0, failed: 0,
+    });
+    await store.commitGraph(1, 'a.jpg', new Map([[1, 3], [2, 1]]));
+    await store.wordDegrees([1, 2]);
+    assert.equal(asked.length, 4, 'a created edge must invalidate its batch');
+
+    store.clearCaches();
+    await store.wordDegrees([1]);
+    assert.equal(asked.length, 5);
 });

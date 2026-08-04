@@ -75,7 +75,7 @@ test('one image cannot leak into another image prefix', () => {
 });
 
 test('byte order is numeric order for words and ordinals', () => {
-    const words = [0, 1, 9, 10, 15, 16, 255, 4096, WORD_CARDINALITY - 1];
+    const words = [0, 1, 9, 10, 15, 16, 255, 256, WORD_CARDINALITY - 1];
     const encoded = words.map((word) => keys.signWordPrefix(word));
     const sorted = [...encoded].sort();
     assert.deepEqual(sorted, encoded, 'PAIR_SCAN walks bytes; the hex must sort like the numbers');
@@ -86,7 +86,7 @@ test('byte order is numeric order for words and ordinals', () => {
 });
 
 test('out-of-range identifiers are refused rather than truncated', () => {
-    assert.throws(() => keys.signWordPrefix(WORD_CARDINALITY * 100), RangeError);
+    assert.throws(() => keys.signWordPrefix(WORD_CARDINALITY), RangeError);
     assert.throws(() => keys.signWordPrefix(-1), RangeError);
     assert.throws(() => keys.signConstellationKey(1, MAX_ORDINAL + 1), RangeError);
     assert.throws(() => keys.signImageKey(MAX_IMAGE_ID + 1), RangeError);

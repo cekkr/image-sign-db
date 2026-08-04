@@ -99,7 +99,17 @@ const cheetahSettings = {
 // env var that repartitions the vocabulary would silently invalidate every
 // stored graph edge.
 const signSettings = {
-  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 3600),
+  // Measured on sample_images/ (100 images), ranking by the pipeline's own
+  // scoring rule, training density against rank-1 at a 96-constellation query:
+  //
+  //     128    54/100        512    82/100
+  //     256    71/100       1024    95/100
+  //
+  // Past 1024 the curve is flat, and every constellation past it is a write, a
+  // graph edge and a slower search for nothing. The previous 3600 was chosen
+  // when a word was mostly sampler noise and more draws were the only way to
+  // make an image findable at all.
+  constellationsPerImage: getNumber('SIGN_CONSTELLATIONS_PER_IMAGE', 1024),
   pointCount: getNumber('SIGN_POINT_COUNT', 7),
   pointPatchRelative: getNumber('SIGN_POINT_PATCH_REL', 0.004),
   workingMaxSide: getNumber('SIGN_WORKING_MAX_SIDE', 1024),
@@ -115,8 +125,20 @@ const signSettings = {
     adaptive: getBoolean('SIGN_TRAIN_ADAPTIVE', true),
     // Constellations between two self-probes. Small enough to stop early on a
     // flat image, large enough that a checkpoint costs less than the chunk.
+    //
+    // A checkpoint is `probes` searches against the whole corpus, so its cost
+    // grows with the corpus while the chunk's does not: measured over 100
+    // images, per-image training went from 20 s at corpus 40 to 45 s at corpus
+    // 90, almost all of it probing. 512 halves the number of checkpoints needed
+    // to reach the ~1024 the accuracy curve flattens at, and costs only
+    // stopping granularity.
     checkEvery: getNumber('SIGN_TRAIN_CHECK_EVERY', 512),
-    probes: getNumber('SIGN_TRAIN_PROBES', 3),
+    // Searches per checkpoint. Two, because the question a checkpoint asks is
+    // "can the corpus find this image yet", and with `stopMinHitRate` at 1 the
+    // bar is "every probe found it" either way — the third probe is a third of
+    // all training cost for a sharper estimate of a number that is compared
+    // against 1.
+    probes: getNumber('SIGN_TRAIN_PROBES', 2),
     // Improvement below this in *both* accuracy and search effort ends the run.
     minGain: getNumber('SIGN_TRAIN_MIN_GAIN', 0.01),
     // The stop rule may only fire once this share of the probes finds the image.
@@ -129,7 +151,10 @@ const signSettings = {
     // chunk and corpus rehearsal decides how much more they need later.
     minCorpus: getNumber('SIGN_TRAIN_MIN_CORPUS', 4),
     // A probe is a cost, not a deliverable: it runs to a lower ceiling than a
-    // real search and with the reranker off.
+    // real search and with the reranker off. One round at the configured batch
+    // size — measured on 37 images, a one-round probe answers 32/37 against a
+    // full search's 35/37 for 57% of the cost, and the question it is asked is
+    // "is this image findable yet", not "which image is this".
     probeMaxConstellations: getNumber('SIGN_TRAIN_PROBE_MAX', 96),
     // Rehearsal: re-probe images already in the corpus and top up the ones it
     // has stopped being able to find (src/signPipeline.js → reviewCorpus).
@@ -148,11 +173,11 @@ const signSettings = {
       // Constellations one top-up buys. One chunk, then measure again: giving a
       // struggling image everything at once spends the budget on whichever
       // image happened to be probed first.
-      topUp: getNumber('SIGN_TRAIN_REVIEW_TOP_UP', 512),
+      topUp: getNumber('SIGN_TRAIN_REVIEW_TOP_UP', 256),
       // Total constellations an image may reach through top-ups. Some images
       // are genuinely indistinguishable from a near-duplicate and no amount of
       // evidence fixes that; without a cap the pass buys most for exactly those.
-      ceiling: getNumber('SIGN_TRAIN_REVIEW_CEILING', 8192),
+      ceiling: getNumber('SIGN_TRAIN_REVIEW_CEILING', 2048),
       // Consecutive top-ups an image may absorb without improving on its own
       // best measured accuracy before rehearsal stops spending on it
       // (`reason: 'no-gain'`). The ceiling alone bounds the work at
@@ -170,25 +195,59 @@ const signSettings = {
     // starts with one chunk when no constellation count was supplied and lets
     // validation choose any stopping point up to this cap. `--extend-to 0`
     // deliberately restores the caller's nominal count as the hard ceiling.
-    extendTo: getNumber('SIGN_TRAIN_EXTEND_TO', 8192),
+    //
+    // 2048, not 8192. The ceiling is what an image costs when validation cannot
+    // stop it, so it is the number that decides the worst case of a run, and on
+    // the measured corpus accuracy is flat past 1024. The old 8192 was not a
+    // safety margin in practice: every image reached it, because the stop rule
+    // asks for all probes to find the image and nothing could.
+    extendTo: getNumber('SIGN_TRAIN_EXTEND_TO', 2048),
   },
   search: {
-    batchSize: getNumber('SIGN_SEARCH_BATCH', 12),
-    minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 24),
-    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 720),
+    // Constellations measured between two recalls, and it is not only a
+    // granularity knob any more: the resolver scores on the query's *term
+    // frequency*, and a round too small to have one measures nothing. Below ~48
+    // almost every word of a round is seen exactly once, which is the flat
+    // query vector the previous revision was stuck with. Measured on a 37-image
+    // corpus at a 192-constellation ceiling, rank-1 and seconds per search:
+    //
+    //     batch 24, 128 seeds   32/37   0.95s
+    //     batch 48, 128 seeds   34/37   0.52s
+    //     batch 96, 192 seeds   35/37   0.37s
+    //
+    // Bigger rounds are both more accurate and cheaper, because the round trip
+    // — not the measuring — is what a search spends its time on.
+    batchSize: getNumber('SIGN_SEARCH_BATCH', 96),
+    minConstellations: getNumber('SIGN_SEARCH_MIN_CONSTELLATIONS', 96),
+    // Measured on the 100-image corpus at 1024 constellations per image, rank-1
+    // against the query budget: 48 -> 80, 96 -> 95, 192 -> 96, 480 -> 97. The
+    // knee is at 96 and the tail is worth about one image in a hundred, so the
+    // ceiling sits just past it rather than five times past it. The old 720 was
+    // the cost of a representation that needed hundreds of draws to say
+    // anything, and every probe in training paid it.
+    maxConstellations: getNumber('SIGN_SEARCH_MAX_CONSTELLATIONS', 192),
     // A word carried by more than this share of the corpus is a stop word and
     // is not worth a recall seed.
-    stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 0.6),
-    seedsPerRound: getNumber('SIGN_SEARCH_SEEDS_PER_ROUND', 96),
-    // Pivoted length normalisation: 0 ignores how many words an image
-    // published, 1 divides its evidence in full proportion to them.
     //
-    // The default is 0.5 because normal training now rehearses selectively and
-    // therefore produces uneven vocabulary sizes. On the measured 20-image
-    // corpus, rehearsal at slope 0 regressed while rehearsal + 0.5 reached
-    // 19/20 rank-1. On a deliberately uniform fixed-density corpus, 0 remains
-    // better; `--no-rehearse` users benchmarking that mode can set it explicitly.
-    lengthSlope: getNumber('SIGN_SEARCH_LENGTH_SLOPE', 0.5),
+    // 1 disables the filter, and that is right now that a word is a cell of a
+    // 4096-cell distribution rather than a near-unique token. A word every
+    // image produces still separates them by *how often* each produces it, and
+    // idf already discounts it to near zero; dropping it instead throws away
+    // the bulk of a query on any corpus past a few dozen images.
+    stopWordImageRatio: getNumber('SIGN_SEARCH_STOPWORD_RATIO', 1),
+    // Words seeded per round, ordered by `query frequency x idf`. Cheetah takes
+    // 32 seeds per GRAPH_RECALL, so this is also the round-trip count: 192 is
+    // six requests, and the measurement above says the sixth still pays.
+    seedsPerRound: getNumber('SIGN_SEARCH_SEEDS_PER_ROUND', 192),
+    // Pivoted length normalisation, applied *on top of* the image's stored
+    // signature norm: 0 ignores how many words an image published, 1 divides
+    // its evidence in full proportion to them.
+    //
+    // 0 by default, because the cosine denominator is now a real one —
+    // `signature_norm`, the L2 norm of the weights the image actually
+    // published. This knob was that norm's stand-in while the resolver had no
+    // access to one, and stacking the two over-corrects.
+    lengthSlope: getNumber('SIGN_SEARCH_LENGTH_SLOPE', 0),
     // How much a constellation that agrees with *itself* is worth over the same
     // triples arriving separately: each group of seeds from one measured sign is
     // scaled by `1 + chainBonus * (agreeing triples - 1)`.
@@ -225,6 +284,14 @@ const signSettings = {
     // near-duplicates keeps measuring — on sample_images the true match often
     // leads the second place by only ~1.1, and stopping there would be stopping
     // on a coin flip.
+    //
+    // **This lives on the cosine scale now, which is much tighter than the old
+    // unnormalised mass.** Measured over the 100-image corpus the mean
+    // leader/runner-up ratio is ~1.13, so 1.35 means "stop only on a clear
+    // win" rather than the "stop routinely" it used to mean. That is the
+    // intended reading and the reason it did not move: with a two-round ceiling
+    // an early stop is worth one round, and buying it with wrong answers is a
+    // bad trade.
     separationTarget: getNumber('SIGN_SEARCH_SEPARATION', 1.35),
     rerankTop: getNumber('SIGN_SEARCH_RERANK_TOP', 5),
     rerankSigns: getNumber('SIGN_SEARCH_RERANK_SIGNS', 12),

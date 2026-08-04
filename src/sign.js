@@ -557,7 +557,7 @@ async function commandFind(store, target, flags) {
     console.log(`Searching for ${path.basename(image)}`);
     const result = await searchImage(store, image, {
         maxConstellations: numberFlag(flags, 'max', settings.sign.search.maxConstellations),
-        rerank: flags.get('no-rerank') !== 'true',
+        rerank: flags.get('rerank') === 'true',
         seed: flags.has('seed') ? flags.get('seed') : null,
     });
     reportCandidates(result);
@@ -576,6 +576,7 @@ async function commandEvaluate(store, targets, flags) {
     const startedAt = new Date();
     const maxConstellations = numberFlag(flags, 'max', settings.sign.search.maxConstellations);
     const skipTrain = flags.get('skip-train') === 'true';
+    const rerank = flags.get('rerank') === 'true';
     const training = skipTrain ? null : await commandTrain(store, targets, flags);
 
     // What the corpus actually holds, read back from the store rather than from
@@ -598,6 +599,11 @@ async function commandEvaluate(store, targets, flags) {
         try {
             result = await searchImage(store, image, {
                 maxConstellations,
+                // Off unless asked for: the field scores annotate the ranking
+                // without changing it, and they cost more than the rest of the
+                // search together. `--rerank` fills in the three `rank1By*`
+                // columns of the report; without it they read 0.
+                rerank,
                 // Seeded per filename so a re-run is comparable, but never with the
                 // seed training used: the query constellations must be fresh.
                 seed: `evaluate:${expected}`,
@@ -868,7 +874,11 @@ async function main() {
                 '  --spawn               start the vendored cheetah-server for this command',
                 '  --data-dir <path>     data directory for --spawn',
                 '  --skip-train          evaluate against an already-trained corpus',
-                '  --no-rerank           report graph recall without the field rerank',
+                '  --rerank              also compute the colour-field scores for the top',
+                '                        candidates. They never reorder the ranking and have never',
+                '                        beaten it (19/100, 27/100, 29/100 against 87/100), and they',
+                '                        cost about 7s of a 7.8s search on a 100-image corpus, so',
+                '                        they are off unless the question is what they say.',
                 '  --report <file>       write the evaluation as JSON (see benchmark.sh)',
                 '  --label <text>        name this run inside the report',
             ].join('\n'));
